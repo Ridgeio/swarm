@@ -20,7 +20,16 @@ Send messages between Claude Code sessions, monitor what other agents are workin
 
 Agents register with `swarm join`, then communicate via `swarm send`. Messages are pushed directly into the target agent's terminal using Cmux's native `send` command — the same push-based delivery that made [AgentSwarm](https://github.com/tlangridge/agent-swarm) work, but without a web UI.
 
+## Prerequisites
+
+- **macOS** (Cmux is macOS-only)
+- **[Cmux](https://cmux.dev)** installed and running
+- **Node.js >= 20** (`node --version` to check)
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** CLI installed
+
 ## Install
+
+### 1. Clone and build
 
 ```bash
 git clone https://github.com/Ridgeio/swarm.git
@@ -29,24 +38,43 @@ npm install
 npm run build
 ```
 
-Then either add the `bin/` directory to your PATH, or use the absolute path to `bin/swarm`.
+### 2. Install the slash commands
 
-### Claude Code slash commands
-
-Copy the slash commands to your Claude Code commands directory:
+This copies three commands (`/join-swarm`, `/leave-swarm`, `/reset-swarm`) into Claude Code and configures them to point at your local swarm binary:
 
 ```bash
 mkdir -p ~/.claude/commands
-cp skill/join-swarm.md ~/.claude/commands/join-swarm.md
-cp skill/leave-swarm.md ~/.claude/commands/leave-swarm.md
-cp skill/reset-swarm.md ~/.claude/commands/reset-swarm.md
+
+# Get the absolute path to the swarm binary
+SWARM_BIN="$(pwd)/bin/swarm"
+
+# Install each command, replacing the generic 'swarm' with the full path
+for cmd in join-swarm leave-swarm reset-swarm; do
+  sed "s|swarm |${SWARM_BIN} |g" "skill/${cmd}.md" > ~/.claude/commands/${cmd}.md
+done
+
+echo "Installed. Your swarm binary is at: ${SWARM_BIN}"
 ```
 
-Edit each file to update the path to `bin/swarm` for your machine.
+### 3. Verify
+
+Open a Cmux terminal with Claude Code and run:
+
+```
+/join-swarm TestAgent
+```
+
+You should see: `Joined swarm as "TestAgent" (surface: ...)`. Then clean up:
+
+```
+/leave-swarm
+```
+
+If it works, you're set. If you get "command not found", check that the paths in `~/.claude/commands/join-swarm.md` point to the correct location of `bin/swarm`.
 
 ## Quick start
 
-In Cmux, open two Claude Code sessions. In each one:
+Open two or more Claude Code sessions in Cmux. In each one:
 
 ```
 /join-swarm Alice    # in pane 1
@@ -63,6 +91,10 @@ swarm send Bob "please review the auth PR"
 Bob's terminal will show: `[SWARM from Alice]: please review the auth PR`
 
 When you're done, agents can `/leave-swarm` individually, or you can `/reset-swarm` to wipe everything and start fresh.
+
+### Switching projects
+
+Run `/reset-swarm` (or `swarm reset` from any terminal) to clear all agents and messages. Then have agents `/join-swarm` again for the new project.
 
 ## Slash Commands
 
@@ -87,6 +119,67 @@ swarm read <agent> [--lines <n>]            Read an agent's terminal screen
 swarm reset                                 Clear all agents and messages
 swarm help                                  Show help
 ```
+
+## Example workflows
+
+### Code review delegation
+
+You have three agents. One is the lead, two are developers.
+
+```
+Lead:   /join-swarm Lead
+Dev A:  /join-swarm Alice
+Dev B:  /join-swarm Bob
+```
+
+The lead delegates work:
+```bash
+swarm send Alice "implement the user auth module in src/auth.ts"
+swarm send Bob "write tests for the payment flow in tests/payment.test.ts"
+```
+
+Alice finishes and notifies Bob for review:
+```bash
+swarm send Bob "auth module done on branch feat/auth, can you review?"
+```
+
+Bob checks Alice's progress without interrupting:
+```bash
+swarm read Alice --lines 30
+```
+
+### Parallel feature development
+
+Two agents working on separate features that share a dependency:
+
+```bash
+# Agent A notices a shared concern
+swarm send AgentB "heads up, I'm refactoring the database client in src/db.ts. Don't touch that file for the next few minutes."
+
+# Agent B acknowledges
+swarm send AgentA "got it, I'll work on the API routes instead"
+
+# Agent A finishes
+swarm send AgentB "db refactor done and pushed. You can use the new query() method now."
+```
+
+### Monitoring a team
+
+A lead agent checks on everyone:
+```bash
+swarm members                    # who's active?
+swarm read Alice --lines 20      # what's Alice doing?
+swarm read Bob --lines 20        # what's Bob doing?
+swarm broadcast "status check — what's everyone working on?"
+```
+
+### End of session
+
+```bash
+swarm broadcast "wrapping up for now, great work team"
+```
+
+Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear everything.
 
 ## How agents coordinate
 

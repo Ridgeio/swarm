@@ -23,13 +23,26 @@ Agents register with `swarm join`, then communicate via `swarm send`. Messages a
 ## Install
 
 ```bash
-git clone https://github.com/tlangridge/swarm.git
+git clone https://github.com/Ridgeio/swarm.git
 cd swarm
 npm install
 npm run build
 ```
 
 Then either add the `bin/` directory to your PATH, or use the absolute path to `bin/swarm`.
+
+### Claude Code slash commands
+
+Copy the slash commands to your Claude Code commands directory:
+
+```bash
+mkdir -p ~/.claude/commands
+cp skill/join-swarm.md ~/.claude/commands/join-swarm.md
+cp skill/leave-swarm.md ~/.claude/commands/leave-swarm.md
+cp skill/reset-swarm.md ~/.claude/commands/reset-swarm.md
+```
+
+Edit each file to update the path to `bin/swarm` for your machine.
 
 ## Quick start
 
@@ -40,12 +53,24 @@ In Cmux, open two Claude Code sessions. In each one:
 /join-swarm Bob      # in pane 2
 ```
 
+Or just `/join-swarm` with no arguments — agents will pick their own creative name.
+
 Then from Alice's session:
 ```bash
 swarm send Bob "please review the auth PR"
 ```
 
 Bob's terminal will show: `[SWARM from Alice]: please review the auth PR`
+
+When you're done, agents can `/leave-swarm` individually, or you can `/reset-swarm` to wipe everything and start fresh.
+
+## Slash Commands
+
+| Command | What it does |
+|---------|-------------|
+| `/join-swarm [name]` | Join the swarm. Auto-picks a creative name if none given. |
+| `/leave-swarm` | Leave the swarm. |
+| `/reset-swarm` | Clear all agents, messages, and inbox state. |
 
 ## CLI Reference
 
@@ -59,21 +84,9 @@ swarm members                               List active agents
 swarm status [--set <desc>] [--agent <name>] Update or query status
 swarm whoami                                Show own registration
 swarm read <agent> [--lines <n>]            Read an agent's terminal screen
+swarm reset                                 Clear all agents and messages
 swarm help                                  Show help
 ```
-
-## Claude Code skill
-
-The `/join-swarm` command is a Claude Code custom slash command. To install it, copy `skill/join-swarm.md` to your Claude Code commands directory:
-
-```bash
-mkdir -p ~/.claude/commands
-cp skill/join-swarm.md ~/.claude/commands/join-swarm.md
-```
-
-Edit the file to update the path to `bin/swarm` for your machine.
-
-When any Claude Code session runs `/join-swarm AgentName`, it joins the swarm and gets the coordination protocol instructions.
 
 ## How agents coordinate
 

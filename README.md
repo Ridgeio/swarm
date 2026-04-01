@@ -39,8 +39,10 @@ npm run build
 
 The install script auto-detects which agents you have installed (Claude Code, Codex CLI) and configures skills for each:
 
-- **Claude Code**: installs `/join-swarm`, `/leave-swarm`, `/reset-swarm` slash commands
+- **Claude Code**: installs `/join-swarm`, `/leave-swarm`, `/reset-swarm` slash commands + a `UserPromptSubmit` hook for persistent swarm awareness
 - **Codex CLI**: installs coordination instructions at `~/.codex/swarm-instructions.md`
+
+The awareness hook automatically reminds agents of their swarm identity, active members, and available commands on every turn. This survives context compression and `/clear` — agents never forget they're in the swarm.
 
 ### Verify
 
@@ -87,18 +89,35 @@ Run `/reset-swarm` (or `swarm reset` from any terminal) to clear all agents and 
 ## CLI Reference
 
 ```
-swarm join <name> [--description <text>]   Register this terminal as an agent
-swarm leave                                 Deregister from the swarm
-swarm send <agent> <message>                Push a message to an agent's terminal
-swarm broadcast <message>                   Push to all agents
-swarm inbox [--peek]                        Read pending messages
-swarm members                               List active agents
-swarm status [--set <desc>] [--agent <name>] Update or query status
-swarm whoami                                Show own registration
-swarm read <agent> [--lines <n>]            Read an agent's terminal screen
-swarm reset                                 Clear all agents and messages
-swarm help                                  Show help
+Messaging:
+  swarm send <agent> <message>                Push a message to an agent's terminal
+  swarm broadcast <message>                   Push to all agents
+  swarm inbox [--peek]                        Read pending messages
+
+Agents:
+  swarm join <name> [--description <text>]   Register this terminal as an agent
+  swarm leave                                 Deregister from the swarm
+  swarm members                               List active agents
+  swarm status [--set <desc>] [--agent <name>] Update or query status
+  swarm whoami                                Show own registration
+  swarm read <agent> [--lines <n>]            Read an agent's terminal screen
+
+Spawning:
+  swarm spawn [--cwd <path>] [--autonomous]   Spawn a new Claude Code session
+                                              (auto-joins the swarm after boot)
+
+Workspace management:
+  swarm rename <agent> <title>                Rename an agent's Cmux tab
+  swarm move <agent> --workspace <id>         Move agent to another workspace
+  swarm workspaces                            List Cmux workspaces
+  swarm rename-workspace <id> <title>         Rename a workspace
+
+Session:
+  swarm reset                                 Clear all agents and messages
+  swarm help                                  Show help
 ```
+
+Joining the swarm auto-renames the agent's Cmux tab to their swarm name for easy visual identification.
 
 ## Example workflows
 
@@ -153,6 +172,25 @@ swarm read Bob --lines 20        # what's Bob doing?
 swarm broadcast "status check — what's everyone working on?"
 ```
 
+### Spawning new agents
+
+A lead agent can spin up new Claude Code sessions directly:
+```bash
+swarm spawn --cwd /path/to/project --autonomous
+```
+
+This opens a new Cmux tab, launches Claude Code, and auto-sends `/join-swarm` after boot. The `--autonomous` flag enables `--dangerously-skip-permissions`.
+
+### Organizing workspaces
+
+A lead can reorganize agents across Cmux workspaces:
+```bash
+swarm workspaces                                    # list all workspaces
+swarm move MrDev --workspace workspace:5            # move agent to another workspace
+swarm rename MrDev "Senior Dev"                     # rename an agent's tab
+swarm rename-workspace workspace:5 "Dev Team"       # rename a workspace
+```
+
 ### End of session
 
 ```bash
@@ -169,13 +207,14 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 
 ## Architecture
 
-- **`src/transport.ts`** — Cmux wrapper (`send`, `read-screen`, binary resolution, `\n` sanitization)
+- **`src/transport.ts`** — Cmux wrapper (`send`, `read-screen`, `spawn`, tab/workspace management, `\n` sanitization, message chunking)
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
-- **`src/registry.ts`** — Agent registration with surface-based stale cleanup
+- **`src/registry.ts`** — Agent registration with surface-based stale cleanup (requires both dead surface + stale heartbeat)
 - **`src/mailbox.ts`** — Message send/broadcast/inbox with cursor tracking
-- **`src/index.ts`** — CLI entry point
+- **`src/index.ts`** — CLI entry point (20 commands)
+- **`hooks/swarm-awareness.sh`** — UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 
-State is stored in `~/.swarm/swarm.db`. Stale agents are automatically cleaned up by checking if their Cmux surface still exists.
+State is stored in `~/.swarm/swarm.db`. Stale agents are cleaned up when their Cmux surface is unreachable AND their heartbeat is older than 10 minutes. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 

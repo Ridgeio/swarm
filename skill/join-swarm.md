@@ -2,17 +2,28 @@ Join the agent coordination swarm. This lets you communicate with other Claude C
 
 ## Steps
 
-1. Run the join command with your agent name (use a short, descriptive name):
+1. First, pick your agent name. If a name was provided as an argument, use it:
 
 ```bash
-swarm join "$ARGUMENTS"
+echo "$ARGUMENTS"
 ```
 
-If no name was provided in the arguments, pick a short name based on your current task or role (e.g., "AuthDev", "Reviewer", "Lead").
+If `$ARGUMENTS` is empty or blank, you MUST invent your own short, creative name. Pick something fun and unique — an adjective + noun combo works well (e.g., "SwiftFox", "IronBolt", "NeonOwl", "QuietStorm"). Don't ask the user, just pick one.
 
-If `swarm` is not in PATH, use the full path to the binary in the swarm repo.
+2. Join the swarm with your chosen name. If `swarm` is not in PATH, use the full path to the binary in the swarm repo.
 
-2. After joining, follow these coordination rules:
+```bash
+swarm join "<your-chosen-name>"
+```
+
+3. Check for pending messages and see who else is active:
+
+```bash
+swarm inbox
+swarm members
+```
+
+4. After joining, follow these coordination rules:
 
 - **Before starting new work**: Run `swarm inbox` to check for pending messages
 - **When you receive a message** (text starting with `[SWARM from <name>]:`): Read it and respond appropriately. Reply with `swarm send <name> "<reply>"`

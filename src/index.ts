@@ -1,7 +1,7 @@
 import { getDb } from './db.js';
 import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, updateStatus, updateHeartbeat } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
-import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace } from './transport.js';
+import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -206,11 +206,25 @@ try {
       const perms = autonomous ? ' --dangerously-skip-permissions' : '';
       const claudeCmd = `claude${perms}`;
 
-      spawnWorkspace(cwd, claudeCmd);
+      const result = spawnWorkspace(cwd, claudeCmd);
+      if (!result) {
+        console.error('Failed to spawn workspace');
+        process.exit(1);
+      }
 
-      const joinHint = name ? ` ${name}` : '';
-      console.log(`Spawned new Claude Code session in ${cwd}`);
-      console.log(`Run /join-swarm${joinHint} in the new session to join the swarm.`);
+      const joinArg = name || '';
+      console.log(`Spawned new Claude Code session in ${cwd} (${result.workspaceRef}, ${result.surfaceRef})`);
+
+      // Wait for Claude Code to boot, then send /join-swarm
+      console.log('Waiting for Claude Code to initialize...');
+      sleep(8);
+
+      try {
+        sendToSurface(result.surfaceRef, `/join-swarm ${joinArg}`, result.workspaceRef);
+        console.log(`Sent /join-swarm ${joinArg} to new session`);
+      } catch {
+        console.log(`Could not auto-join. Run /join-swarm ${joinArg} manually in the new tab.`);
+      }
       break;
     }
 

@@ -47,7 +47,7 @@ function sanitize(text: string): string {
 const CHUNK_SIZE = 60;
 const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe', 'pipe'] };
 
-function sleep(seconds: number): void {
+export function sleep(seconds: number): void {
   execFileSync('sleep', [String(seconds)], STDIO_OPTS);
 }
 
@@ -74,9 +74,20 @@ export function sendToSurface(surfaceId: string, text: string, workspaceId?: str
   }
 }
 
-export function spawnWorkspace(cwd: string, command: string): void {
+export function spawnWorkspace(cwd: string, command: string): { workspaceRef: string; surfaceRef: string } | null {
   const cmux = resolveCmux();
-  execFileSync(cmux, ['new-workspace', '--cwd', cwd, '--command', command], STDIO_OPTS);
+  // new-workspace returns "OK workspace:N"
+  const wsOut = execFileSync(cmux, ['new-workspace', '--cwd', cwd, '--command', command], STDIO_OPTS).toString().trim();
+  const wsMatch = wsOut.match(/workspace:\d+/);
+  if (!wsMatch) return null;
+  const workspaceRef = wsMatch[0];
+
+  // Get the surface in the new workspace
+  const surfOut = execFileSync(cmux, ['list-pane-surfaces', '--workspace', workspaceRef], STDIO_OPTS).toString().trim();
+  const surfMatch = surfOut.match(/surface:\d+/);
+  if (!surfMatch) return null;
+
+  return { workspaceRef, surfaceRef: surfMatch[0] };
 }
 
 export function readScreen(surfaceId: string, lines?: number, workspaceId?: string | null): string {

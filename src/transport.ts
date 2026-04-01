@@ -100,6 +100,29 @@ export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): 
   }
 }
 
+export function renameTab(surfaceId: string, name: string, workspaceId?: string | null): void {
+  const cmux = resolveCmux();
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  try {
+    execFileSync(cmux, ['rename-tab', ...wsArgs, '--surface', surfaceId, '--', name], STDIO_OPTS);
+  } catch {}
+}
+
+export function moveSurface(surfaceId: string, targetWorkspaceId: string): void {
+  const cmux = resolveCmux();
+  execFileSync(cmux, ['move-surface', '--surface', surfaceId, '--workspace', targetWorkspaceId], STDIO_OPTS);
+}
+
+export function listWorkspaces(): string {
+  const cmux = resolveCmux();
+  return execFileSync(cmux, ['list-workspaces'], STDIO_OPTS).toString();
+}
+
+export function renameWorkspace(workspaceId: string, title: string): void {
+  const cmux = resolveCmux();
+  execFileSync(cmux, ['rename-workspace', '--workspace', workspaceId, '--', title], STDIO_OPTS);
+}
+
 export function identify(): { surfaceId: string | undefined; workspaceId: string | undefined } {
   return {
     surfaceId: process.env.CMUX_SURFACE_ID,

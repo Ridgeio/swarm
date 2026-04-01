@@ -146,6 +146,43 @@ EOF
   installed=$((installed + 1))
 fi
 
+# ── Swarm awareness hook ─────────────────────────────────────────────────────
+
+HOOK_SCRIPT="${SWARM_DIR}/hooks/swarm-awareness.sh"
+if command -v claude &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
+  echo ""
+  echo "Installing swarm awareness hook..."
+
+  # Update the SWARM_BIN path in the hook script
+  sed -i '' "s|SWARM_BIN=.*|SWARM_BIN=\"${SWARM_BIN}\"|" "$HOOK_SCRIPT"
+
+  SETTINGS_FILE="$HOME/.claude/settings.json"
+  if [ -f "$SETTINGS_FILE" ]; then
+    # Check if hooks already configured
+    if grep -q "swarm-awareness" "$SETTINGS_FILE" 2>/dev/null; then
+      echo "  Hook already configured in settings.json"
+    else
+      # Use node to safely merge the hook into settings.json
+      node -e "
+        const fs = require('fs');
+        const settings = JSON.parse(fs.readFileSync('$SETTINGS_FILE', 'utf8'));
+        if (!settings.hooks) settings.hooks = {};
+        if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = [];
+        settings.hooks.UserPromptSubmit.push({
+          matcher: '',
+          hooks: [{
+            type: 'command',
+            command: '$HOOK_SCRIPT',
+            timeout: 5
+          }]
+        });
+        fs.writeFileSync('$SETTINGS_FILE', JSON.stringify(settings, null, 2));
+      "
+      echo "  Installed: UserPromptSubmit hook for swarm awareness"
+    fi
+  fi
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""

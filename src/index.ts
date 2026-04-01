@@ -1,7 +1,7 @@
 import { getDb } from './db.js';
 import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, updateStatus, updateHeartbeat } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
-import { readScreen, identify, spawnWorkspace } from './transport.js';
+import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace } from './transport.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -46,6 +46,10 @@ Commands:
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read agent's terminal
   swarm spawn [--cwd <path>] [--autonomous]   Spawn a new Claude Code session
+  swarm rename <agent> <title>                Rename an agent's tab
+  swarm move <agent> --workspace <id>         Move agent to another workspace
+  swarm workspaces                            List Cmux workspaces
+  swarm rename-workspace <id> <title>         Rename a workspace
   swarm reset                                 Clear all agents and messages
   swarm help                                  Show this help`);
 }
@@ -66,6 +70,7 @@ try {
       const description = getFlag('--description');
       const db = getDb();
       const agent = joinAgent(db, name, surfaceId, workspaceId, process.ppid, description);
+      renameTab(surfaceId, name, workspaceId);
       console.log(`Joined swarm as "${agent.name}" (surface: ${agent.surface_id})`);
       break;
     }
@@ -206,6 +211,70 @@ try {
       const joinHint = name ? ` ${name}` : '';
       console.log(`Spawned new Claude Code session in ${cwd}`);
       console.log(`Run /join-swarm${joinHint} in the new session to join the swarm.`);
+      break;
+    }
+
+    case 'rename': {
+      const targetName = args[1];
+      const title = args.slice(2).join(' ');
+      if (!targetName || !title) {
+        console.error('Usage: swarm rename <agent> <title>');
+        process.exit(1);
+      }
+      const db = getDb();
+      const target = getAgent(db, targetName);
+      if (!target) {
+        console.error(`Agent "${targetName}" not found.`);
+        process.exit(1);
+      }
+      renameTab(target.surface_id, title, target.workspace_id);
+      console.log(`Renamed ${targetName}'s tab to "${title}"`);
+      break;
+    }
+
+    case 'move': {
+      const targetName = args[1];
+      const targetWorkspace = getFlag('--workspace');
+      if (!targetName || !targetWorkspace) {
+        console.error('Usage: swarm move <agent> --workspace <id>');
+        process.exit(1);
+      }
+      const db = getDb();
+      const target = getAgent(db, targetName);
+      if (!target) {
+        console.error(`Agent "${targetName}" not found.`);
+        process.exit(1);
+      }
+      try {
+        moveSurface(target.surface_id, targetWorkspace);
+        console.log(`Moved ${targetName} to workspace ${targetWorkspace}`);
+      } catch (err: any) {
+        console.error(`Failed to move ${targetName}: ${err.message}`);
+        process.exit(1);
+      }
+      break;
+    }
+
+    case 'workspaces': {
+      const output = listWorkspaces();
+      console.log(output);
+      break;
+    }
+
+    case 'rename-workspace': {
+      const wsId = args[1];
+      const title = args.slice(2).join(' ');
+      if (!wsId || !title) {
+        console.error('Usage: swarm rename-workspace <workspace-id> <title>');
+        process.exit(1);
+      }
+      try {
+        renameWorkspace(wsId, title);
+        console.log(`Renamed workspace ${wsId} to "${title}"`);
+      } catch (err: any) {
+        console.error(`Failed to rename workspace: ${err.message}`);
+        process.exit(1);
+      }
       break;
     }
 

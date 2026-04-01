@@ -76,18 +76,29 @@ describe('registry', () => {
     assert.strictEqual(agent?.description, 'reviewing PR');
   });
 
-  test('stale surface cleanup removes dead agents', () => {
-    // Both surfaces are fake so both will be cleaned up by cmux check.
-    // Insert agents directly and verify cleanupStale behavior via listAgents:
-    // since neither surface exists in cmux, listAgents will clean both.
-    joinAgent(db, 'Ghost', 'surface-ghost', 'workspace-1', 999999);
-    joinAgent(db, 'Alive', 'surface-alive', 'workspace-1', process.ppid);
-    // Verify both were inserted
+  test('stale surface cleanup removes dead agents with stale heartbeat', () => {
+    // Insert agents with fake surfaces and stale heartbeats (>10min old)
+    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
+      VALUES ('g1', 'Ghost', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?)`).run(staleTime, staleTime);
+    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
+      VALUES ('a1', 'Alive', NULL, 'surface-alive', 'workspace-1', ${process.ppid}, ?, ?)`).run(staleTime, staleTime);
     const before = db.prepare('SELECT * FROM agents').all() as any[];
     assert.strictEqual(before.length, 2);
-    // listAgents triggers cleanup — fake surfaces are not alive in cmux
+    // listAgents triggers cleanup — fake surfaces + stale heartbeats = pruned
     const after = listAgents(db);
     assert.strictEqual(after.length, 0);
+  });
+
+  test('agents with dead surface but fresh heartbeat are NOT pruned', () => {
+    // Fresh heartbeat protects against transient cmux errors
+    joinAgent(db, 'Fresh', 'surface-fake', 'workspace-1', process.ppid);
+    const before = db.prepare('SELECT * FROM agents').all() as any[];
+    assert.strictEqual(before.length, 1);
+    const after = listAgents(db);
+    // Should still be there — heartbeat is fresh even though surface is fake
+    assert.strictEqual(after.length, 1);
+    assert.strictEqual(after[0].name, 'Fresh');
   });
 
   test('empty DB returns empty list', () => {

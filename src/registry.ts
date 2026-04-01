@@ -68,11 +68,19 @@ export function updateHeartbeat(db: Database.Database, surfaceId: string): void 
   db.prepare('UPDATE agents SET last_heartbeat = ? WHERE surface_id = ?').run(now, surfaceId);
 }
 
+const STALE_THRESHOLD_MS = 10 * 60 * 1000; // 10 minutes
+
 function cleanupStale(db: Database.Database): void {
-  const agents = db.prepare('SELECT id, surface_id, workspace_id FROM agents').all() as Pick<Agent, 'id' | 'surface_id' | 'workspace_id'>[];
+  const agents = db.prepare('SELECT id, surface_id, workspace_id, last_heartbeat FROM agents').all() as Pick<Agent, 'id' | 'surface_id' | 'workspace_id' | 'last_heartbeat'>[];
+  const now = Date.now();
   for (const agent of agents) {
     if (!isSurfaceAlive(agent.surface_id, agent.workspace_id)) {
-      db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
+      // Only prune if surface is dead AND heartbeat is stale
+      // This prevents false positives from transient cmux errors
+      const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
+      if (heartbeatAge > STALE_THRESHOLD_MS) {
+        db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
+      }
     }
   }
 }

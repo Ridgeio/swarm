@@ -25,38 +25,24 @@ Agents register with `swarm join`, then communicate via `swarm send`. Messages a
 - **macOS** (Cmux is macOS-only)
 - **[Cmux](https://cmux.dev)** installed and running
 - **Node.js >= 20** (`node --version` to check)
-- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** CLI installed
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** and/or **[Codex CLI](https://github.com/openai/codex)** installed
 
 ## Install
-
-### 1. Clone and build
 
 ```bash
 git clone https://github.com/Ridgeio/swarm.git
 cd swarm
 npm install
 npm run build
+./install.sh
 ```
 
-### 2. Install the slash commands
+The install script auto-detects which agents you have installed (Claude Code, Codex CLI) and configures skills for each:
 
-This copies three commands (`/join-swarm`, `/leave-swarm`, `/reset-swarm`) into Claude Code and configures them to point at your local swarm binary:
+- **Claude Code**: installs `/join-swarm`, `/leave-swarm`, `/reset-swarm` slash commands
+- **Codex CLI**: installs coordination instructions at `~/.codex/swarm-instructions.md`
 
-```bash
-mkdir -p ~/.claude/commands
-
-# Get the absolute path to the swarm binary
-SWARM_BIN="$(pwd)/bin/swarm"
-
-# Install each command, replacing the generic 'swarm' with the full path
-for cmd in join-swarm leave-swarm reset-swarm; do
-  sed "s|swarm |${SWARM_BIN} |g" "skill/${cmd}.md" > ~/.claude/commands/${cmd}.md
-done
-
-echo "Installed. Your swarm binary is at: ${SWARM_BIN}"
-```
-
-### 3. Verify
+### Verify
 
 Open a Cmux terminal with Claude Code and run:
 
@@ -64,13 +50,7 @@ Open a Cmux terminal with Claude Code and run:
 /join-swarm TestAgent
 ```
 
-You should see: `Joined swarm as "TestAgent" (surface: ...)`. Then clean up:
-
-```
-/leave-swarm
-```
-
-If it works, you're set. If you get "command not found", check that the paths in `~/.claude/commands/join-swarm.md` point to the correct location of `bin/swarm`.
+You should see: `Joined swarm as "TestAgent" (surface: ...)`. Then clean up with `/leave-swarm`.
 
 ## Quick start
 

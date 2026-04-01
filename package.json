@@ -1,0 +1,29 @@
+{
+  "name": "swarm",
+  "version": "0.1.0",
+  "description": "Cross-terminal agent coordination via Cmux",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "swarm": "bin/swarm"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "node --import tsx --test tests/*.test.ts",
+    "prebuild": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^25.5.0",
+    "better-sqlite3": "^12.8.0",
+    "typescript": "^6.0.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}

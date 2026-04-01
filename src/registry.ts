@@ -1,6 +1,6 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
-import { readScreen, SurfaceGoneError } from './transport.js';
+import { isSurfaceAlive } from './transport.js';
 
 export interface Agent {
   id: string;
@@ -64,20 +64,10 @@ export function updateHeartbeat(db: Database.Database, surfaceId: string): void 
   db.prepare('UPDATE agents SET last_heartbeat = ? WHERE surface_id = ?').run(now, surfaceId);
 }
 
-function isSurfaceAlive(surfaceId: string): boolean {
-  try {
-    readScreen(surfaceId, 1);
-    return true;
-  } catch (err) {
-    if (err instanceof SurfaceGoneError) return false;
-    return true; // cmux not found or other error — assume alive
-  }
-}
-
 function cleanupStale(db: Database.Database): void {
-  const agents = db.prepare('SELECT id, surface_id FROM agents').all() as Pick<Agent, 'id' | 'surface_id'>[];
+  const agents = db.prepare('SELECT id, surface_id, workspace_id FROM agents').all() as Pick<Agent, 'id' | 'surface_id' | 'workspace_id'>[];
   for (const agent of agents) {
-    if (!isSurfaceAlive(agent.surface_id)) {
+    if (!isSurfaceAlive(agent.surface_id, agent.workspace_id)) {
       db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
     }
   }

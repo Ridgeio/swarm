@@ -32,7 +32,7 @@ export function sendMessage(
   const msgId = result.lastInsertRowid;
 
   try {
-    sendToSurface(target.surface_id, formatted);
+    sendToSurface(target.surface_id, formatted, target.workspace_id);
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
     return { delivered: true, message: `Message sent to ${toName}` };
   } catch (err) {
@@ -70,7 +70,7 @@ export function broadcastMessage(
   let failed = 0;
   for (const agent of recipients) {
     try {
-      sendToSurface(agent.surface_id, formatted);
+      sendToSurface(agent.surface_id, formatted, agent.workspace_id);
       sent++;
     } catch {
       failed++;

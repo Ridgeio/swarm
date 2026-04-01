@@ -186,7 +186,7 @@ try {
         process.exit(1);
       }
       const lines = getFlag('--lines');
-      const screen = readScreen(target.surface_id, lines ? parseInt(lines, 10) : undefined);
+      const screen = readScreen(target.surface_id, lines ? parseInt(lines, 10) : undefined, target.workspace_id);
       console.log(`--- ${target.name}'s terminal ---`);
       console.log(screen);
       break;

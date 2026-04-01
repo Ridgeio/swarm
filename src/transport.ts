@@ -44,25 +44,36 @@ function sanitize(text: string): string {
     .replace(/\t/g, ' ');
 }
 
-export function sendToSurface(surfaceId: string, text: string): void {
+export function sendToSurface(surfaceId: string, text: string, workspaceId?: string | null): void {
   const cmux = resolveCmux();
   const safe = sanitize(text);
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
   try {
-    execFileSync(cmux, ['send', '--surface', surfaceId, safe], { stdio: ['pipe', 'pipe', 'pipe'] });
-    execFileSync(cmux, ['send-key', '--surface', surfaceId, 'Enter'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], { stdio: ['pipe', 'pipe', 'pipe'] });
+    execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], { stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (err: any) {
     throw new SurfaceGoneError(surfaceId);
   }
 }
 
-export function readScreen(surfaceId: string, lines?: number): string {
+export function readScreen(surfaceId: string, lines?: number, workspaceId?: string | null): string {
   const cmux = resolveCmux();
-  const args = ['read-screen', '--surface', surfaceId];
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  const args = ['read-screen', ...wsArgs, '--surface', surfaceId];
   if (lines) args.push('--lines', String(lines));
   try {
     return execFileSync(cmux, args, { stdio: ['pipe', 'pipe', 'pipe'] }).toString();
   } catch (err: any) {
     throw new SurfaceGoneError(surfaceId);
+  }
+}
+
+export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean {
+  try {
+    readScreen(surfaceId, 1, workspaceId);
+    return true;
+  } catch {
+    return false;
   }
 }
 

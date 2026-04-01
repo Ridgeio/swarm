@@ -48,13 +48,10 @@ export function sendToSurface(surfaceId: string, text: string): void {
   const cmux = resolveCmux();
   const safe = sanitize(text);
   try {
-    execFileSync(cmux, ['send', '--surface', surfaceId, safe]);
-    execFileSync(cmux, ['send-key', '--surface', surfaceId, 'Enter']);
+    execFileSync(cmux, ['send', '--surface', surfaceId, safe], { stdio: ['pipe', 'pipe', 'pipe'] });
+    execFileSync(cmux, ['send-key', '--surface', surfaceId, 'Enter'], { stdio: ['pipe', 'pipe', 'pipe'] });
   } catch (err: any) {
-    if (err.status !== 0) {
-      throw new SurfaceGoneError(surfaceId);
-    }
-    throw err;
+    throw new SurfaceGoneError(surfaceId);
   }
 }
 
@@ -63,12 +60,9 @@ export function readScreen(surfaceId: string, lines?: number): string {
   const args = ['read-screen', '--surface', surfaceId];
   if (lines) args.push('--lines', String(lines));
   try {
-    return execFileSync(cmux, args).toString();
+    return execFileSync(cmux, args, { stdio: ['pipe', 'pipe', 'pipe'] }).toString();
   } catch (err: any) {
-    if (err.status !== 0) {
-      throw new SurfaceGoneError(surfaceId);
-    }
-    throw err;
+    throw new SurfaceGoneError(surfaceId);
   }
 }
 

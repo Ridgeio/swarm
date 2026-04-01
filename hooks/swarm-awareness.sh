@@ -12,6 +12,9 @@ DB="$HOME/.swarm/swarm.db"
 AGENT=$(sqlite3 "$DB" "SELECT name FROM agents WHERE surface_id='$SURFACE_ID'" 2>/dev/null)
 [ -z "$AGENT" ] && exit 0
 
+# Refresh heartbeat on every prompt — keeps idle agents alive
+sqlite3 "$DB" "UPDATE agents SET last_heartbeat='$(date -u +%Y-%m-%dT%H:%M:%S.000Z)' WHERE surface_id='$SURFACE_ID'" 2>/dev/null
+
 SWARM_BIN="/Users/tom/Developer/Ridge.io/swarm/bin/swarm"
 MEMBERS=$(sqlite3 "$DB" "SELECT name FROM agents ORDER BY joined_at" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
 

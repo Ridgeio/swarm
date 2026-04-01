@@ -1,5 +1,5 @@
 import { getDb } from './db.js';
-import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, updateStatus, updateHeartbeat } from './registry.js';
+import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, updateStatus, updateHeartbeat, updateWorkspace } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 
@@ -261,6 +261,7 @@ try {
       }
       try {
         moveSurface(target.surface_id, targetWorkspace);
+        updateWorkspace(db, target.surface_id, targetWorkspace);
         console.log(`Moved ${targetName} to workspace ${targetWorkspace}`);
       } catch (err: any) {
         console.error(`Failed to move ${targetName}: ${err.message}`);

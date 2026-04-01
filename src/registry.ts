@@ -59,6 +59,10 @@ export function updateStatus(db: Database.Database, surfaceId: string, descripti
   return result.changes > 0;
 }
 
+export function updateWorkspace(db: Database.Database, surfaceId: string, workspaceId: string): void {
+  db.prepare('UPDATE agents SET workspace_id = ? WHERE surface_id = ?').run(workspaceId, surfaceId);
+}
+
 export function updateHeartbeat(db: Database.Database, surfaceId: string): void {
   const now = new Date().toISOString();
   db.prepare('UPDATE agents SET last_heartbeat = ? WHERE surface_id = ?').run(now, surfaceId);

@@ -1,7 +1,7 @@
 import { getDb } from './db.js';
 import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, updateStatus, updateHeartbeat } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
-import { readScreen, identify } from './transport.js';
+import { readScreen, identify, spawnWorkspace } from './transport.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -45,6 +45,7 @@ Commands:
   swarm status [--set <desc>] [--agent <name>] Update or query status
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read agent's terminal
+  swarm spawn [--cwd <path>] [--autonomous]   Spawn a new Claude Code session
   swarm reset                                 Clear all agents and messages
   swarm help                                  Show this help`);
 }
@@ -189,6 +190,22 @@ try {
       const screen = readScreen(target.surface_id, lines ? parseInt(lines, 10) : undefined, target.workspace_id);
       console.log(`--- ${target.name}'s terminal ---`);
       console.log(screen);
+      break;
+    }
+
+    case 'spawn': {
+      const name = getFlag('--name');
+      const cwd = getFlag('--cwd') || process.cwd();
+      const autonomous = hasFlag('--autonomous');
+
+      const perms = autonomous ? ' --dangerously-skip-permissions' : '';
+      const claudeCmd = `claude${perms}`;
+
+      spawnWorkspace(cwd, claudeCmd);
+
+      const joinHint = name ? ` ${name}` : '';
+      console.log(`Spawned new Claude Code session in ${cwd}`);
+      console.log(`Run /join-swarm${joinHint} in the new session to join the swarm.`);
       break;
     }
 

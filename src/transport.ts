@@ -44,16 +44,39 @@ function sanitize(text: string): string {
     .replace(/\t/g, ' ');
 }
 
+const CHUNK_SIZE = 60;
+const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe', 'pipe'] };
+
+function sleep(seconds: number): void {
+  execFileSync('sleep', [String(seconds)], STDIO_OPTS);
+}
+
 export function sendToSurface(surfaceId: string, text: string, workspaceId?: string | null): void {
   const cmux = resolveCmux();
   const safe = sanitize(text);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
   try {
-    execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], { stdio: ['pipe', 'pipe', 'pipe'] });
-    execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], { stdio: ['pipe', 'pipe', 'pipe'] });
+    // Chunk long messages to avoid Claude Code paste-bracket detection
+    if (safe.length <= CHUNK_SIZE) {
+      execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
+    } else {
+      for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
+        const chunk = safe.slice(i, i + CHUNK_SIZE);
+        execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
+        sleep(0.015);
+      }
+    }
+    // Let input settle before submitting
+    sleep(0.1);
+    execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
   } catch (err: any) {
     throw new SurfaceGoneError(surfaceId);
   }
+}
+
+export function spawnWorkspace(cwd: string, command: string): void {
+  const cmux = resolveCmux();
+  execFileSync(cmux, ['new-workspace', '--cwd', cwd, '--command', command], STDIO_OPTS);
 }
 
 export function readScreen(surfaceId: string, lines?: number, workspaceId?: string | null): string {
@@ -62,7 +85,7 @@ export function readScreen(surfaceId: string, lines?: number, workspaceId?: stri
   const args = ['read-screen', ...wsArgs, '--surface', surfaceId];
   if (lines) args.push('--lines', String(lines));
   try {
-    return execFileSync(cmux, args, { stdio: ['pipe', 'pipe', 'pipe'] }).toString();
+    return execFileSync(cmux, args, STDIO_OPTS).toString();
   } catch (err: any) {
     throw new SurfaceGoneError(surfaceId);
   }

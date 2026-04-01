@@ -45,6 +45,7 @@ Commands:
   swarm status [--set <desc>] [--agent <name>] Update or query status
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read agent's terminal
+  swarm reset                                 Clear all agents and messages
   swarm help                                  Show this help`);
 }
 
@@ -188,6 +189,16 @@ try {
       const screen = readScreen(target.surface_id, lines ? parseInt(lines, 10) : undefined);
       console.log(`--- ${target.name}'s terminal ---`);
       console.log(screen);
+      break;
+    }
+
+    case 'reset': {
+      const db = getDb();
+      const agents = listAgents(db);
+      db.exec('DELETE FROM agents');
+      db.exec('DELETE FROM messages');
+      db.exec('DELETE FROM inbox_cursors');
+      console.log(`Swarm reset. Cleared ${agents.length} agent(s) and all messages.`);
       break;
     }
 

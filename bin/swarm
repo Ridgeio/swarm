@@ -1,2 +1,15 @@
 #!/usr/bin/env node
-import('../dist/index.js');
+try {
+  await import('../dist/index.js');
+} catch (err) {
+  if (err?.message?.includes('NODE_MODULE_VERSION')) {
+    const { execSync } = await import('node:child_process');
+    const path = await import('node:path');
+    const root = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+    process.stderr.write('Rebuilding native modules for current Node version...\n');
+    execSync('npm rebuild better-sqlite3', { cwd: root, stdio: 'inherit' });
+    await import('../dist/index.js');
+  } else {
+    throw err;
+  }
+}

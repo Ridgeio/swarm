@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getDbAt } from '../src/db.js';
-import { joinAgent, leaveAgent, getAgent, listAgents, updateStatus } from '../src/registry.js';
+import { joinAgent, leaveAgent, getAgent, listAgents, updateStatus, joinA2AAgent, leaveA2AAgent } from '../src/registry.js';
 import { getInbox } from '../src/mailbox.js';
 import type Database from 'better-sqlite3';
 
@@ -49,11 +49,11 @@ describe('registry', () => {
     assert.strictEqual(agents[0].description, 'new task');
   });
 
-  test('leave removes agent by surface ID', () => {
+  test('leave removes agent by surface ID', async () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
     const removed = leaveAgent(db, 'surface-1');
     assert.strictEqual(removed, true);
-    const agents = listAgents(db);
+    const agents = await listAgents(db);
     assert.strictEqual(agents.length, 0);
   });
 
@@ -76,34 +76,50 @@ describe('registry', () => {
     assert.strictEqual(agent?.description, 'reviewing PR');
   });
 
-  test('stale surface cleanup removes dead agents with stale heartbeat', () => {
+  test('stale surface cleanup removes dead agents with stale heartbeat', async () => {
     // Insert agents with fake surfaces and stale heartbeats (>10min old)
     const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
-    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
-      VALUES ('g1', 'Ghost', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?)`).run(staleTime, staleTime);
-    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
-      VALUES ('a1', 'Alive', NULL, 'surface-alive', 'workspace-1', ${process.ppid}, ?, ?)`).run(staleTime, staleTime);
+    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
+      VALUES ('g1', 'Ghost', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?, 'cmux', NULL)`).run(staleTime, staleTime);
+    db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
+      VALUES ('a1', 'Alive', NULL, 'surface-alive', 'workspace-1', ${process.ppid}, ?, ?, 'cmux', NULL)`).run(staleTime, staleTime);
     const before = db.prepare('SELECT * FROM agents').all() as any[];
     assert.strictEqual(before.length, 2);
     // listAgents triggers cleanup — fake surfaces + stale heartbeats = pruned
-    const after = listAgents(db);
+    const after = await listAgents(db);
     assert.strictEqual(after.length, 0);
   });
 
-  test('agents with dead surface but fresh heartbeat are NOT pruned', () => {
+  test('agents with dead surface but fresh heartbeat are NOT pruned', async () => {
     // Fresh heartbeat protects against transient cmux errors
     joinAgent(db, 'Fresh', 'surface-fake', 'workspace-1', process.ppid);
     const before = db.prepare('SELECT * FROM agents').all() as any[];
     assert.strictEqual(before.length, 1);
-    const after = listAgents(db);
+    const after = await listAgents(db);
     // Should still be there — heartbeat is fresh even though surface is fake
     assert.strictEqual(after.length, 1);
     assert.strictEqual(after[0].name, 'Fresh');
   });
 
-  test('empty DB returns empty list', () => {
-    const agents = listAgents(db);
+  test('empty DB returns empty list', async () => {
+    const agents = await listAgents(db);
     assert.strictEqual(agents.length, 0);
+  });
+
+  test('joinA2AAgent creates agent with a2a type', () => {
+    const agent = joinA2AAgent(db, 'Cooper', 'http://localhost:18789', 'OpenClaw agent');
+    assert.strictEqual(agent.agent_type, 'a2a');
+    assert.strictEqual(agent.endpoint_url, 'http://localhost:18789');
+    assert.strictEqual(agent.surface_id, 'a2a:Cooper');
+    assert.strictEqual(agent.description, 'OpenClaw agent');
+  });
+
+  test('leaveA2AAgent removes by name', () => {
+    joinA2AAgent(db, 'Cooper', 'http://localhost:18789');
+    const removed = leaveA2AAgent(db, 'Cooper');
+    assert.strictEqual(removed, true);
+    const agent = getAgent(db, 'Cooper');
+    assert.strictEqual(agent, null);
   });
 });
 

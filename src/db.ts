@@ -41,6 +41,16 @@ function migrate(db: Database.Database): void {
       last_read_id INTEGER NOT NULL DEFAULT 0
     );
   `);
+
+  // v2 migration: add A2A support columns
+  const columns = db.prepare("PRAGMA table_info(agents)").all() as { name: string }[];
+  const colNames = new Set(columns.map(c => c.name));
+  if (!colNames.has('agent_type')) {
+    db.exec("ALTER TABLE agents ADD COLUMN agent_type TEXT NOT NULL DEFAULT 'cmux'");
+  }
+  if (!colNames.has('endpoint_url')) {
+    db.exec("ALTER TABLE agents ADD COLUMN endpoint_url TEXT");
+  }
 }
 
 export function getDb(): Database.Database {

@@ -115,18 +115,42 @@ async function main() {
           process.exit(1);
         }
 
-        // Verify agent is reachable
+        // Validate endpoint URL
+        let parsedUrl: URL;
+        try {
+          parsedUrl = new URL(endpoint);
+        } catch {
+          console.error(`Invalid endpoint URL: "${endpoint}". Must be a valid URL (e.g., http://localhost:18789).`);
+          process.exit(1);
+        }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+          console.error(`Unsupported protocol "${parsedUrl.protocol}". Endpoint must use http:// or https://.`);
+          process.exit(1);
+        }
+
+        // Probe agent — try agent card, then fall back to basic reachability
         let agentDescription = getFlag('--description');
+        let reachable = false;
         try {
           const resp = await fetch(`${endpoint}/.well-known/agent-card.json`, {
             signal: AbortSignal.timeout(5000),
           });
+          reachable = true;
           if (resp.ok && !agentDescription) {
             const card = await resp.json() as { description?: string };
             agentDescription = card.description;
           }
         } catch {
-          // Agent card not available — register anyway, agent may not implement discovery yet
+          // Agent card not available — try basic reachability
+          try {
+            await fetch(endpoint, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
+            reachable = true;
+          } catch {
+            // Endpoint not reachable
+          }
+        }
+        if (!reachable) {
+          console.warn(`Warning: endpoint ${endpoint} is not reachable. Registering anyway.`);
         }
 
         const db = getDb();

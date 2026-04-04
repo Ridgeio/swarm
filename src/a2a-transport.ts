@@ -17,7 +17,7 @@ export class A2ATransport implements Transport {
           role: 'user',
           parts: [{ kind: 'text', text: formattedText }],
         },
-      });
+      }, { signal: AbortSignal.timeout(15000) });
       return { delivered: true };
     } catch (err: any) {
       return { delivered: false, error: `A2A delivery failed: ${err.message}` };

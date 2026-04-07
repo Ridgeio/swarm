@@ -286,10 +286,10 @@ async function main() {
         if (agents.length === 0) {
           console.log('No agents in swarm.');
         } else {
-          const surfaceId = process.env.CMUX_SURFACE_ID;
-          const selfName = process.env.SWARM_AGENT_NAME;
+          const db2 = getDb();
+          const self = getSelf(db2);
           for (const agent of agents) {
-            const you = (surfaceId && agent.surface_id === surfaceId) || (selfName && agent.name.toLowerCase() === selfName.toLowerCase()) ? ' (you)' : '';
+            const you = self && agent.name.toLowerCase() === self.name.toLowerCase() ? ' (you)' : '';
             const desc = agent.description ? ` — ${agent.description}` : '';
             const type = agent.agent_type === 'a2a' ? ` [a2a] @ ${agent.endpoint_url}` : agent.agent_type === 'headless' ? ' [headless]' : ' [cmux]';
             console.log(`  ${agent.name}${type}${you}${desc}`);

@@ -1,8 +1,13 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { isSurfaceAlive } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
+
+const HEADLESS_SELF_PATH = path.join(os.homedir(), '.swarm', 'headless-self');
 
 export interface Agent {
   id: string;
@@ -73,11 +78,21 @@ export function joinHeadlessAgent(
     throw new Error(`Agent "${name}" is already registered as a ${existing.agent_type} agent. Choose a different name or remove the existing agent first.`);
   }
   const syntheticSurfaceId = `headless:${name}`;
-  return joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  const agent = joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  // Write marker file so subsequent CLI calls auto-detect this agent
+  fs.writeFileSync(HEADLESS_SELF_PATH, name, 'utf-8');
+  return agent;
 }
 
 export function leaveHeadlessAgent(db: Database.Database, name: string): boolean {
   const result = db.prepare("DELETE FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").run(name);
+  // Remove marker file
+  if (fs.existsSync(HEADLESS_SELF_PATH)) {
+    const savedName = fs.readFileSync(HEADLESS_SELF_PATH, 'utf-8').trim();
+    if (savedName.toLowerCase() === name.toLowerCase()) {
+      fs.unlinkSync(HEADLESS_SELF_PATH);
+    }
+  }
   return result.changes > 0;
 }
 
@@ -91,6 +106,13 @@ export function getSelf(db: Database.Database): Agent | null {
   const agentName = process.env.SWARM_AGENT_NAME;
   if (agentName) {
     return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(agentName) as Agent | undefined ?? null;
+  }
+  // Try headless marker file (written by `swarm join --headless`)
+  if (fs.existsSync(HEADLESS_SELF_PATH)) {
+    const name = fs.readFileSync(HEADLESS_SELF_PATH, 'utf-8').trim();
+    if (name) {
+      return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(name) as Agent | undefined ?? null;
+    }
   }
   return null;
 }

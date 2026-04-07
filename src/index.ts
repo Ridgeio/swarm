@@ -1,25 +1,27 @@
 import { getDb } from './db.js';
-import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent } from './registry.js';
+import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, leaveHeadlessAgent } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
+import { installHook, removeHook, detectHost } from './hooks.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
 
 function requireSelf() {
-  const surfaceId = process.env.CMUX_SURFACE_ID;
-  if (!surfaceId) {
-    console.error('Error: CMUX_SURFACE_ID is not set. Are you running inside Cmux?');
-    process.exit(1);
-  }
   const db = getDb();
   const self = getSelf(db);
   if (!self) {
-    console.error('Error: Not joined to swarm. Run "swarm join <name>" first.');
+    const surfaceId = process.env.CMUX_SURFACE_ID;
+    const agentName = process.env.SWARM_AGENT_NAME;
+    if (!surfaceId && !agentName) {
+      console.error('Error: Not in a swarm context. Set CMUX_SURFACE_ID (Cmux) or SWARM_AGENT_NAME (headless).');
+    } else {
+      console.error('Error: Not joined to swarm. Run "swarm join <name>" first.');
+    }
     process.exit(1);
   }
-  updateHeartbeat(db, surfaceId);
-  return { db, self, surfaceId };
+  updateHeartbeat(db, self.surface_id);
+  return { db, self, surfaceId: self.surface_id };
 }
 
 function getFlag(flag: string): string | undefined {
@@ -40,11 +42,12 @@ function requireCmuxAgent(agent: { name: string; agent_type: string }, action: s
 }
 
 function printHelp() {
-  console.log(`swarm — Cross-terminal agent coordination via Cmux and A2A
+  console.log(`swarm — Cross-terminal agent coordination via Cmux, headless, and A2A
 
 Agent Management:
-  swarm join <name> [--description <text>]        Register this Cmux terminal
-  swarm leave                                      Deregister this Cmux terminal
+  swarm join <name> [--description <text>]        Register (auto-detects Cmux or headless)
+    [--headless]                                   Force headless mode (no Cmux required)
+  swarm leave                                      Deregister from the swarm
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>]
   swarm unregister-a2a <name>                      Remove an A2A agent
@@ -79,14 +82,10 @@ async function main() {
       case 'join': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm join <name> [--description <text>]');
+          console.error('Usage: swarm join <name> [--description <text>] [--headless]');
           process.exit(1);
         }
-        const { surfaceId, workspaceId } = identify();
-        if (!surfaceId) {
-          console.error('Error: CMUX_SURFACE_ID is not set. Are you running inside Cmux?');
-          process.exit(1);
-        }
+        const headless = hasFlag('--headless');
         const description = getFlag('--description');
         const db = getDb();
         const existing = getAgent(db, name);
@@ -94,15 +93,51 @@ async function main() {
           console.error(`Agent "${name}" is already registered as an A2A agent. Choose a different name or run "swarm unregister-a2a ${name}" first.`);
           process.exit(1);
         }
-        const agent = joinAgent(db, name, surfaceId, workspaceId, process.ppid, description);
-        renameTab(surfaceId, name, workspaceId);
-        console.log(`Joined swarm as "${agent.name}" (surface: ${agent.surface_id})`);
+
+        if (headless) {
+          const agent = joinHeadlessAgent(db, name, description);
+          // Auto-install awareness hook
+          const host = detectHost();
+          if (host) {
+            installHook(host, name);
+            console.log(`Joined swarm as "${agent.name}" (headless, ${host} hook installed)`);
+          } else {
+            console.log(`Joined swarm as "${agent.name}" (headless)`);
+            console.log('Tip: Run "swarm inbox" periodically to check for messages.');
+          }
+        } else {
+          const { surfaceId, workspaceId } = identify();
+          if (!surfaceId) {
+            // Auto-detect: if not in Cmux, fall back to headless
+            const agent = joinHeadlessAgent(db, name, description);
+            const host = detectHost();
+            if (host) {
+              installHook(host, name);
+              console.log(`Joined swarm as "${agent.name}" (headless, ${host} hook installed)`);
+            } else {
+              console.log(`Joined swarm as "${agent.name}" (headless — not in Cmux)`);
+              console.log('Tip: Run "swarm inbox" periodically to check for messages.');
+            }
+          } else {
+            const agent = joinAgent(db, name, surfaceId, workspaceId, process.ppid, description);
+            renameTab(surfaceId, name, workspaceId);
+            console.log(`Joined swarm as "${agent.name}" (surface: ${agent.surface_id})`);
+          }
+        }
         break;
       }
 
       case 'leave': {
         const { db, self } = requireSelf();
-        leaveAgent(db, self.surface_id);
+        if (self.agent_type === 'headless') {
+          leaveHeadlessAgent(db, self.name);
+          const host = detectHost();
+          if (host) {
+            removeHook(host, self.name);
+          }
+        } else {
+          leaveAgent(db, self.surface_id);
+        }
         console.log(`Left swarm (was "${self.name}")`);
         break;
       }
@@ -252,10 +287,11 @@ async function main() {
           console.log('No agents in swarm.');
         } else {
           const surfaceId = process.env.CMUX_SURFACE_ID;
+          const selfName = process.env.SWARM_AGENT_NAME;
           for (const agent of agents) {
-            const you = agent.surface_id === surfaceId ? ' (you)' : '';
+            const you = (surfaceId && agent.surface_id === surfaceId) || (selfName && agent.name.toLowerCase() === selfName.toLowerCase()) ? ' (you)' : '';
             const desc = agent.description ? ` — ${agent.description}` : '';
-            const type = agent.agent_type === 'a2a' ? ` [a2a] @ ${agent.endpoint_url}` : ' [cmux]';
+            const type = agent.agent_type === 'a2a' ? ` [a2a] @ ${agent.endpoint_url}` : agent.agent_type === 'headless' ? ' [headless]' : ' [cmux]';
             console.log(`  ${agent.name}${type}${you}${desc}`);
           }
           console.log(`\n${agents.length} agent(s)`);

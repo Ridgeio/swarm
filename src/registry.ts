@@ -63,10 +63,36 @@ export function leaveA2AAgent(db: Database.Database, name: string): boolean {
   return result.changes > 0;
 }
 
+export function joinHeadlessAgent(
+  db: Database.Database,
+  name: string,
+  description?: string
+): Agent {
+  const existing = getAgent(db, name);
+  if (existing && existing.agent_type !== 'headless') {
+    throw new Error(`Agent "${name}" is already registered as a ${existing.agent_type} agent. Choose a different name or remove the existing agent first.`);
+  }
+  const syntheticSurfaceId = `headless:${name}`;
+  return joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+}
+
+export function leaveHeadlessAgent(db: Database.Database, name: string): boolean {
+  const result = db.prepare("DELETE FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").run(name);
+  return result.changes > 0;
+}
+
 export function getSelf(db: Database.Database): Agent | null {
+  // Try Cmux surface first
   const surfaceId = process.env.CMUX_SURFACE_ID;
-  if (!surfaceId) return null;
-  return db.prepare('SELECT * FROM agents WHERE surface_id = ?').get(surfaceId) as Agent | undefined ?? null;
+  if (surfaceId) {
+    return db.prepare('SELECT * FROM agents WHERE surface_id = ?').get(surfaceId) as Agent | undefined ?? null;
+  }
+  // Try headless agent by SWARM_AGENT_NAME env var
+  const agentName = process.env.SWARM_AGENT_NAME;
+  if (agentName) {
+    return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(agentName) as Agent | undefined ?? null;
+  }
+  return null;
 }
 
 export function getAgent(db: Database.Database, name: string): Agent | null {
@@ -106,13 +132,19 @@ async function cleanupStale(db: Database.Database): Promise<void> {
 
   // Check all agents in parallel
   const checks = agents.map(async (agent) => {
-    const alive = agent.agent_type === 'a2a'
-      ? await isAgentAlive(agent)
-      : isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    let alive: boolean;
+    if (agent.agent_type === 'a2a') {
+      alive = await isAgentAlive(agent);
+    } else if (agent.agent_type === 'headless') {
+      // Headless agents are alive if their heartbeat is fresh
+      const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
+      alive = heartbeatAge <= STALE_THRESHOLD_MS;
+    } else {
+      alive = isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    }
 
     if (alive) {
       // Refresh heartbeat for A2A agents on successful liveness check
-      // so transient failures after 10min don't cause immediate pruning
       if (agent.agent_type === 'a2a') {
         updateHeartbeat(db, agent.surface_id);
       }

@@ -1,4 +1,4 @@
-export type AgentType = 'cmux' | 'a2a';
+export type AgentType = 'cmux' | 'a2a' | 'headless';
 
 export interface TransportAgent {
   name: string;

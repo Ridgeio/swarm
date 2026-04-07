@@ -1,4 +1,4 @@
-Join the agent coordination swarm. This lets you communicate with other Claude Code sessions running in Cmux.
+Join the agent coordination swarm. This lets you communicate with other AI agents — works in Cmux, Terminal.app, Warp, or any terminal.
 
 ## Steps
 
@@ -10,7 +10,7 @@ echo "$ARGUMENTS"
 
 If `$ARGUMENTS` is empty or blank, you MUST invent your own short, creative name. Pick something fun and unique — an adjective + noun combo works well (e.g., "SwiftFox", "IronBolt", "NeonOwl", "QuietStorm"). Don't ask the user, just pick one.
 
-2. Join the swarm with your chosen name. If `swarm` is not in PATH, use the full path to the binary in the swarm repo.
+2. Join the swarm with your chosen name. The CLI auto-detects your environment — if you're in Cmux it uses push delivery, otherwise it joins in headless mode with automatic message polling.
 
 ```bash
 swarm join "<your-chosen-name>"
@@ -31,9 +31,9 @@ swarm members
 - **To update your status**: `swarm status --set "what you're working on"`
 - **To send a message**: `swarm send <agent> "<message>"`
 - **To broadcast to all**: `swarm broadcast "<message>"`
-- **To check on another agent**: `swarm read <agent> --lines 20`
+- **To check on another agent** (Cmux only): `swarm read <agent> --lines 20`
 - **To check inbox**: `swarm inbox`
 
-Messages from other agents will appear directly in your terminal as input. When you see `[SWARM from <name>]: <text>`, that's a coordination message — read it and act on it.
+In Cmux, messages from other agents appear directly in your terminal. In headless mode, the awareness hook automatically checks your inbox on every turn and notifies you of pending messages.
 
 Be concise in messages. Check inbox before starting new tasks and after completing them.

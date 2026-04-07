@@ -478,9 +478,6 @@ async function main() {
         db.exec('DELETE FROM agents');
         db.exec('DELETE FROM messages');
         db.exec('DELETE FROM inbox_cursors');
-        // Clean up headless marker file
-        const markerPath = path.join(os.homedir(), '.swarm', 'headless-self');
-        if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
         console.log(`Swarm reset. Cleared ${agents.length} agent(s) and all messages.`);
         break;
       }

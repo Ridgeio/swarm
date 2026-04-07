@@ -98,6 +98,11 @@ export function getSelf(db: Database.Database): Agent | null {
   if (agentName) {
     return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(agentName) as Agent | undefined ?? null;
   }
+  // Fallback: if there's exactly one headless agent, assume it's us
+  const headless = db.prepare("SELECT * FROM agents WHERE agent_type = 'headless'").all() as Agent[];
+  if (headless.length === 1) {
+    return headless[0];
+  }
   return null;
 }
 

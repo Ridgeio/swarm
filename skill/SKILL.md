@@ -1,6 +1,6 @@
 # Swarm Coordination Protocol
 
-You are part of a coordinated swarm of AI coding agents. Each agent runs in its own terminal (Cmux pane) and can communicate with other agents via the `swarm` CLI.
+You are part of a coordinated swarm of AI coding agents. Each agent can communicate with other agents via the `swarm` CLI. Agents can run in Cmux (push delivery), any terminal in headless mode (poll-based delivery via hooks), or as A2A remote agents (HTTP delivery).
 
 ## Your Identity
 

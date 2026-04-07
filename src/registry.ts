@@ -1,11 +1,20 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { isSurfaceAlive } from './transport.js';
+import { isAgentAlive } from './transport-router.js';
+import type { AgentType } from './transport-interface.js';
+
+const HEADLESS_SELF_PATH = path.join(os.homedir(), '.swarm', 'headless-self');
 
 export interface Agent {
   id: string;
   name: string;
   description: string | null;
+  agent_type: AgentType;
+  endpoint_url: string | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -19,17 +28,34 @@ export function joinAgent(
   surfaceId: string,
   workspaceId: string | undefined,
   ppid: number,
-  description?: string
+  description?: string,
+  agentType: AgentType = 'cmux',
+  endpointUrl?: string
 ): Agent {
   const id = randomUUID();
   const now = new Date().toISOString();
 
   db.prepare(`
-    INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now);
+    INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null);
 
-  return { id, name, description: description ?? null, surface_id: surfaceId, workspace_id: workspaceId ?? null, ppid, joined_at: now, last_heartbeat: now };
+  return { id, name, description: description ?? null, agent_type: agentType, endpoint_url: endpointUrl ?? null, surface_id: surfaceId, workspace_id: workspaceId ?? null, ppid, joined_at: now, last_heartbeat: now };
+}
+
+export function joinA2AAgent(
+  db: Database.Database,
+  name: string,
+  endpointUrl: string,
+  description?: string
+): Agent {
+  // Prevent overwriting an existing Cmux agent
+  const existing = getAgent(db, name);
+  if (existing && existing.agent_type === 'cmux') {
+    throw new Error(`Agent "${name}" is already registered as a Cmux agent. Choose a different name or remove the existing agent first.`);
+  }
+  const syntheticSurfaceId = `a2a:${name}`;
+  return joinAgent(db, name, syntheticSurfaceId, undefined, 0, description, 'a2a', endpointUrl);
 }
 
 export function leaveAgent(db: Database.Database, surfaceId: string): boolean {
@@ -37,18 +63,70 @@ export function leaveAgent(db: Database.Database, surfaceId: string): boolean {
   return result.changes > 0;
 }
 
+export function leaveA2AAgent(db: Database.Database, name: string): boolean {
+  const result = db.prepare("DELETE FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'a2a'").run(name);
+  return result.changes > 0;
+}
+
+export function joinHeadlessAgent(
+  db: Database.Database,
+  name: string,
+  description?: string
+): Agent {
+  const existing = getAgent(db, name);
+  if (existing && existing.agent_type !== 'headless') {
+    throw new Error(`Agent "${name}" is already registered as a ${existing.agent_type} agent. Choose a different name or remove the existing agent first.`);
+  }
+  const syntheticSurfaceId = `headless:${name}`;
+  const agent = joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  // Write marker file so subsequent CLI calls auto-detect this agent
+  fs.writeFileSync(HEADLESS_SELF_PATH, name, 'utf-8');
+  return agent;
+}
+
+export function leaveHeadlessAgent(db: Database.Database, name: string): boolean {
+  const result = db.prepare("DELETE FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").run(name);
+  // Remove marker file
+  if (fs.existsSync(HEADLESS_SELF_PATH)) {
+    const savedName = fs.readFileSync(HEADLESS_SELF_PATH, 'utf-8').trim();
+    if (savedName.toLowerCase() === name.toLowerCase()) {
+      fs.unlinkSync(HEADLESS_SELF_PATH);
+    }
+  }
+  return result.changes > 0;
+}
+
 export function getSelf(db: Database.Database): Agent | null {
+  // Try Cmux surface first
   const surfaceId = process.env.CMUX_SURFACE_ID;
-  if (!surfaceId) return null;
-  return db.prepare('SELECT * FROM agents WHERE surface_id = ?').get(surfaceId) as Agent | undefined ?? null;
+  if (surfaceId) {
+    return db.prepare('SELECT * FROM agents WHERE surface_id = ?').get(surfaceId) as Agent | undefined ?? null;
+  }
+  // Try headless agent by SWARM_AGENT_NAME env var
+  const agentName = process.env.SWARM_AGENT_NAME;
+  if (agentName) {
+    return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(agentName) as Agent | undefined ?? null;
+  }
+  // Try headless marker file (written by `swarm join --headless`)
+  if (fs.existsSync(HEADLESS_SELF_PATH)) {
+    const name = fs.readFileSync(HEADLESS_SELF_PATH, 'utf-8').trim();
+    if (name) {
+      return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(name) as Agent | undefined ?? null;
+    }
+  }
+  return null;
 }
 
 export function getAgent(db: Database.Database, name: string): Agent | null {
   return db.prepare('SELECT * FROM agents WHERE name = ? COLLATE NOCASE').get(name) as Agent | undefined ?? null;
 }
 
-export function listAgents(db: Database.Database): Agent[] {
-  cleanupStale(db);
+export async function listAgents(db: Database.Database): Promise<Agent[]> {
+  await cleanupStale(db);
+  return db.prepare('SELECT * FROM agents ORDER BY joined_at ASC').all() as Agent[];
+}
+
+export function listAgentsSync(db: Database.Database): Agent[] {
   return db.prepare('SELECT * FROM agents ORDER BY joined_at ASC').all() as Agent[];
 }
 
@@ -74,25 +152,40 @@ const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 const failedChecks = new Map<string, number>();
 const REQUIRED_FAILURES = 3; // Must fail 3 consecutive checks before pruning
 
-function cleanupStale(db: Database.Database): void {
-  const agents = db.prepare('SELECT id, surface_id, workspace_id, last_heartbeat FROM agents').all() as Pick<Agent, 'id' | 'surface_id' | 'workspace_id' | 'last_heartbeat'>[];
+async function cleanupStale(db: Database.Database): Promise<void> {
+  const agents = db.prepare('SELECT id, name, agent_type, endpoint_url, surface_id, workspace_id, last_heartbeat FROM agents').all() as Agent[];
   const now = Date.now();
-  for (const agent of agents) {
-    const alive = isSurfaceAlive(agent.surface_id, agent.workspace_id);
+
+  // Check all agents in parallel
+  const checks = agents.map(async (agent) => {
+    // Headless agents are never auto-pruned — only removed by explicit leave/reset
+    if (agent.agent_type === 'headless') return;
+
+    let alive: boolean;
+    if (agent.agent_type === 'a2a') {
+      alive = await isAgentAlive(agent);
+    } else {
+      alive = isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    }
+
     if (alive) {
       failedChecks.delete(agent.id);
-      continue;
-    }
+      // Refresh heartbeat for A2A agents on successful liveness check
+      if (agent.agent_type === 'a2a') {
+        updateHeartbeat(db, agent.surface_id);
+      }
+    } else {
+      // Track consecutive failures to prevent single-check false positives
+      const failures = (failedChecks.get(agent.id) ?? 0) + 1;
+      failedChecks.set(agent.id, failures);
 
-    // Surface appears dead — track consecutive failures
-    const failures = (failedChecks.get(agent.id) ?? 0) + 1;
-    failedChecks.set(agent.id, failures);
-
-    // Only prune if: surface failed multiple consecutive checks AND heartbeat is stale
-    const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
-    if (failures >= REQUIRED_FAILURES && heartbeatAge > STALE_THRESHOLD_MS) {
-      db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
-      failedChecks.delete(agent.id);
+      const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
+      if (failures >= REQUIRED_FAILURES && heartbeatAge > STALE_THRESHOLD_MS) {
+        db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
+        failedChecks.delete(agent.id);
+      }
     }
-  }
+  });
+
+  await Promise.all(checks);
 }

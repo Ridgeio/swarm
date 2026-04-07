@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { sendToSurface, SurfaceGoneError } from './transport.js';
+import { deliverToAgent } from './transport-router.js';
 import { getAgent, listAgents } from './registry.js';
 
 export interface Message {
@@ -11,12 +11,12 @@ export interface Message {
   created_at: string;
 }
 
-export function sendMessage(
+export async function sendMessage(
   db: Database.Database,
   fromName: string,
   toName: string,
   body: string
-): { delivered: boolean; message: string } {
+): Promise<{ delivered: boolean; message: string }> {
   const target = getAgent(db, toName);
   if (!target) {
     return { delivered: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
@@ -31,24 +31,27 @@ export function sendMessage(
 
   const msgId = result.lastInsertRowid;
 
-  try {
-    sendToSurface(target.surface_id, formatted, target.workspace_id);
+  const deliveryResult = await deliverToAgent(target, formatted);
+  if (deliveryResult.delivered) {
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
     return { delivered: true, message: `Message sent to ${toName}` };
-  } catch (err) {
-    if (err instanceof SurfaceGoneError) {
-      return { delivered: false, message: `${toName}'s terminal is no longer active. Message saved to inbox.` };
+  } else {
+    // A2A agents can't read the local swarm inbox, so don't claim it was saved there
+    if (target.agent_type === 'a2a') {
+      return { delivered: false, message: `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}` };
     }
-    throw err;
+    // For Cmux and headless agents: push failed but message is in the DB.
+    // The recipient will pick it up via `swarm inbox`.
+    return { delivered: true, message: `Message sent to ${toName} (queued for inbox)` };
   }
 }
 
-export function broadcastMessage(
+export async function broadcastMessage(
   db: Database.Database,
   fromName: string,
   body: string
-): { sent: number; failed: number } {
-  const agents = listAgents(db);
+): Promise<{ sent: number; failed: number }> {
+  const agents = await listAgents(db);
   const recipients = agents.filter(a => a.name !== fromName);
 
   if (recipients.length === 0) {
@@ -65,16 +68,16 @@ export function broadcastMessage(
 
   const msgId = result.lastInsertRowid;
 
-  // Deliver outside the DB transaction
+  // Deliver to all recipients in parallel
+  const results = await Promise.all(
+    recipients.map(agent => deliverToAgent(agent, formatted))
+  );
+
   let sent = 0;
   let failed = 0;
-  for (const agent of recipients) {
-    try {
-      sendToSurface(agent.surface_id, formatted, agent.workspace_id);
-      sent++;
-    } catch {
-      failed++;
-    }
+  for (const r of results) {
+    if (r.delivered) sent++;
+    else failed++;
   }
 
   if (sent > 0) {

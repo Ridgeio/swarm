@@ -110,20 +110,36 @@ function installClaudeCodeHook(agentName: string): void {
   if (!settings.hooks) settings.hooks = {};
   if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = [];
 
-  // Check if swarm hook already exists
-  const existing = settings.hooks.UserPromptSubmit.find(
-    (h: any) => h.command && h.command.includes('swarm-awareness')
-  );
-  if (existing) {
-    // Update the agent name in the env
-    existing.command = `SWARM_AGENT_NAME="${agentName}" ${HOOK_SCRIPT}`;
-    fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-    return;
+  const hookCommand = `SWARM_AGENT_NAME="${agentName}" ${HOOK_SCRIPT}`;
+
+  // Check if swarm hook already exists (search in both old and new format)
+  for (const entry of settings.hooks.UserPromptSubmit) {
+    // New format: { matcher, hooks: [...] }
+    if (entry.hooks && Array.isArray(entry.hooks)) {
+      const existing = entry.hooks.find((h: any) => h.command?.includes('swarm-awareness'));
+      if (existing) {
+        existing.command = hookCommand;
+        fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+        return;
+      }
+    }
+    // Old format: { type, command } — migrate it
+    if (entry.command?.includes('swarm-awareness')) {
+      // Replace old format entry with new format
+      const idx = settings.hooks.UserPromptSubmit.indexOf(entry);
+      settings.hooks.UserPromptSubmit[idx] = {
+        matcher: '',
+        hooks: [{ type: 'command', command: hookCommand }],
+      };
+      fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      return;
+    }
   }
 
+  // Add new hook in correct format
   settings.hooks.UserPromptSubmit.push({
-    type: 'command',
-    command: `SWARM_AGENT_NAME="${agentName}" ${HOOK_SCRIPT}`,
+    matcher: '',
+    hooks: [{ type: 'command', command: hookCommand }],
   });
 
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
@@ -136,9 +152,17 @@ function removeClaudeCodeHook(): void {
   const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
   if (!settings.hooks?.UserPromptSubmit) return;
 
-  settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit.filter(
-    (h: any) => !h.command || !h.command.includes('swarm-awareness')
-  );
+  // Filter out swarm hooks (handles both old and new format)
+  settings.hooks.UserPromptSubmit = settings.hooks.UserPromptSubmit.filter((entry: any) => {
+    // New format: { matcher, hooks: [...] }
+    if (entry.hooks && Array.isArray(entry.hooks)) {
+      entry.hooks = entry.hooks.filter((h: any) => !h.command?.includes('swarm-awareness'));
+      return entry.hooks.length > 0;
+    }
+    // Old format: { type, command }
+    if (entry.command?.includes('swarm-awareness')) return false;
+    return true;
+  });
 
   // Clean up empty arrays
   if (settings.hooks.UserPromptSubmit.length === 0) {

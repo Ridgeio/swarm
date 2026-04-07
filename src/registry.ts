@@ -154,13 +154,12 @@ async function cleanupStale(db: Database.Database): Promise<void> {
 
   // Check all agents in parallel
   const checks = agents.map(async (agent) => {
+    // Headless agents are never auto-pruned — only removed by explicit leave/reset
+    if (agent.agent_type === 'headless') return;
+
     let alive: boolean;
     if (agent.agent_type === 'a2a') {
       alive = await isAgentAlive(agent);
-    } else if (agent.agent_type === 'headless') {
-      // Headless agents are alive if their heartbeat is fresh
-      const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
-      alive = heartbeatAge <= STALE_THRESHOLD_MS;
     } else {
       alive = isSurfaceAlive(agent.surface_id, agent.workspace_id);
     }

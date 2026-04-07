@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { getDb } from './db.js';
 import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, leaveHeadlessAgent } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
@@ -455,9 +458,22 @@ async function main() {
       case 'reset': {
         const db = getDb();
         const agents = listAgentsSync(db);
+        // Clean up hooks for any headless agents before wiping the DB
+        const headlessAgents = agents.filter(a => a.agent_type === 'headless');
+        if (headlessAgents.length > 0) {
+          const host = detectHost();
+          if (host) {
+            for (const a of headlessAgents) {
+              removeHook(host, a.name);
+            }
+          }
+        }
         db.exec('DELETE FROM agents');
         db.exec('DELETE FROM messages');
         db.exec('DELETE FROM inbox_cursors');
+        // Clean up headless marker file
+        const markerPath = path.join(os.homedir(), '.swarm', 'headless-self');
+        if (fs.existsSync(markerPath)) fs.unlinkSync(markerPath);
         console.log(`Swarm reset. Cleared ${agents.length} agent(s) and all messages.`);
         break;
       }

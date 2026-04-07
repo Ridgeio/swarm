@@ -32,6 +32,12 @@ export function joinAgent(
   agentType: AgentType = 'cmux',
   endpointUrl?: string
 ): Agent {
+  // Check if name is already taken by a different agent
+  const existing = getAgent(db, name);
+  if (existing && existing.surface_id !== surfaceId) {
+    throw new Error(`Agent name "${name}" is already taken by a ${existing.agent_type} agent. Choose a different name.`);
+  }
+
   const id = randomUUID();
   const now = new Date().toISOString();
 

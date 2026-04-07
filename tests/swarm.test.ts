@@ -40,13 +40,20 @@ describe('registry', () => {
     assert.strictEqual(agent?.description, 'working on auth');
   });
 
-  test('re-join overwrites (INSERT OR REPLACE)', () => {
+  test('re-join from same surface updates agent', () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid, 'old task');
-    joinAgent(db, 'Alice', 'surface-2', 'workspace-1', process.ppid, 'new task');
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid, 'new task');
     const agents = db.prepare('SELECT * FROM agents ORDER BY joined_at ASC').all() as any[];
     assert.strictEqual(agents.length, 1);
-    assert.strictEqual(agents[0].surface_id, 'surface-2');
     assert.strictEqual(agents[0].description, 'new task');
+  });
+
+  test('re-join from different surface is rejected', () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid, 'old task');
+    assert.throws(
+      () => joinAgent(db, 'Alice', 'surface-2', 'workspace-1', process.ppid, 'new task'),
+      { message: /already taken/ }
+    );
   });
 
   test('leave removes agent by surface ID', async () => {

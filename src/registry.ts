@@ -1,8 +1,38 @@
 import type Database from 'better-sqlite3';
 import { randomUUID } from 'crypto';
+import { execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { isSurfaceAlive } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
+
+const SWARM_DIR = path.join(os.homedir(), '.swarm');
+
+/**
+ * Get a session-unique marker file path based on the TTY device.
+ * Each terminal session has a unique TTY, so markers don't collide.
+ */
+function getSessionMarkerPath(): string | null {
+  // Try SWARM_AGENT_NAME first (set by hook)
+  if (process.env.SWARM_AGENT_NAME) return null; // no marker needed
+
+  // Find TTY from process tree
+  try {
+    let pid = process.ppid?.toString() || '';
+    for (let i = 0; i < 5 && pid; i++) {
+      const tty = execFileSync('ps', ['-o', 'tty=', '-p', pid], { encoding: 'utf-8' }).trim();
+      if (tty && tty !== '??' && tty !== '') {
+        // e.g., ttys003 → ~/.swarm/headless-ttys003
+        return path.join(SWARM_DIR, `headless-${tty}`);
+      }
+      pid = execFileSync('ps', ['-o', 'ppid=', '-p', pid], { encoding: 'utf-8' }).trim();
+    }
+  } catch { /* fall through */ }
+
+  return null;
+}
 
 export interface Agent {
   id: string;
@@ -79,11 +109,26 @@ export function joinHeadlessAgent(
     throw new Error(`Agent "${name}" is already registered as a ${existing.agent_type} agent. Choose a different name or remove the existing agent first.`);
   }
   const syntheticSurfaceId = `headless:${name}`;
-  return joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  const agent = joinAgent(db, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  // Write per-TTY marker so this session's CLI calls auto-identify
+  const markerPath = getSessionMarkerPath();
+  if (markerPath) {
+    fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+    fs.writeFileSync(markerPath, name, 'utf-8');
+  }
+  return agent;
 }
 
 export function leaveHeadlessAgent(db: Database.Database, name: string): boolean {
   const result = db.prepare("DELETE FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").run(name);
+  // Clean up per-TTY marker
+  const markerPath = getSessionMarkerPath();
+  if (markerPath && fs.existsSync(markerPath)) {
+    const saved = fs.readFileSync(markerPath, 'utf-8').trim();
+    if (saved.toLowerCase() === name.toLowerCase()) {
+      fs.unlinkSync(markerPath);
+    }
+  }
   return result.changes > 0;
 }
 
@@ -98,10 +143,13 @@ export function getSelf(db: Database.Database): Agent | null {
   if (agentName) {
     return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(agentName) as Agent | undefined ?? null;
   }
-  // Fallback: if there's exactly one headless agent, assume it's us
-  const headless = db.prepare("SELECT * FROM agents WHERE agent_type = 'headless'").all() as Agent[];
-  if (headless.length === 1) {
-    return headless[0];
+  // Try per-TTY marker file (written by swarm join, unique per terminal session)
+  const markerPath = getSessionMarkerPath();
+  if (markerPath && fs.existsSync(markerPath)) {
+    const name = fs.readFileSync(markerPath, 'utf-8').trim();
+    if (name) {
+      return db.prepare("SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'").get(name) as Agent | undefined ?? null;
+    }
   }
   return null;
 }

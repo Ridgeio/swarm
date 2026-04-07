@@ -37,10 +37,12 @@ export async function sendMessage(
     return { delivered: true, message: `Message sent to ${toName}` };
   } else {
     // A2A agents can't read the local swarm inbox, so don't claim it was saved there
-    const fallback = target.agent_type === 'a2a'
-      ? `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}`
-      : deliveryResult.error || `${toName}'s terminal is not active. Message saved to inbox.`;
-    return { delivered: false, message: fallback };
+    if (target.agent_type === 'a2a') {
+      return { delivered: false, message: `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}` };
+    }
+    // For Cmux and headless agents: push failed but message is in the DB.
+    // The recipient will pick it up via `swarm inbox`.
+    return { delivered: true, message: `Message sent to ${toName} (queued for inbox)` };
   }
 }
 

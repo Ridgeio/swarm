@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Swarm awareness hook (headless) — runs on UserPromptSubmit
-# Injects swarm context for headless agents that poll via inbox.
+# Injects swarm context and delivers pending messages inline.
 
 AGENT_NAME="${SWARM_AGENT_NAME:-}"
 [ -z "$AGENT_NAME" ] && exit 0
@@ -15,19 +15,22 @@ REGISTERED=$(sqlite3 "$DB" "SELECT name FROM agents WHERE name='$AGENT_NAME' COL
 # Refresh heartbeat
 sqlite3 "$DB" "UPDATE agents SET last_heartbeat='$(date -u +%Y-%m-%dT%H:%M:%S.000Z)' WHERE name='$AGENT_NAME' COLLATE NOCASE" 2>/dev/null
 
+SWARM_BIN="$(cd "$(dirname "$0")/.." && pwd)/bin/swarm"
 MEMBERS=$(sqlite3 "$DB" "SELECT name FROM agents ORDER BY joined_at" 2>/dev/null | tr '\n' ', ' | sed 's/,$//')
 
-# Check for unread messages
-INBOX=$(SWARM_AGENT_NAME="$AGENT_NAME" /Users/tom/Developer/Ridge.io/prompteden/swarm/bin/swarm inbox --peek 2>/dev/null)
+# Read and consume pending messages (not peek — marks as read)
+INBOX=$(SWARM_AGENT_NAME="$AGENT_NAME" "$SWARM_BIN" inbox 2>/dev/null)
 
 if echo "$INBOX" | grep -q "No new messages"; then
-  INBOX_LINE=""
+  INBOX_SECTION=""
 else
-  INBOX_LINE="\nPending messages — run: swarm inbox"
+  INBOX_SECTION="
+NEW MESSAGES (respond to these):
+${INBOX}"
 fi
 
 cat <<SWARM_EOF
-You are "$AGENT_NAME" in a coordination swarm. Active agents: ${MEMBERS}.
+You are "${AGENT_NAME}" in a coordination swarm. Active agents: ${MEMBERS}.
 Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${INBOX_LINE}
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.${INBOX_SECTION}
 SWARM_EOF

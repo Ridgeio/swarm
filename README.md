@@ -1,8 +1,8 @@
 # swarm
 
-Cross-terminal agent coordination for AI coding agents running in [Cmux](https://cmux.dev).
+Cross-terminal and cross-agent coordination for AI coding agents. Supports local agents running in [Cmux](https://cmux.dev) and remote agents via the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/).
 
-Send messages between Claude Code sessions, monitor what other agents are working on, and coordinate multi-agent workflows — all from the terminal.
+Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compatible agent — monitor what other agents are working on and coordinate multi-agent workflows from the terminal.
 
 ## How it works
 
@@ -14,18 +14,27 @@ Send messages between Claude Code sessions, monitor what other agents are workin
        │                         │
        └────────┬────────────────┘
                 │
-         ~/.swarm/swarm.db
-         (shared SQLite)
+         ~/.swarm/swarm.db        ┌──────────────┐
+         (shared SQLite)          │ OpenClaw     │
+                │                 │ (A2A agent)  │
+                └────── A2A ─────►└──────────────┘
+                │                 ┌──────────────┐
+                └────── A2A ─────►│ Hermes       │
+                                  │ (A2A agent)  │
+                                  └──────────────┘
 ```
 
-Agents register with `swarm join`, then communicate via `swarm send`. Messages are pushed directly into the target agent's terminal using Cmux's native `send` command — the same push-based delivery that made [AgentSwarm](https://github.com/tlangridge/agent-swarm) work, but without a web UI.
+**Cmux agents** (Claude Code, Codex CLI) register with `swarm join` and receive messages pushed directly into their terminal via Cmux's native `send` command.
+
+**A2A agents** (OpenClaw, Hermes, or any agent with an A2A-compatible endpoint) register with `swarm register-a2a` and receive messages delivered over HTTP via the A2A protocol. This enables cross-user and cross-machine coordination.
 
 ## Prerequisites
 
-- **macOS** (Cmux is macOS-only)
-- **[Cmux](https://cmux.dev)** installed and running
+- **macOS** (Cmux is macOS-only; A2A agents can run on any platform)
+- **[Cmux](https://cmux.dev)** installed and running (for local terminal agents)
 - **Node.js >= 20** (`node --version` to check)
-- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** and/or **[Codex CLI](https://github.com/openai/codex)** installed
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** and/or **[Codex CLI](https://github.com/openai/codex)** for Cmux agents
+- Any A2A-compatible agent (e.g., OpenClaw, Hermes) for remote coordination
 
 ## Install
 
@@ -94,13 +103,21 @@ Messaging:
   swarm broadcast <message>                   Push to all agents
   swarm inbox [--peek]                        Read pending messages
 
-Agents:
+Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
   swarm leave                                 Deregister from the swarm
-  swarm members                               List active agents
-  swarm status [--set <desc>] [--agent <name>] Update or query status
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read an agent's terminal screen
+
+A2A Agents (remote/cross-user agents):
+  swarm register-a2a <name> --endpoint <url>  Register an A2A agent
+        [--description <text>]
+  swarm unregister-a2a <name>                 Remove an A2A agent
+  swarm discover <url>                        Fetch and display an A2A agent card
+
+Shared:
+  swarm members                               List active agents (Cmux + A2A)
+  swarm status [--set <desc>] [--agent <name>] Update or query status
 
 Spawning:
   swarm spawn [--cwd <path>] [--autonomous]   Spawn a new Claude Code session
@@ -117,7 +134,7 @@ Session:
   swarm help                                  Show help
 ```
 
-Joining the swarm auto-renames the agent's Cmux tab to their swarm name for easy visual identification.
+Joining the swarm auto-renames the agent's Cmux tab to their swarm name for easy visual identification. A2A agents are shown with their endpoint URL in `swarm members`.
 
 ## Example workflows
 
@@ -191,6 +208,48 @@ swarm rename MrDev "Senior Dev"                     # rename an agent's tab
 swarm rename-workspace workspace:5 "Dev Team"       # rename a workspace
 ```
 
+### Coordinating with A2A agents
+
+Register external agents (OpenClaw, Hermes, or any A2A-compatible agent) by their endpoint:
+
+```bash
+swarm register-a2a Cooper --endpoint http://localhost:3100/.well-known/agent.json
+swarm register-a2a Hermes --endpoint http://localhost:3200/.well-known/agent.json
+```
+
+Discover an agent's capabilities before registering:
+```bash
+swarm discover http://localhost:3100/.well-known/agent.json
+```
+
+Once registered, A2A agents participate in the swarm just like Cmux agents:
+```bash
+swarm send Cooper "review the auth PR on branch feat/auth"
+swarm broadcast "status check — what's everyone working on?"
+swarm members   # shows both [cmux] and [a2a] agents
+```
+
+Messages to A2A agents are delivered via HTTP POST. Messages to Cmux agents are pushed into their terminal. The routing is transparent — `swarm send` figures out the right transport.
+
+### Mixed swarm (Cmux + A2A)
+
+A typical setup with local Claude Code sessions and remote agents:
+
+```bash
+# Local Cmux agents
+/join-swarm Lead          # in Cmux pane 1
+/join-swarm DevA          # in Cmux pane 2
+
+# Remote A2A agents
+swarm register-a2a Cooper --endpoint http://localhost:3100/.well-known/agent.json
+swarm register-a2a Hermes --endpoint http://localhost:3200/.well-known/agent.json
+
+# Now coordinate across all of them
+swarm send Cooper "research the best auth library for our stack"
+swarm send DevA "implement the API routes while Cooper researches auth"
+swarm send Hermes "draft the user-facing docs for the new auth flow"
+```
+
 ### End of session
 
 ```bash
@@ -201,32 +260,39 @@ Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear e
 
 ## How agents coordinate
 
-Messages are injected directly into the target terminal via `cmux send`. The receiving agent sees it as user input and responds naturally. This is push-based delivery — agents don't need to poll.
+**Cmux agents**: Messages are injected directly into the target terminal via `cmux send`. The receiving agent sees it as user input and responds naturally. This is push-based delivery — agents don't need to poll.
+
+**A2A agents**: Messages are delivered via HTTP POST to the agent's registered endpoint using the [A2A protocol](https://google.github.io/A2A/). The agent processes the message and can respond through the same channel.
 
 The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to delegate work, and how to report status. The coordination protocol is the real product; the CLI is its runtime.
 
 ## Architecture
 
-- **`src/transport.ts`** — Cmux wrapper (`send`, `read-screen`, `spawn`, tab/workspace management, `\n` sanitization, message chunking)
+- **`src/transport-interface.ts`** — Transport abstraction (`Transport`, `TransportAgent`, `AgentType`)
+- **`src/cmux-transport.ts`** — Cmux transport: terminal push via `cmux send`
+- **`src/a2a-transport.ts`** — A2A transport: HTTP delivery via `@a2a-js/sdk`
+- **`src/transport-router.ts`** — Dispatcher that routes `send`/`broadcast` to the correct transport by agent type
+- **`src/transport.ts`** — Low-level Cmux utilities (`send`, `read-screen`, `spawn`, tab/workspace management, `\n` sanitization, message chunking)
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
-- **`src/registry.ts`** — Agent registration with surface-based stale cleanup (requires both dead surface + stale heartbeat)
+- **`src/registry.ts`** — Agent CRUD, A2A registration, async stale cleanup
 - **`src/mailbox.ts`** — Message send/broadcast/inbox with cursor tracking
-- **`src/index.ts`** — CLI entry point (20 commands)
+- **`src/index.ts`** — CLI entry point
 - **`hooks/swarm-awareness.sh`** — UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 
-State is stored in `~/.swarm/swarm.db`. Stale agents are cleaned up when their Cmux surface is unreachable AND their heartbeat is older than 10 minutes. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
+State is stored in `~/.swarm/swarm.db`. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 10 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 
 - Messages are sanitized (strips `\n`, `\r`, `\t`) to prevent injection via `cmux send`
 - Uses `execFileSync` (not `execSync`) to avoid shell injection
-- `swarm read` can see any agent's terminal output — the swarm is a trusted environment
+- `swarm read` can see any Cmux agent's terminal output — the swarm is a trusted environment
+- A2A agents communicate over localhost HTTP — no authentication required for local-only use. For remote endpoints, consider running behind a reverse proxy with TLS
 
 ## Requirements
 
-- [Cmux](https://cmux.dev) terminal multiplexer
+- [Cmux](https://cmux.dev) terminal multiplexer (for local Cmux agents)
 - Node.js >= 20
-- macOS (Cmux is macOS-only)
+- macOS (Cmux is macOS-only; A2A agents can run on any platform)
 
 ## License
 

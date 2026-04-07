@@ -41,15 +41,30 @@ export function detectTerminalApp(): 'Terminal' | 'iTerm2' | 'Warp' | null {
 }
 
 /**
- * Get the TTY device of the current process (e.g., /dev/ttys003).
- * Used to identify which Terminal.app window/tab we're in.
+ * Get the TTY device of the current process or its parent (e.g., /dev/ttys003).
+ * Claude Code's Bash tool runs without a real TTY, so we walk up the process
+ * tree to find the parent shell's TTY.
  */
 function getCurrentTty(): string | null {
+  // Try `tty` command first (works when stdin is a real TTY)
   try {
-    return execFileSync('tty', { encoding: 'utf-8', stdio: ['inherit', 'pipe', 'pipe'] }).trim();
-  } catch {
-    return null;
-  }
+    const result = execFileSync('tty', { encoding: 'utf-8', stdio: ['inherit', 'pipe', 'pipe'] }).trim();
+    if (result && !result.includes('not a tty')) return result;
+  } catch { /* fall through */ }
+
+  // Walk up the process tree to find a TTY
+  try {
+    let pid = process.ppid?.toString() || '';
+    for (let i = 0; i < 5 && pid; i++) {
+      const tty = execFileSync('ps', ['-o', 'tty=', '-p', pid], { encoding: 'utf-8' }).trim();
+      if (tty && tty !== '??' && tty !== '') {
+        return `/dev/${tty}`;
+      }
+      pid = execFileSync('ps', ['-o', 'ppid=', '-p', pid], { encoding: 'utf-8' }).trim();
+    }
+  } catch { /* fall through */ }
+
+  return null;
 }
 
 /**

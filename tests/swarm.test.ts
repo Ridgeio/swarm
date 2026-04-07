@@ -77,15 +77,20 @@ describe('registry', () => {
   });
 
   test('stale surface cleanup removes dead agents with stale heartbeat', () => {
-    // Insert agents with fake surfaces and stale heartbeats (>10min old)
-    const staleTime = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+    // Insert agents with fake surfaces and stale heartbeats (>30min old)
+    const staleTime = new Date(Date.now() - 35 * 60 * 1000).toISOString();
     db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
       VALUES ('g1', 'Ghost', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?)`).run(staleTime, staleTime);
     db.prepare(`INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
       VALUES ('a1', 'Alive', NULL, 'surface-alive', 'workspace-1', ${process.ppid}, ?, ?)`).run(staleTime, staleTime);
     const before = db.prepare('SELECT * FROM agents').all() as any[];
     assert.strictEqual(before.length, 2);
-    // listAgents triggers cleanup — fake surfaces + stale heartbeats = pruned
+    // Cleanup requires 3 consecutive failed surface checks before pruning
+    listAgents(db); // strike 1
+    assert.strictEqual((db.prepare('SELECT * FROM agents').all() as any[]).length, 2);
+    listAgents(db); // strike 2
+    assert.strictEqual((db.prepare('SELECT * FROM agents').all() as any[]).length, 2);
+    // Strike 3 — now agents should be pruned
     const after = listAgents(db);
     assert.strictEqual(after.length, 0);
   });

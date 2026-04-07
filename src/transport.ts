@@ -55,22 +55,30 @@ export function sendToSurface(surfaceId: string, text: string, workspaceId?: str
   const cmux = resolveCmux();
   const safe = sanitize(text);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
-  try {
-    // Chunk long messages to avoid Claude Code paste-bracket detection
-    if (safe.length <= CHUNK_SIZE) {
-      execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
-    } else {
-      for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
-        const chunk = safe.slice(i, i + CHUNK_SIZE);
-        execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
-        sleep(0.015);
+  // Retry once on failure to handle transient cmux errors
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      // Chunk long messages to avoid Claude Code paste-bracket detection
+      if (safe.length <= CHUNK_SIZE) {
+        execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
+      } else {
+        for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
+          const chunk = safe.slice(i, i + CHUNK_SIZE);
+          execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
+          sleep(0.015);
+        }
       }
+      // Let input settle before submitting
+      sleep(0.1);
+      execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
+      return; // success
+    } catch (err: any) {
+      if (attempt === 0) {
+        sleep(0.5); // brief pause before retry
+        continue;
+      }
+      throw new SurfaceGoneError(surfaceId);
     }
-    // Let input settle before submitting
-    sleep(0.1);
-    execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
-  } catch (err: any) {
-    throw new SurfaceGoneError(surfaceId);
   }
 }
 
@@ -103,12 +111,19 @@ export function readScreen(surfaceId: string, lines?: number, workspaceId?: stri
 }
 
 export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean {
-  try {
-    readScreen(surfaceId, 1, workspaceId);
-    return true;
-  } catch {
-    return false;
+  // Retry once after a short delay to handle transient cmux socket errors
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      readScreen(surfaceId, 1, workspaceId);
+      return true;
+    } catch {
+      if (attempt === 0) {
+        // Brief pause before retry — transient socket contention
+        execFileSync('sleep', ['0.5'], STDIO_OPTS);
+      }
+    }
   }
+  return false;
 }
 
 export function renameTab(surfaceId: string, name: string, workspaceId?: string | null): void {

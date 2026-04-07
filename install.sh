@@ -3,6 +3,7 @@ set -euo pipefail
 
 SWARM_DIR="$(cd "$(dirname "$0")" && pwd)"
 SWARM_BIN="${SWARM_DIR}/bin/swarm"
+SKILL_DIR="${SWARM_DIR}/skill"
 
 echo "swarm installer"
 echo "Binary: ${SWARM_BIN}"
@@ -21,71 +22,25 @@ installed=0
 
 if command -v claude &>/dev/null; then
   echo "Found: Claude Code"
-  mkdir -p ~/.claude/commands
+  CLAUDE_SKILLS="$HOME/.claude/skills"
+  mkdir -p "$CLAUDE_SKILLS"
 
-  cat > ~/.claude/commands/join-swarm.md << SKILL
-Join the agent coordination swarm. This lets you communicate with other Claude Code sessions running in Cmux.
+  # Remove old command-style installs if they exist
+  rm -f ~/.claude/commands/join-swarm.md ~/.claude/commands/leave-swarm.md ~/.claude/commands/reset-swarm.md 2>/dev/null
 
-## Steps
+  # Symlink each skill — git pull automatically updates them
+  for skill in swarm join-swarm leave-swarm reset-swarm; do
+    skill_dir="${CLAUDE_SKILLS}/${skill}"
+    mkdir -p "$skill_dir"
+    if [ "$skill" = "swarm" ]; then
+      src="${SKILL_DIR}/SKILL.md"
+    else
+      src="${SKILL_DIR}/${skill}.md"
+    fi
+    ln -sf "$src" "${skill_dir}/SKILL.md"
+    echo "  Linked: /${skill} → ${src}"
+  done
 
-1. First, pick your agent name. If a name was provided as an argument, use it:
-
-\`\`\`bash
-echo "\$ARGUMENTS"
-\`\`\`
-
-If \$ARGUMENTS is empty or blank, you MUST invent your own short, creative name. Pick something fun and unique — an adjective + noun combo works well (e.g., "SwiftFox", "IronBolt", "NeonOwl", "QuietStorm"). Don't ask the user, just pick one.
-
-2. Join the swarm with your chosen name:
-
-\`\`\`bash
-${SWARM_BIN} join "<your-chosen-name>"
-\`\`\`
-
-3. Check for pending messages and see who else is active:
-
-\`\`\`bash
-${SWARM_BIN} inbox
-${SWARM_BIN} members
-\`\`\`
-
-4. After joining, follow these coordination rules:
-
-- **Before starting new work**: Run \`${SWARM_BIN} inbox\` to check for pending messages
-- **When you receive a message** (text starting with \`[SWARM from <name>]:\`): Read it and respond appropriately. Reply with \`${SWARM_BIN} send <name> "<reply>"\`
-- **To see who's active**: \`${SWARM_BIN} members\`
-- **To update your status**: \`${SWARM_BIN} status --set "what you're working on"\`
-- **To send a message**: \`${SWARM_BIN} send <agent> "<message>"\`
-- **To broadcast to all**: \`${SWARM_BIN} broadcast "<message>"\`
-- **To check on another agent**: \`${SWARM_BIN} read <agent> --lines 20\`
-- **To check inbox**: \`${SWARM_BIN} inbox\`
-
-Messages from other agents will appear directly in your terminal as input. When you see \`[SWARM from <name>]: <text>\`, that's a coordination message — read it and act on it.
-
-Be concise in messages. Check inbox before starting new tasks and after completing them.
-SKILL
-
-  cat > ~/.claude/commands/leave-swarm.md << SKILL
-Leave the agent coordination swarm. This disconnects you from other agents.
-
-\`\`\`bash
-${SWARM_BIN} leave
-\`\`\`
-
-You are no longer part of the swarm. Other agents will no longer see you in \`swarm members\` and cannot send you messages.
-SKILL
-
-  cat > ~/.claude/commands/reset-swarm.md << SKILL
-Reset the swarm. Clears all agents, messages, and inbox state. Use when switching projects or starting fresh.
-
-\`\`\`bash
-${SWARM_BIN} reset
-\`\`\`
-
-The swarm is now empty. All agents will need to \`/join-swarm\` again.
-SKILL
-
-  echo "  Installed: /join-swarm, /leave-swarm, /reset-swarm"
   installed=$((installed + 1))
 fi
 
@@ -153,9 +108,6 @@ if command -v claude &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
   echo ""
   echo "Installing swarm awareness hook..."
 
-  # Update the SWARM_BIN path in the hook script
-  sed -i '' "s|SWARM_BIN=.*|SWARM_BIN=\"${SWARM_BIN}\"|" "$HOOK_SCRIPT"
-
   SETTINGS_FILE="$HOME/.claude/settings.json"
   if [ -f "$SETTINGS_FILE" ]; then
     # Check if hooks already configured
@@ -183,6 +135,24 @@ if command -v claude &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
   fi
 fi
 
+# ── swarm CLI in PATH ────────────────────────────────────────────────────────
+
+if ! command -v swarm &>/dev/null; then
+  echo ""
+  echo "Adding swarm to PATH..."
+  if [ -d /opt/homebrew/bin ] && [ -w /opt/homebrew/bin ]; then
+    ln -sf "${SWARM_BIN}" /opt/homebrew/bin/swarm
+    echo "  Linked: /opt/homebrew/bin/swarm"
+  elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+    ln -sf "${SWARM_BIN}" /usr/local/bin/swarm
+    echo "  Linked: /usr/local/bin/swarm"
+  else
+    mkdir -p "$HOME/.local/bin"
+    ln -sf "${SWARM_BIN}" "$HOME/.local/bin/swarm"
+    echo "  Linked: ~/.local/bin/swarm (add to PATH if needed)"
+  fi
+fi
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 echo ""
@@ -191,6 +161,7 @@ if [ $installed -eq 0 ]; then
   echo "You can still use the CLI directly: ${SWARM_BIN} help"
 else
   echo "Done. ${installed} agent platform(s) configured."
+  echo "Skills are symlinked — git pull automatically updates them."
   echo ""
-  echo "To test: open a Claude Code or Codex session in Cmux and run /join-swarm"
+  echo "To test: open a Claude Code or Codex session and run /join-swarm"
 fi

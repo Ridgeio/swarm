@@ -6,6 +6,7 @@ import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, u
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
+import { registerSurface, removeSurface, detectTerminalApp } from './applescript-transport.js';
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -79,6 +80,29 @@ Admin:
   swarm help                                       Show this help`);
 }
 
+function joinAsHeadless(db: ReturnType<typeof getDb>, name: string, description?: string): void {
+  const agent = joinHeadlessAgent(db, name, description);
+  const parts: string[] = ['headless'];
+
+  // Register terminal surface for push delivery (AppleScript)
+  const surface = registerSurface(name);
+  if (surface) {
+    parts.push(`${surface.app} push`);
+  }
+
+  // Install awareness hook as backup
+  const host = detectHost();
+  if (host) {
+    installHook(host, name);
+    parts.push(`${host} hook`);
+  }
+
+  console.log(`Joined swarm as "${agent.name}" (${parts.join(', ')})`);
+  if (!surface && !host) {
+    console.log('Tip: Run "swarm inbox" periodically to check for messages.');
+  }
+}
+
 async function main() {
   try {
     switch (command) {
@@ -98,29 +122,12 @@ async function main() {
         }
 
         if (headless) {
-          const agent = joinHeadlessAgent(db, name, description);
-          // Auto-install awareness hook
-          const host = detectHost();
-          if (host) {
-            installHook(host, name);
-            console.log(`Joined swarm as "${agent.name}" (headless, ${host} hook installed)`);
-          } else {
-            console.log(`Joined swarm as "${agent.name}" (headless)`);
-            console.log('Tip: Run "swarm inbox" periodically to check for messages.');
-          }
+          joinAsHeadless(db, name, description);
         } else {
           const { surfaceId, workspaceId } = identify();
           if (!surfaceId) {
             // Auto-detect: if not in Cmux, fall back to headless
-            const agent = joinHeadlessAgent(db, name, description);
-            const host = detectHost();
-            if (host) {
-              installHook(host, name);
-              console.log(`Joined swarm as "${agent.name}" (headless, ${host} hook installed)`);
-            } else {
-              console.log(`Joined swarm as "${agent.name}" (headless — not in Cmux)`);
-              console.log('Tip: Run "swarm inbox" periodically to check for messages.');
-            }
+            joinAsHeadless(db, name, description);
           } else {
             const agent = joinAgent(db, name, surfaceId, workspaceId, process.ppid, description);
             renameTab(surfaceId, name, workspaceId);
@@ -134,6 +141,7 @@ async function main() {
         const { db, self } = requireSelf();
         if (self.agent_type === 'headless') {
           leaveHeadlessAgent(db, self.name);
+          removeSurface(self.name);
           const host = detectHost();
           if (host) {
             removeHook(host, self.name);
@@ -458,14 +466,13 @@ async function main() {
       case 'reset': {
         const db = getDb();
         const agents = listAgentsSync(db);
-        // Clean up hooks for any headless agents before wiping the DB
+        // Clean up hooks and surfaces for any headless agents before wiping the DB
         const headlessAgents = agents.filter(a => a.agent_type === 'headless');
         if (headlessAgents.length > 0) {
           const host = detectHost();
-          if (host) {
-            for (const a of headlessAgents) {
-              removeHook(host, a.name);
-            }
+          for (const a of headlessAgents) {
+            removeSurface(a.name);
+            if (host) removeHook(host, a.name);
           }
         }
         db.exec('DELETE FROM agents');

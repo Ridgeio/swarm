@@ -1,5 +1,7 @@
 import { execFileSync } from 'child_process';
 import fs from 'fs';
+import path from 'path';
+import os from 'os';
 
 export class SurfaceGoneError extends Error {
   constructor(public surfaceId: string) {
@@ -51,34 +53,88 @@ export function sleep(seconds: number): void {
   execFileSync('sleep', [String(seconds)], STDIO_OPTS);
 }
 
+// File-based lock to prevent concurrent sends to the same surface from interleaving chunks.
+// Uses mkdir atomicity: mkdir fails if the dir already exists, providing a cross-process mutex.
+const LOCK_DIR = path.join(os.homedir(), '.swarm', 'locks');
+const LOCK_TIMEOUT_MS = 15_000;
+const LOCK_POLL_MS = 50;
+const LOCK_STALE_MS = 30_000; // Force-break locks older than this (dead process)
+
+function lockPathForSurface(surfaceId: string): string {
+  return path.join(LOCK_DIR, `surface-${surfaceId.replace(/[^a-zA-Z0-9-]/g, '_')}.lock`);
+}
+
+function acquireSurfaceLock(surfaceId: string): string {
+  fs.mkdirSync(LOCK_DIR, { recursive: true });
+  const lockPath = lockPathForSurface(surfaceId);
+  const deadline = Date.now() + LOCK_TIMEOUT_MS;
+
+  while (Date.now() < deadline) {
+    try {
+      // mkdir is atomic — fails if already exists
+      fs.mkdirSync(lockPath);
+      // Write our PID so stale locks can be detected
+      fs.writeFileSync(path.join(lockPath, 'pid'), String(process.pid));
+      return lockPath;
+    } catch {
+      // Lock exists — check if stale
+      try {
+        const stat = fs.statSync(lockPath);
+        if (Date.now() - stat.mtimeMs > LOCK_STALE_MS) {
+          // Stale lock from a dead process — force remove and retry
+          fs.rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        // Lock disappeared between our mkdir and stat — retry immediately
+        continue;
+      }
+      // Wait and retry
+      execFileSync('sleep', [String(LOCK_POLL_MS / 1000)], STDIO_OPTS);
+    }
+  }
+  // Timed out — proceed without lock rather than blocking forever
+  return '';
+}
+
+function releaseSurfaceLock(lockPath: string): void {
+  if (!lockPath) return;
+  try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {}
+}
+
 export function sendToSurface(surfaceId: string, text: string, workspaceId?: string | null): void {
   const cmux = resolveCmux();
   const safe = sanitize(text);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
-  // Retry once on failure to handle transient cmux errors
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      // Chunk long messages to avoid Claude Code paste-bracket detection
-      if (safe.length <= CHUNK_SIZE) {
-        execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
-      } else {
-        for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
-          const chunk = safe.slice(i, i + CHUNK_SIZE);
-          execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
-          sleep(0.015);
+  const lockPath = acquireSurfaceLock(surfaceId);
+  try {
+    // Retry once on failure to handle transient cmux errors
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        // Chunk long messages to avoid Claude Code paste-bracket detection
+        if (safe.length <= CHUNK_SIZE) {
+          execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
+        } else {
+          for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
+            const chunk = safe.slice(i, i + CHUNK_SIZE);
+            execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
+            sleep(0.015);
+          }
         }
+        // Let input settle before submitting
+        sleep(0.1);
+        execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
+        return; // success
+      } catch (err: any) {
+        if (attempt === 0) {
+          sleep(0.5); // brief pause before retry
+          continue;
+        }
+        throw new SurfaceGoneError(surfaceId);
       }
-      // Let input settle before submitting
-      sleep(0.1);
-      execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
-      return; // success
-    } catch (err: any) {
-      if (attempt === 0) {
-        sleep(0.5); // brief pause before retry
-        continue;
-      }
-      throw new SurfaceGoneError(surfaceId);
     }
+  } finally {
+    releaseSurfaceLock(lockPath);
   }
 }
 

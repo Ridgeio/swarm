@@ -57,19 +57,23 @@ export function joinAgent(
   agentType: AgentType = 'cmux',
   endpointUrl?: string
 ): Agent {
-  // Check if name is already taken by a different agent
-  const existing = getAgent(db, name);
-  if (existing && existing.surface_id !== surfaceId) {
-    throw new Error(`Agent name "${name}" is already taken by a ${existing.agent_type} agent. Choose a different name.`);
-  }
-
   const id = randomUUID();
   const now = new Date().toISOString();
 
-  db.prepare(`
-    INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null);
+  // Atomic check-and-insert. Without this, two terminals racing to claim the
+  // same name after a reap can both read an empty slot and both insert —
+  // INSERT OR REPLACE lets the second silently overwrite the first.
+  const tx = db.transaction(() => {
+    const existing = getAgent(db, name);
+    if (existing && existing.surface_id !== surfaceId) {
+      throw new Error(`Agent name "${name}" is already taken by a ${existing.agent_type} agent. Choose a different name.`);
+    }
+    db.prepare(`
+      INSERT OR REPLACE INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null);
+  });
+  tx.immediate();
 
   return { id, name, description: description ?? null, agent_type: agentType, endpoint_url: endpointUrl ?? null, surface_id: surfaceId, workspace_id: workspaceId ?? null, ppid, joined_at: now, last_heartbeat: now };
 }
@@ -225,4 +229,65 @@ async function cleanupStale(db: Database.Database): Promise<void> {
   });
 
   await Promise.all(checks);
+}
+
+/**
+ * Probe an agent's liveness twice back-to-back. Returns true only if both probes fail.
+ * Used by the lazy-reap path where we need higher confidence than a single probe —
+ * isSurfaceAlive already retries once internally, so this gives us up to 4 attempts
+ * before declaring an agent dead.
+ */
+async function isConfirmedDead(agent: Agent): Promise<boolean> {
+  const probe = async (): Promise<boolean> =>
+    agent.agent_type === 'a2a'
+      ? await isAgentAlive(agent)
+      : isSurfaceAlive(agent.surface_id, agent.workspace_id);
+  if (await probe()) return false;
+  return !(await probe());
+}
+
+/**
+ * If an agent with this name exists, is not headless, and fails two back-to-back
+ * liveness probes, delete it. Called on the join-conflict path so a stale entry
+ * from a dead surface doesn't block rejoin. Returns the reaped agent or null.
+ * Headless agents are skipped — they have no surface to probe.
+ */
+export async function reapIfDead(db: Database.Database, name: string): Promise<Agent | null> {
+  const existing = getAgent(db, name);
+  if (!existing) return null;
+  if (existing.agent_type === 'headless') return null;
+  if (await isConfirmedDead(existing)) {
+    db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);
+    failedChecks.delete(existing.id);
+    return existing;
+  }
+  return null;
+}
+
+/** Reap all non-headless agents that fail two back-to-back liveness probes. */
+export async function reapAll(db: Database.Database): Promise<Agent[]> {
+  const agents = db.prepare('SELECT * FROM agents').all() as Agent[];
+  const reaped: Agent[] = [];
+  for (const agent of agents) {
+    if (agent.agent_type === 'headless') continue;
+    if (await isConfirmedDead(agent)) {
+      db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
+      failedChecks.delete(agent.id);
+      reaped.push(agent);
+    }
+  }
+  return reaped;
+}
+
+/**
+ * Force-delete an agent by name without probing. Escape hatch for operators who
+ * know an entry is stale (e.g., after a cmux crash). Removes any agent type,
+ * including headless. Returns the removed agent or null.
+ */
+export function forceReap(db: Database.Database, name: string): Agent | null {
+  const existing = getAgent(db, name);
+  if (!existing) return null;
+  db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);
+  failedChecks.delete(existing.id);
+  return existing;
 }

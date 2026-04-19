@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { getDb } from './db.js';
-import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, leaveHeadlessAgent } from './registry.js';
+import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, leaveHeadlessAgent, reapIfDead, reapAll, forceReap } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
@@ -76,6 +76,7 @@ Cmux-only:
   swarm rename-workspace <id> <title>              Rename a workspace
 
 Admin:
+  swarm reap [--name <agent>] [--force]            Prune dead agents after liveness probe
   swarm reset                                      Clear all agents and messages
   swarm help                                       Show this help`);
 }
@@ -115,9 +116,17 @@ async function main() {
         const headless = hasFlag('--headless');
         const description = getFlag('--description');
         const db = getDb();
+
+        // Lazy reap first so a dead cmux/a2a registration with this name doesn't
+        // block rejoin. Skips headless agents (no probeable surface).
+        const reaped = await reapIfDead(db, name);
+        if (reaped) {
+          console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) — surface was dead.`);
+        }
+
         const existing = getAgent(db, name);
         if (existing && existing.agent_type === 'a2a') {
-          console.error(`Agent "${name}" is already registered as an A2A agent. Choose a different name or run "swarm unregister-a2a ${name}" first.`);
+          console.error(`Agent "${name}" is already registered as a live A2A agent. Choose a different name or run "swarm unregister-a2a ${name}" first.`);
           process.exit(1);
         }
 
@@ -200,6 +209,10 @@ async function main() {
         }
 
         const db = getDb();
+        const reaped = await reapIfDead(db, name);
+        if (reaped) {
+          console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) — surface was dead.`);
+        }
         const agent = joinA2AAgent(db, name, endpoint, agentDescription);
         console.log(`Registered A2A agent "${agent.name}" @ ${endpoint}`);
         break;
@@ -459,6 +472,62 @@ async function main() {
         } catch (err: any) {
           console.error(`Failed to rename workspace: ${err.message}`);
           process.exit(1);
+        }
+        break;
+      }
+
+      case 'reap': {
+        const db = getDb();
+        const name = getFlag('--name');
+        const force = hasFlag('--force');
+
+        if (force && !name) {
+          console.error('Usage: swarm reap --name <agent> --force  (--force requires --name)');
+          process.exit(1);
+        }
+
+        if (name) {
+          if (force) {
+            const removed = forceReap(db, name);
+            if (removed) {
+              // Clean up headless side effects (hook + terminal surface) so operators
+              // using --force as the sanctioned headless-removal escape hatch don't
+              // leave stale swarm-awareness state pointing at a deleted agent.
+              if (removed.agent_type === 'headless') {
+                removeSurface(removed.name);
+                const host = detectHost();
+                if (host) removeHook(host, removed.name);
+              }
+              console.log(`Force-reaped "${removed.name}" (${removed.agent_type}).`);
+            } else {
+              console.error(`No agent named "${name}" found.`);
+              process.exit(1);
+            }
+          } else {
+            const removed = await reapIfDead(db, name);
+            if (removed) {
+              console.log(`Reaped "${removed.name}" (${removed.agent_type}) — surface confirmed dead.`);
+            } else {
+              const still = getAgent(db, name);
+              if (!still) {
+                console.error(`No agent named "${name}" found.`);
+                process.exit(1);
+              } else if (still.agent_type === 'headless') {
+                console.error(`"${name}" is a headless agent; has no probeable surface. Use --force to remove.`);
+                process.exit(1);
+              } else {
+                console.log(`"${name}" is alive; not reaped. Use --force to remove anyway.`);
+              }
+            }
+          }
+        } else {
+          const removed = await reapAll(db);
+          if (removed.length === 0) {
+            console.log('No dead agents found.');
+          } else {
+            console.log(`Reaped ${removed.length} agent(s):`);
+            for (const a of removed) console.log(`  ${a.name} (${a.agent_type})`);
+          }
         }
         break;
       }

@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getDbAt } from '../src/db.js';
-import { joinAgent, leaveAgent, getAgent, listAgents, updateStatus, joinA2AAgent, leaveA2AAgent } from '../src/registry.js';
+import { joinAgent, leaveAgent, getAgent, listAgents, updateStatus, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, reapIfDead, reapAll, forceReap } from '../src/registry.js';
 import { getInbox } from '../src/mailbox.js';
 import type Database from 'better-sqlite3';
 
@@ -132,6 +132,110 @@ describe('registry', () => {
     assert.strictEqual(removed, true);
     const agent = getAgent(db, 'Cooper');
     assert.strictEqual(agent, null);
+  });
+});
+
+describe('reap', () => {
+  test('reapIfDead removes a cmux agent with a dead surface', async () => {
+    // In the test environment cmux is unavailable, so isSurfaceAlive fails.
+    joinAgent(db, 'Ghost', 'surface-fake', 'workspace-1', process.ppid);
+    const reaped = await reapIfDead(db, 'Ghost');
+    assert.ok(reaped, 'expected agent to be reaped');
+    assert.strictEqual(reaped.name, 'Ghost');
+    assert.strictEqual(getAgent(db, 'Ghost'), null);
+  });
+
+  test('reapIfDead returns null for a nonexistent agent', async () => {
+    const reaped = await reapIfDead(db, 'DoesNotExist');
+    assert.strictEqual(reaped, null);
+  });
+
+  test('reapIfDead skips headless agents', async () => {
+    // Set SWARM_AGENT_NAME so joinHeadlessAgent doesn't try to write a TTY marker
+    const prev = process.env.SWARM_AGENT_NAME;
+    process.env.SWARM_AGENT_NAME = 'Ephemeral';
+    try {
+      joinHeadlessAgent(db, 'Ephemeral');
+    } finally {
+      if (prev === undefined) delete process.env.SWARM_AGENT_NAME;
+      else process.env.SWARM_AGENT_NAME = prev;
+    }
+    const reaped = await reapIfDead(db, 'Ephemeral');
+    assert.strictEqual(reaped, null, 'headless agents must not be reaped');
+    assert.ok(getAgent(db, 'Ephemeral'), 'headless agent should still exist');
+  });
+
+  test('reapIfDead is case-insensitive', async () => {
+    joinAgent(db, 'Ghost', 'surface-fake', 'workspace-1', process.ppid);
+    const reaped = await reapIfDead(db, 'GHOST');
+    assert.ok(reaped);
+    assert.strictEqual(reaped.name, 'Ghost');
+  });
+
+  test('reapAll prunes cmux agents but keeps headless', async () => {
+    joinAgent(db, 'GhostA', 'surface-a', 'workspace-1', process.ppid);
+    joinAgent(db, 'GhostB', 'surface-b', 'workspace-1', process.ppid);
+    const prev = process.env.SWARM_AGENT_NAME;
+    process.env.SWARM_AGENT_NAME = 'Keeper';
+    try {
+      joinHeadlessAgent(db, 'Keeper');
+    } finally {
+      if (prev === undefined) delete process.env.SWARM_AGENT_NAME;
+      else process.env.SWARM_AGENT_NAME = prev;
+    }
+
+    const reaped = await reapAll(db);
+    const reapedNames = reaped.map(a => a.name).sort();
+    assert.deepStrictEqual(reapedNames, ['GhostA', 'GhostB']);
+    assert.strictEqual(getAgent(db, 'GhostA'), null);
+    assert.strictEqual(getAgent(db, 'GhostB'), null);
+    assert.ok(getAgent(db, 'Keeper'), 'headless agent must survive reapAll');
+  });
+
+  test('reapAll on empty db returns empty array', async () => {
+    const reaped = await reapAll(db);
+    assert.deepStrictEqual(reaped, []);
+  });
+
+  test('forceReap deletes an agent without probing', () => {
+    joinAgent(db, 'Victim', 'surface-x', 'workspace-1', process.ppid);
+    const removed = forceReap(db, 'Victim');
+    assert.ok(removed);
+    assert.strictEqual(removed.name, 'Victim');
+    assert.strictEqual(getAgent(db, 'Victim'), null);
+  });
+
+  test('forceReap returns null for unknown agent', () => {
+    assert.strictEqual(forceReap(db, 'NoOne'), null);
+  });
+
+  test('forceReap can delete a headless agent', () => {
+    const prev = process.env.SWARM_AGENT_NAME;
+    process.env.SWARM_AGENT_NAME = 'Stuck';
+    try {
+      joinHeadlessAgent(db, 'Stuck');
+    } finally {
+      if (prev === undefined) delete process.env.SWARM_AGENT_NAME;
+      else process.env.SWARM_AGENT_NAME = prev;
+    }
+    const removed = forceReap(db, 'Stuck');
+    assert.ok(removed, 'forceReap must work on headless agents as an escape hatch');
+    assert.strictEqual(getAgent(db, 'Stuck'), null);
+  });
+
+  test('rejoin succeeds after reaping a dead entry with the same name', async () => {
+    joinAgent(db, 'Lead', 'old-surface', 'workspace-1', process.ppid, 'old task');
+    // Simulate: cmux restart gives Lead a new surface id. Direct rejoin would fail.
+    assert.throws(
+      () => joinAgent(db, 'Lead', 'new-surface', 'workspace-1', process.ppid, 'new task'),
+      { message: /already taken/ }
+    );
+    // After reap (old surface is fake = dead), rejoin succeeds.
+    await reapIfDead(db, 'Lead');
+    joinAgent(db, 'Lead', 'new-surface', 'workspace-1', process.ppid, 'new task');
+    const agent = getAgent(db, 'Lead');
+    assert.strictEqual(agent?.surface_id, 'new-surface');
+    assert.strictEqual(agent?.description, 'new task');
   });
 });
 

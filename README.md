@@ -130,6 +130,7 @@ Workspace management:
   swarm rename-workspace <id> <title>         Rename a workspace
 
 Session:
+  swarm reap [--name <agent>] [--force]       Prune dead agents after liveness probe
   swarm reset                                 Clear all agents and messages
   swarm help                                  Show help
 ```

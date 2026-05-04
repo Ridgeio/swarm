@@ -49,10 +49,14 @@ fi
 if command -v codex &>/dev/null; then
   echo "Found: Codex CLI"
   mkdir -p ~/.codex
-  CODEX_SKILLS="$HOME/.codex/skills"
-  mkdir -p "$CODEX_SKILLS/swarm"
-  ln -sf "${SKILL_DIR}/SKILL.md" "$CODEX_SKILLS/swarm/SKILL.md"
-  echo "  Linked: swarm skill → ${SKILL_DIR}/SKILL.md"
+  for codex_skills_dir in "$HOME/.agents/skills" "$HOME/.codex/skills"; do
+    mkdir -p "$codex_skills_dir"
+    for skill_name in swarm join-swarm leave-swarm reset-swarm; do
+      rm -rf "$codex_skills_dir/$skill_name"
+      ln -s "${SKILL_DIR}/codex/${skill_name}" "$codex_skills_dir/$skill_name"
+      echo "  Linked: ${codex_skills_dir}/${skill_name} → ${SKILL_DIR}/codex/${skill_name}"
+    done
+  done
 
   cat > ~/.codex/swarm-instructions.md << SKILL
 # Swarm Coordination
@@ -167,5 +171,5 @@ else
   echo "Done. ${installed} agent platform(s) configured."
   echo "Skills are symlinked — git pull automatically updates them."
   echo ""
-  echo "To test: open a Claude Code or Codex session and run /join-swarm"
+  echo "To test: open Claude Code and run /join-swarm, or open Codex and type \$join-swarm"
 fi

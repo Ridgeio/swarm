@@ -38,6 +38,10 @@ function hasFlag(flag: string): boolean {
   return args.includes(flag);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 function requireCmuxAgent(agent: { name: string; agent_type: string }, action: string): void {
   if (agent.agent_type === 'a2a') {
     console.error(`Cannot ${action} for A2A agent "${agent.name}". This command only works with Cmux agents.`);
@@ -69,7 +73,8 @@ Status:
 
 Cmux-only:
   swarm read <agent> [--lines <n>]                 Read agent's terminal
-  swarm spawn [--cwd <path>] [--autonomous]        Spawn a new Claude Code session
+  swarm spawn [--agent claude|codex] [--name <n>]  Spawn a new CLI agent
+    [--cwd <path>] [--autonomous]
   swarm rename <agent> <title>                     Rename an agent's Cmux tab
   swarm move <agent> --workspace <id>              Move agent to another workspace
   swarm workspaces                                 List Cmux workspaces
@@ -370,24 +375,44 @@ async function main() {
         const name = getFlag('--name');
         const cwd = getFlag('--cwd') || process.cwd();
         const autonomous = hasFlag('--autonomous');
+        const agentKind = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
 
-        const perms = autonomous ? ' --dangerously-skip-permissions' : '';
-        const claudeCmd = `claude${perms}`;
+        let commandText: string;
+        let label: string;
+        if (agentKind === 'claude') {
+          const perms = autonomous ? ' --dangerously-skip-permissions' : '';
+          commandText = `claude${perms}`;
+          label = 'Claude Code';
+        } else if (agentKind === 'codex') {
+          const perms = autonomous ? ' --dangerously-bypass-approvals-and-sandbox' : '';
+          const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
+          const joinInstruction = name
+            ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}". Then run ${swarmBin} inbox and ${swarmBin} members. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
+            : `Join the local swarm. First run ${swarmBin} members. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>". Then run ${swarmBin} inbox and ${swarmBin} members. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
+          commandText = `codex --cd ${shellQuote(cwd)}${perms} ${shellQuote(joinInstruction)}`;
+          label = 'Codex CLI';
+        } else {
+          console.error('Usage: swarm spawn [--agent claude|codex] [--name <name>] [--cwd <path>] [--autonomous]');
+          process.exit(1);
+        }
 
-        const result = spawnWorkspace(cwd, claudeCmd);
+        const result = spawnWorkspace(cwd, commandText);
         if (!result) {
           console.error('Failed to spawn workspace');
           process.exit(1);
         }
 
         const joinArg = name || '';
-        console.log(`Spawned new Claude Code session in ${cwd} (${result.workspaceRef}, ${result.surfaceRef})`);
+        console.log(`Spawned new ${label} session in ${cwd} (${result.workspaceRef}, ${result.surfaceRef})`);
 
-        // Wait for Claude Code to boot, then send /join-swarm
-        console.log('Waiting for Claude Code to initialize...');
-        sleep(8);
+        if (agentKind === 'codex') {
+          console.log('Codex received the join instructions as its initial prompt.');
+          break;
+        }
 
         try {
+          console.log('Waiting for Claude Code to initialize...');
+          sleep(8);
           sendToSurface(result.surfaceRef, `/join-swarm ${joinArg}`, result.workspaceRef);
           console.log(`Sent /join-swarm ${joinArg} to new session`);
         } catch {

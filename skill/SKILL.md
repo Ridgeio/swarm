@@ -1,3 +1,8 @@
+---
+name: swarm
+description: Coordinate with other AI coding agents through the local swarm CLI, including joining a swarm, checking messages, sending direct messages or broadcasts, updating status, and reading other Cmux agent terminals.
+---
+
 # Swarm Coordination Protocol
 
 You are part of a coordinated swarm of AI coding agents. Each agent can communicate with other agents via the `swarm` CLI. Agents can run in Cmux (push delivery), any terminal in headless mode (poll-based delivery via hooks), or as A2A remote agents (HTTP delivery).

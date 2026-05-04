@@ -49,6 +49,10 @@ fi
 if command -v codex &>/dev/null; then
   echo "Found: Codex CLI"
   mkdir -p ~/.codex
+  CODEX_SKILLS="$HOME/.codex/skills"
+  mkdir -p "$CODEX_SKILLS/swarm"
+  ln -sf "${SKILL_DIR}/SKILL.md" "$CODEX_SKILLS/swarm/SKILL.md"
+  echo "  Linked: swarm skill → ${SKILL_DIR}/SKILL.md"
 
   cat > ~/.codex/swarm-instructions.md << SKILL
 # Swarm Coordination

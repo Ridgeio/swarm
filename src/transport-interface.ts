@@ -1,6 +1,7 @@
 export type AgentType = 'cmux' | 'a2a' | 'headless';
 
 export interface TransportAgent {
+  swarm_id: string;
   name: string;
   agent_type: AgentType;
   surface_id: string;

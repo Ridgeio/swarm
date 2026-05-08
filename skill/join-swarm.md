@@ -1,31 +1,43 @@
-Join the agent coordination swarm. This lets you communicate with other AI agents — works in Cmux, Terminal.app, Warp, or any terminal.
+---
+name: join-swarm
+description: Join the local swarm coordination system as an AI coding agent, choosing or accepting an agent name, checking inbox messages, and listing active swarm members.
+---
+
+Join the agent coordination swarm for the current project. Swarm supports multiple independent project swarms on the same machine; use `--swarm <name>` when the user gives a project/swarm name or when several codebases are active.
 
 ## Steps
 
-1. First, determine your agent name.
+1. First, determine the target swarm and your agent name.
 
-If a name was provided as an argument, use it:
+If arguments were provided, preserve any `--swarm <name>` option and use the remaining first plain argument as your agent name:
 ```bash
 echo "$ARGUMENTS"
 ```
 
-If `$ARGUMENTS` is empty or blank, check who's already in the swarm:
+If no swarm name was provided, use the current CLI context. The CLI can infer a swarm from this terminal, `SWARM_ID`, or a codebase root registered with `swarm create`.
+
+If no agent name was provided, check who's already in the selected swarm:
 ```bash
-swarm members 2>/dev/null
+swarm members --swarm "<swarm-name>" 2>/dev/null
 ```
 
-- If the swarm is **empty** (no agents or "No agents in swarm"), join as **"Lead"** — you're the first agent, so you coordinate the team.
-- If agents **already exist**, pick a creative name that's fun and unique — an adjective + noun combo works well (e.g., "SwiftFox", "IronBolt", "NeonOwl", "QuietStorm"). Don't ask the user, just pick one.
+Omit `--swarm` when no swarm name was provided and the CLI can infer the current swarm.
+
+- If the selected swarm is **empty** (no agents or "No agents in swarm"), join as **"Lead"** — you're the first agent in this project swarm, so you coordinate the team.
+- If agents **already exist in this swarm**, pick a short creative name that's unique within this swarm. Don't ask the user, just pick one.
 
 2. Join the swarm with your chosen name. The CLI auto-detects your environment — if you're in Cmux it uses push delivery, otherwise it joins in headless mode with automatic message polling.
 
 ```bash
-swarm join "<your-chosen-name>"
+swarm join "<your-chosen-name>" --swarm "<swarm-name>"
 ```
+
+Omit `--swarm` when no swarm name was provided.
 
 3. Check for pending messages and see who else is active:
 
 ```bash
+swarm whoami
 swarm inbox
 swarm members
 ```

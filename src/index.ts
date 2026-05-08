@@ -611,11 +611,19 @@ async function main() {
         }
 
         if (selectedTerminal === 'warp') {
-          // Warp's `warp://action/new_tab?command=...` is documented to accept
-          // only `path`; the `command` query param is silently ignored (verified
-          // empirically). Launch Configurations DO support auto-running commands
-          // and ARE invokable via the `warp://launch/<name>` URI, so we generate
-          // a one-shot launch config YAML and trigger that.
+          // Two paths:
+          //  --window: open a fresh Warp window via launch configuration YAML
+          //            (auto-runs the join+exec command — no keystrokes needed,
+          //            but spawns a separate window which can clutter and is
+          //            vulnerable to keystroke races if the user is typing
+          //            while the launch fires).
+          //  default:  open a NEW TAB in the active Warp window via
+          //            warp://action/new_tab?path=<cwd>, then clipboard-paste
+          //            the join+exec command into the new tab. Warp's
+          //            `command` query param on new_tab is silently ignored
+          //            (verified empirically), so we paste post-open.
+          //            Requires Accessibility access to Warp.app.
+          const useWindow = hasFlag('--window');
           let warpCommand: string;
           let willAutoJoin = false;
 
@@ -625,41 +633,57 @@ async function main() {
             warpCommand = `swarm join ${shellQuote(name)} --swarm ${shellQuote(swarm.name)}${pushFlag} && exec ${agentCmd}`;
             willAutoJoin = true;
           } else if (agentFlag === 'codex') {
-            // codex receives join instructions as its initial prompt — no
-            // shell-side join needed.
             warpCommand = agentCmd;
             willAutoJoin = true;
           } else {
             warpCommand = agentCmd;
           }
 
-          const launchConfigsDir = path.join(os.homedir(), '.warp', 'launch_configurations');
-          fs.mkdirSync(launchConfigsDir, { recursive: true });
-          const configName = `swarm-spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-          const configPath = path.join(launchConfigsDir, `${configName}.yaml`);
-          // Minimal YAML — quote the command string so embedded characters
-          // (single quotes, colons) survive YAML parsing. We use double-quoted
-          // YAML scalar with backslash-escaped backslashes and double quotes.
-          const yamlEscape = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-          const yaml = [
-            '---',
-            `name: ${configName}`,
-            'windows:',
-            '  - tabs:',
-            '      - layout:',
-            `          cwd: ${JSON.stringify(cwd)}`,
-            '          commands:',
-            `            - exec: "${yamlEscape(warpCommand)}"`,
-            '',
-          ].join('\n');
-          fs.writeFileSync(configPath, yaml, 'utf-8');
+          if (useWindow) {
+            const launchConfigsDir = path.join(os.homedir(), '.warp', 'launch_configurations');
+            fs.mkdirSync(launchConfigsDir, { recursive: true });
+            const configName = `swarm-spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+            const configPath = path.join(launchConfigsDir, `${configName}.yaml`);
+            const yamlEscape = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+            const yaml = [
+              '---',
+              `name: ${configName}`,
+              'windows:',
+              '  - tabs:',
+              '      - layout:',
+              `          cwd: ${JSON.stringify(cwd)}`,
+              '          commands:',
+              `            - exec: "${yamlEscape(warpCommand)}"`,
+              '',
+            ].join('\n');
+            fs.writeFileSync(configPath, yaml, 'utf-8');
 
-          execFileSync('open', [`warp://launch/${configName}`], { stdio: 'ignore' });
-          // Best-effort cleanup: remove the temp config after a delay so Warp
-          // has time to read it. Don't await.
-          setTimeout(() => { try { fs.unlinkSync(configPath); } catch { /* ignore */ } }, 5000).unref();
+            execFileSync('open', [`warp://launch/${configName}`], { stdio: 'ignore' });
+            setTimeout(() => { try { fs.unlinkSync(configPath); } catch { /* ignore */ } }, 5000).unref();
+            console.log(`Opened new Warp window in ${cwd} running ${agentLabel}.${willAutoJoin ? ' The new tab will auto-join the swarm.' : ` Run /join-swarm --swarm ${swarm.name} in the new tab to join.`}`);
+            break;
+          }
 
-          console.log(`Opened new Warp tab in ${cwd} running ${agentLabel}.${willAutoJoin ? ' The new tab will auto-join the swarm.' : ` Run /join-swarm --swarm ${swarm.name} in the new tab to join.`}`);
+          // Tab path: new_tab with path, then paste command via Accessibility.
+          execFileSync('open', [`warp://action/new_tab?path=${encodeURIComponent(cwd)}`], { stdio: 'ignore' });
+          // Wait for the new tab to spawn and grab focus before pasting.
+          sleep(0.8);
+
+          const escapedForApplescript = warpCommand.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          const args = [
+            '-e', 'tell application "Warp" to activate',
+            '-e', `set the clipboard to "${escapedForApplescript}"`,
+            '-e', 'tell application "System Events" to keystroke "v" using command down',
+            '-e', 'delay 0.1',
+            '-e', 'tell application "System Events" to keystroke return',
+          ];
+          try {
+            execFileSync('osascript', args, { stdio: 'ignore' });
+            console.log(`Opened new Warp tab in ${cwd} running ${agentLabel}.${willAutoJoin ? ' The new tab will auto-join the swarm.' : ` Run /join-swarm --swarm ${swarm.name} in the new tab to join.`}`);
+          } catch (err: any) {
+            console.error(`Opened new Warp tab in ${cwd}, but failed to type the join command (Accessibility?). Run manually in the new tab: ${warpCommand}`);
+            console.error(`Underlying error: ${err.message ?? err}`);
+          }
           break;
         }
 

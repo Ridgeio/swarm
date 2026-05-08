@@ -34,6 +34,8 @@ swarm join "<your-chosen-name>" --swarm "<swarm-name>"
 
 Omit `--swarm` when no swarm name was provided.
 
+In Warp, add `--push` only when the user wants experimental push delivery and has granted macOS Accessibility access to the parent terminal binary that runs `swarm`. Without `--push`, Warp agents still join normally and receive messages through the inbox/hook flow.
+
 3. Check for pending messages and see who else is active:
 
 ```bash

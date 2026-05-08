@@ -155,7 +155,7 @@ Swarm Management:
 
 Agent Management:
   swarm join <name> [--description <text>]        Register in the selected swarm
-    [--headless] [--root <path>]                  Force headless / set swarm root on create
+    [--headless] [--push] [--root <path>]         Force headless / opt into Warp push / set root
   swarm leave                                      Deregister from the current swarm
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>]
@@ -192,13 +192,34 @@ Admin:
   swarm help                                       Show this help`);
 }
 
-function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string, description?: string): void {
+function safeOscTitlePart(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f]/g, '_');
+}
+
+function writeWarpOscTitle(surface: { ttyDevice?: string }, swarmName: string, agentName: string): void {
+  if (!surface.ttyDevice) return;
+  const title = `swarm/${safeOscTitlePart(swarmName)}/${safeOscTitlePart(agentName)}`;
+  try {
+    fs.writeFileSync(surface.ttyDevice, `\x1b]0;${title}\x07`);
+  } catch (err: any) {
+    if (err?.code !== 'EACCES' && err?.code !== 'ENOENT') {
+      console.warn(`Warning: Could not set Warp tab title for accessibility targeting: ${err.message}`);
+    }
+  }
+}
+
+function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string, description?: string, pushEnabled?: boolean): void {
   const agent = joinHeadlessAgent(db, swarm.id, name, description);
   const parts: string[] = [`swarm: ${swarm.name}`, 'headless'];
 
-  const surface = registerSurface(swarm.id, name);
+  const surface = registerSurface(swarm.id, name, pushEnabled);
   if (surface) {
-    parts.push(`${surface.app} push`);
+    if (surface.app === 'Warp') {
+      parts.push(surface.pushEnabled ? 'Warp push' : 'Warp inbox');
+      writeWarpOscTitle(surface, swarm.name, name);
+    } else {
+      parts.push(`${surface.app} push`);
+    }
   }
 
   const host = detectHost();
@@ -278,10 +299,11 @@ async function main() {
       case 'join': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--swarm <name>]');
+          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--swarm <name>]');
           process.exit(1);
         }
         const headless = hasFlag('--headless');
+        const pushEnabled = hasFlag('--push');
         const description = getFlag('--description');
         const db = getDb();
         const swarm = explicitSwarmName
@@ -300,11 +322,11 @@ async function main() {
         }
 
         if (headless) {
-          joinAsHeadless(db, swarm, name, description);
+          joinAsHeadless(db, swarm, name, description, pushEnabled);
         } else {
           const { surfaceId, workspaceId } = identify();
           if (!surfaceId) {
-            joinAsHeadless(db, swarm, name, description);
+            joinAsHeadless(db, swarm, name, description, pushEnabled);
           } else {
             const agent = joinAgent(db, swarm.id, name, surfaceId, workspaceId, process.ppid, description);
             renameTab(surfaceId, `${swarm.name}/${name}`, workspaceId);
@@ -597,8 +619,10 @@ async function main() {
           let warpCommand: string;
           let willAutoJoin = false;
 
+          const pushFlag = hasFlag('--push') ? ' --push' : '';
+
           if (agentFlag === 'claude' && name) {
-            warpCommand = `swarm join ${shellQuote(name)} --swarm ${shellQuote(swarm.name)} && exec ${agentCmd}`;
+            warpCommand = `swarm join ${shellQuote(name)} --swarm ${shellQuote(swarm.name)}${pushFlag} && exec ${agentCmd}`;
             willAutoJoin = true;
           } else if (agentFlag === 'codex') {
             // codex receives join instructions as its initial prompt — no

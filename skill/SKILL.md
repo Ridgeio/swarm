@@ -47,6 +47,8 @@ If you think you may have missed messages (e.g., you were busy), check your inbo
 swarm inbox
 ```
 
+Warp terminals default to inbox/hook delivery. To opt into experimental Warp push delivery, join with `swarm join <name> --push`; macOS Accessibility access must be granted to the parent terminal binary that runs `swarm`, because delivery activates Warp, pastes through the clipboard, and presses Return with System Events.
+
 ### Checking on Others
 See what another agent's terminal currently shows:
 ```

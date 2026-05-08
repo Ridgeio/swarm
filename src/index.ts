@@ -1,4 +1,7 @@
 import path from 'path';
+import os from 'os';
+import fs from 'fs';
+import { execFileSync } from 'child_process';
 import { DEFAULT_SWARM_ID } from './db.js';
 import { getDb } from './db.js';
 import {
@@ -169,12 +172,15 @@ Status:
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
 
-Cmux-only:
-  swarm read <agent> [--lines <n>]                 Read agent's terminal
+Local Agents:
   swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
-    [--agent claude|codex] [--name <name>]           (default: claude; --autonomous adds
+    [--agent claude|codex] [--name <name>]
+    [--terminal auto|cmux|warp]                      (default: auto; --autonomous adds
                                                       --dangerously-skip-permissions for claude
                                                       and --yolo for codex)
+
+Cmux-only:
+  swarm read <agent> [--lines <n>]                 Read agent's terminal
   swarm rename <agent> <title>                     Rename an agent's Cmux tab
   swarm move <agent> --workspace <id>              Move agent to another workspace
   swarm workspaces                                 List Cmux workspaces
@@ -549,7 +555,16 @@ async function main() {
         const cwd = getFlag('--cwd') || process.cwd();
         const autonomous = hasFlag('--autonomous');
         const agentFlag = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
-        const { workspaceId } = identify();
+        const terminalFlag = (getFlag('--terminal') || 'auto').toLowerCase();
+        let selectedTerminal: 'cmux' | 'warp';
+        if (terminalFlag === 'auto') {
+          selectedTerminal = process.env.TERM_PROGRAM === 'WarpTerminal' ? 'warp' : 'cmux';
+        } else if (terminalFlag === 'cmux' || terminalFlag === 'warp') {
+          selectedTerminal = terminalFlag;
+        } else {
+          console.error(`Unknown --terminal "${terminalFlag}". Supported: auto, cmux, warp.`);
+          process.exit(1);
+        }
 
         let agentCmd: string;
         let agentLabel: string;
@@ -573,6 +588,58 @@ async function main() {
           process.exit(1);
         }
 
+        if (selectedTerminal === 'warp') {
+          // Warp's `warp://action/new_tab?command=...` is documented to accept
+          // only `path`; the `command` query param is silently ignored (verified
+          // empirically). Launch Configurations DO support auto-running commands
+          // and ARE invokable via the `warp://launch/<name>` URI, so we generate
+          // a one-shot launch config YAML and trigger that.
+          let warpCommand: string;
+          let willAutoJoin = false;
+
+          if (agentFlag === 'claude' && name) {
+            warpCommand = `swarm join ${shellQuote(name)} --swarm ${shellQuote(swarm.name)} && exec ${agentCmd}`;
+            willAutoJoin = true;
+          } else if (agentFlag === 'codex') {
+            // codex receives join instructions as its initial prompt — no
+            // shell-side join needed.
+            warpCommand = agentCmd;
+            willAutoJoin = true;
+          } else {
+            warpCommand = agentCmd;
+          }
+
+          const launchConfigsDir = path.join(os.homedir(), '.warp', 'launch_configurations');
+          fs.mkdirSync(launchConfigsDir, { recursive: true });
+          const configName = `swarm-spawn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+          const configPath = path.join(launchConfigsDir, `${configName}.yaml`);
+          // Minimal YAML — quote the command string so embedded characters
+          // (single quotes, colons) survive YAML parsing. We use double-quoted
+          // YAML scalar with backslash-escaped backslashes and double quotes.
+          const yamlEscape = (s: string) => s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+          const yaml = [
+            '---',
+            `name: ${configName}`,
+            'windows:',
+            '  - tabs:',
+            '      - layout:',
+            `          cwd: ${JSON.stringify(cwd)}`,
+            '          commands:',
+            `            - exec: "${yamlEscape(warpCommand)}"`,
+            '',
+          ].join('\n');
+          fs.writeFileSync(configPath, yaml, 'utf-8');
+
+          execFileSync('open', [`warp://launch/${configName}`], { stdio: 'ignore' });
+          // Best-effort cleanup: remove the temp config after a delay so Warp
+          // has time to read it. Don't await.
+          setTimeout(() => { try { fs.unlinkSync(configPath); } catch { /* ignore */ } }, 5000).unref();
+
+          console.log(`Opened new Warp tab in ${cwd} running ${agentLabel}.${willAutoJoin ? ' The new tab will auto-join the swarm.' : ` Run /join-swarm --swarm ${swarm.name} in the new tab to join.`}`);
+          break;
+        }
+
+        const { workspaceId } = identify();
         let result: { workspaceRef: string | null; surfaceRef: string } | null = null;
         let spawnedInCurrentWorkspace = false;
 

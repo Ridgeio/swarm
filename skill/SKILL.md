@@ -61,7 +61,7 @@ When you need another local Claude Code agent, spawn it from the lead/current ag
 swarm spawn --name DevA --cwd /path/to/project --swarm <swarm-name>
 ```
 
-When run inside Cmux, this opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm. If no name is provided, the spawned session receives `/join-swarm --swarm <swarm-name>` and can choose its own name.
+By default, `swarm spawn` auto-selects the terminal: Warp when running inside Warp, otherwise Cmux. Use `--terminal cmux` or `--terminal warp` to force one. Cmux opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm. Warp opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex agents receive join instructions as their initial prompt.
 
 ## Coordination Protocol
 

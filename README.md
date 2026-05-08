@@ -220,12 +220,13 @@ swarm broadcast "status check — what's everyone working on?"
 
 ### Spawning new agents
 
-A lead agent can spin up new Claude Code sessions directly. When run from inside Cmux, new agents open as surfaces/tabs in the current workspace:
+A lead agent can spin up new Claude Code or Codex sessions directly. By default, `swarm spawn` opens Warp tabs when run inside Warp and Cmux surfaces otherwise:
 ```bash
 swarm spawn --cwd /path/to/project --swarm ridge --autonomous
+swarm spawn --terminal warp --name DevA --cwd /path/to/project --swarm ridge
 ```
 
-This opens a new Cmux tab in the current workspace, launches Claude Code, and auto-sends `/join-swarm --swarm ridge` after boot. If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. The `--autonomous` flag enables `--dangerously-skip-permissions`.
+In Cmux, this opens a new tab in the current workspace, launches the agent, and auto-sends `/join-swarm --swarm ridge` after boot. If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. In Warp, it opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex agents receive join instructions as their initial prompt. The `--autonomous` flag enables `--dangerously-skip-permissions` for Claude and `--yolo` for Codex.
 
 ### Organizing workspaces
 

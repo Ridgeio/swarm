@@ -13,28 +13,30 @@ import fs from 'fs';
  */
 
 interface AppleScriptSurface {
-  app: 'Terminal' | 'iTerm2';
+  app: 'Terminal' | 'iTerm2' | 'Warp';
   windowId?: number;
   tabIndex?: number;
   ttyDevice?: string;
 }
 
-const SURFACES_DIR = path.join(os.homedir(), '.swarm', 'surfaces');
+function surfacesDir(): string {
+  return process.env.SWARM_SURFACES_DIR || path.join(os.homedir(), '.swarm', 'surfaces');
+}
 
 function safePathSegment(value: string): string {
   return value.replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
 function surfacePath(swarmId: string, agentName: string): string {
-  return path.join(SURFACES_DIR, safePathSegment(swarmId), `${safePathSegment(agentName)}.json`);
+  return path.join(surfacesDir(), safePathSegment(swarmId), `${safePathSegment(agentName)}.json`);
 }
 
 function legacySurfacePath(agentName: string): string {
-  return path.join(SURFACES_DIR, `${agentName}.json`);
+  return path.join(surfacesDir(), `${agentName}.json`);
 }
 
 function ensureSurfacesDir(swarmId: string): void {
-  const dir = path.join(SURFACES_DIR, safePathSegment(swarmId));
+  const dir = path.join(surfacesDir(), safePathSegment(swarmId));
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
@@ -115,7 +117,7 @@ function findTerminalWindowForTty(ttyDevice: string): { windowId: number; tabInd
  */
 export function registerSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
   const app = detectTerminalApp();
-  if (!app || app === 'Warp') return null;
+  if (!app) return null;
 
   const tty = getCurrentTty();
   const surface: AppleScriptSurface = { app, ttyDevice: tty ?? undefined };
@@ -254,6 +256,8 @@ export class AppleScriptTransport implements Transport {
         case 'iTerm2':
           sendToITerm2(surface, formattedText);
           break;
+        case 'Warp':
+          return { delivered: false, error: 'Warp push delivery not yet implemented (Phase 3 — requires accessibility grant)' };
         default:
           return { delivered: false, error: `Unsupported terminal app: ${surface.app}` };
       }

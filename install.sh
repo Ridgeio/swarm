@@ -109,6 +109,23 @@ EOF
   installed=$((installed + 1))
 fi
 
+# ── Gemini CLI ──────────────────────────────────────────────────────────────
+
+if command -v gemini &>/dev/null; then
+  echo "Found: Gemini CLI"
+  GEMINI_SKILLS="$HOME/.gemini/skills"
+  GEMINI_SKILL_DIR="${SWARM_DIR}/skill/gemini"
+  mkdir -p "$GEMINI_SKILLS"
+
+  # Symlink each skill directory into ~/.gemini/skills/
+  for skill_name in swarm join-swarm leave-swarm reset-swarm; do
+    ln -sf "${GEMINI_SKILL_DIR}/${skill_name}" "${GEMINI_SKILLS}/${skill_name}"
+    echo "  Linked: ${skill_name} → ${GEMINI_SKILL_DIR}/${skill_name}"
+  done
+
+  installed=$((installed + 1))
+fi
+
 # ── Swarm awareness hook ─────────────────────────────────────────────────────
 
 HOOK_SCRIPT="${SWARM_DIR}/hooks/swarm-awareness.sh"
@@ -165,7 +182,7 @@ fi
 
 echo ""
 if [ $installed -eq 0 ]; then
-  echo "No supported agents found (checked: claude, codex)."
+  echo "No supported agents found (checked: claude, codex, gemini)."
   echo "You can still use the CLI directly: ${SWARM_BIN} help"
 else
   echo "Done. ${installed} agent platform(s) configured."

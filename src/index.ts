@@ -1,32 +1,64 @@
-import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import { DEFAULT_SWARM_ID } from './db.js';
 import { getDb } from './db.js';
-import { joinAgent, leaveAgent, getSelf, getAgent, listAgents, listAgentsSync, updateStatus, updateHeartbeat, updateWorkspace, joinA2AAgent, leaveA2AAgent, joinHeadlessAgent, leaveHeadlessAgent } from './registry.js';
+import {
+  Agent,
+  Swarm,
+  deleteSwarm,
+  findSwarmForCwd,
+  forceReap,
+  getAgent,
+  getOrCreateSwarm,
+  getSelf,
+  getSwarm,
+  getSwarmById,
+  joinA2AAgent,
+  joinAgent,
+  joinHeadlessAgent,
+  leaveA2AAgent,
+  leaveAgent,
+  leaveHeadlessAgent,
+  listAgents,
+  listAgentsSync,
+  listSwarms,
+  reapAll,
+  reapIfDead,
+  updateHeartbeat,
+  updateStatus,
+  updateWorkspace,
+} from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
-import { readScreen, identify, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
+import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
-import { registerSurface, removeSurface, detectTerminalApp } from './applescript-transport.js';
+import { registerSurface, removeSurface } from './applescript-transport.js';
 
-const args = process.argv.slice(2);
-const command = args[0];
+const rawArgs = process.argv.slice(2);
 
-function requireSelf() {
-  const db = getDb();
-  const self = getSelf(db);
-  if (!self) {
-    const surfaceId = process.env.CMUX_SURFACE_ID;
-    const agentName = process.env.SWARM_AGENT_NAME;
-    if (!surfaceId && !agentName) {
-      console.error('Error: Not in a swarm context. Set CMUX_SURFACE_ID (Cmux) or SWARM_AGENT_NAME (headless).');
-    } else {
-      console.error('Error: Not joined to swarm. Run "swarm join <name>" first.');
+function parseGlobalFlags(input: string[]): { args: string[]; swarmName: string | undefined } {
+  const stripped: string[] = [];
+  let swarmName: string | undefined;
+
+  for (let i = 0; i < input.length; i += 1) {
+    const arg = input[i];
+    if (arg === '--swarm' || arg === '-s') {
+      swarmName = input[i + 1];
+      i += 1;
+      continue;
     }
-    process.exit(1);
+    if (arg.startsWith('--swarm=')) {
+      swarmName = arg.slice('--swarm='.length);
+      continue;
+    }
+    stripped.push(arg);
   }
-  updateHeartbeat(db, self.surface_id);
-  return { db, self, surfaceId: self.surface_id };
+
+  return { args: stripped, swarmName };
 }
+
+const parsed = parseGlobalFlags(rawArgs);
+const args = parsed.args;
+const command = args[0];
+const explicitSwarmName = parsed.swarmName;
 
 function getFlag(flag: string): string | undefined {
   const idx = args.indexOf(flag);
@@ -42,9 +74,66 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = false): Swarm {
+  if (explicitSwarmName) {
+    const existing = getSwarm(db, explicitSwarmName);
+    if (existing) return existing;
+    if (create) return getOrCreateSwarm(db, explicitSwarmName);
+    throw new Error(`Swarm "${explicitSwarmName}" not found. Run "swarm create ${explicitSwarmName}" first.`);
+  }
+
+  if (process.env.SWARM_ID) {
+    const byId = getSwarmById(db, process.env.SWARM_ID);
+    if (byId) return byId;
+  }
+
+  if (process.env.SWARM_NAME) {
+    const byName = getSwarm(db, process.env.SWARM_NAME);
+    if (byName) return byName;
+    if (create) return getOrCreateSwarm(db, process.env.SWARM_NAME);
+  }
+
+  const self = getSelf(db);
+  if (self) {
+    const swarm = getSwarmById(db, self.swarm_id);
+    if (swarm) return swarm;
+  }
+
+  const cwdSwarm = findSwarmForCwd(db);
+  if (cwdSwarm) return cwdSwarm;
+
+  return getOrCreateSwarm(db);
+}
+
+function requireSelf(): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
+  const db = getDb();
+  const explicitSwarm = explicitSwarmName ? getSwarm(db, explicitSwarmName) : null;
+  if (explicitSwarmName && !explicitSwarm) {
+    console.error(`Error: Swarm "${explicitSwarmName}" not found.`);
+    process.exit(1);
+  }
+
+  const self = getSelf(db, explicitSwarm?.id);
+  if (!self) {
+    const surfaceId = process.env.CMUX_SURFACE_ID;
+    const agentName = process.env.SWARM_AGENT_NAME;
+    const target = explicitSwarm ? ` "${explicitSwarm.name}"` : '';
+    if (!surfaceId && !agentName) {
+      console.error(`Error: Not in a swarm context${target}. Set CMUX_SURFACE_ID (Cmux) or join headless with "swarm join <name>".`);
+    } else {
+      console.error(`Error: Not joined to swarm${target}. Run "swarm join <name>${explicitSwarm ? ` --swarm ${explicitSwarm.name}` : ''}" first.`);
+    }
+    process.exit(1);
+  }
+
+  updateHeartbeat(db, self.swarm_id, self.surface_id);
+  const swarm = getSwarmById(db, self.swarm_id) ?? getOrCreateSwarm(db);
+  return { db, self, swarm, surfaceId: self.surface_id };
+}
+
 function requireCmuxAgent(agent: { name: string; agent_type: string }, action: string): void {
   if (agent.agent_type === 'a2a') {
-    console.error(`Cannot ${action} for A2A agent "${agent.name}". This command only works with Cmux agents.`);
+    console.error(`Cannot ${action} for A2A agent "${agent.name}". This command only works with Cmux/headless terminal agents.`);
     process.exit(1);
   }
 }
@@ -52,109 +141,186 @@ function requireCmuxAgent(agent: { name: string; agent_type: string }, action: s
 function printHelp() {
   console.log(`swarm — Cross-terminal agent coordination via Cmux, headless, and A2A
 
+Swarm Selection:
+  --swarm <name>, -s <name>                       Run the command in a named swarm
+
+Swarm Management:
+  swarm create <name> [--root <path>]             Create or update a named swarm
+    [--description <text>]
+  swarm swarms                                    List known swarms
+  swarm delete <name>                             Delete a non-default swarm
+
 Agent Management:
-  swarm join <name> [--description <text>]        Register (auto-detects Cmux or headless)
-    [--headless]                                   Force headless mode (no Cmux required)
-  swarm leave                                      Deregister from the swarm
+  swarm join <name> [--description <text>]        Register in the selected swarm
+    [--headless] [--root <path>]                  Force headless / set swarm root on create
+  swarm leave                                      Deregister from the current swarm
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>]
   swarm unregister-a2a <name>                      Remove an A2A agent
   swarm discover <url>                             Fetch and display an A2A agent card
 
 Communication:
-  swarm send <agent> <message>                     Send message (any transport)
-  swarm broadcast <message>                        Send to all agents
+  swarm send <agent> <message>                     Send message within the current swarm
+  swarm broadcast <message>                        Send to all agents in the current swarm
   swarm inbox [--peek]                             Read pending messages
 
 Status:
-  swarm members                                    List active agents
+  swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
 
 Cmux-only:
   swarm read <agent> [--lines <n>]                 Read agent's terminal
-  swarm spawn [--agent claude|codex] [--name <n>]  Spawn a new CLI agent
-    [--cwd <path>] [--autonomous]
+  swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
+    [--agent claude|codex] [--name <name>]           (default: claude; --autonomous adds
+                                                      --dangerously-skip-permissions for claude
+                                                      and --yolo for codex)
   swarm rename <agent> <title>                     Rename an agent's Cmux tab
   swarm move <agent> --workspace <id>              Move agent to another workspace
   swarm workspaces                                 List Cmux workspaces
   swarm rename-workspace <id> <title>              Rename a workspace
 
 Admin:
-  swarm reset                                      Clear all agents and messages
+  swarm reap [--name <agent>] [--force] [--all]    Prune dead agents after liveness probe
+  swarm reset [--all]                              Clear current swarm, or all swarms
   swarm help                                       Show this help`);
 }
 
-function joinAsHeadless(db: ReturnType<typeof getDb>, name: string, description?: string): void {
-  const agent = joinHeadlessAgent(db, name, description);
-  const parts: string[] = ['headless'];
+function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string, description?: string): void {
+  const agent = joinHeadlessAgent(db, swarm.id, name, description);
+  const parts: string[] = [`swarm: ${swarm.name}`, 'headless'];
 
-  // Register terminal surface for push delivery (AppleScript)
-  const surface = registerSurface(name);
+  const surface = registerSurface(swarm.id, name);
   if (surface) {
     parts.push(`${surface.app} push`);
   }
 
-  // Install awareness hook as backup
   const host = detectHost();
   if (host) {
-    installHook(host, name);
+    installHook(host, name, swarm.id, swarm.name);
     parts.push(`${host} hook`);
   }
 
-  console.log(`Joined swarm as "${agent.name}" (${parts.join(', ')})`);
+  console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (${parts.join(', ')})`);
   if (!surface && !host) {
     console.log('Tip: Run "swarm inbox" periodically to check for messages.');
   }
 }
 
+function printHookContext(): void {
+  const { db, self, swarm } = requireSelf();
+  const agents = listAgentsSync(db, self.swarm_id);
+  const members = agents.map(agent => agent.name).join(', ');
+  const inbox = getInbox(db, self.swarm_id, self.name);
+  const inboxSection = inbox.length === 0
+    ? ''
+    : `\nNEW MESSAGES (respond to these):\n${inbox.map(msg => {
+      const time = new Date(msg.created_at).toLocaleTimeString();
+      return `[${time}] ${msg.from_agent}: ${msg.body}`;
+    }).join('\n')}`;
+
+  const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
+  console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
+Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"${readCommand}
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.${inboxSection}`);
+}
+
 async function main() {
   try {
     switch (command) {
+      case 'create': {
+        const name = args[1];
+        if (!name) {
+          console.error('Usage: swarm create <name> [--root <path>] [--description <text>]');
+          process.exit(1);
+        }
+        const db = getDb();
+        const swarm = getOrCreateSwarm(db, name, getFlag('--root'), getFlag('--description'));
+        console.log(`Swarm "${swarm.name}" ready${swarm.root_path ? ` (root: ${swarm.root_path})` : ''}.`);
+        break;
+      }
+
+      case 'swarms': {
+        const db = getDb();
+        const current = getSelf(db);
+        const swarms = listSwarms(db);
+        for (const swarm of swarms) {
+          const marker = current?.swarm_id === swarm.id ? ' (current)' : '';
+          const root = swarm.root_path ? ` — ${swarm.root_path}` : '';
+          console.log(`  ${swarm.name}${marker}${root}`);
+        }
+        console.log(`\n${swarms.length} swarm(s)`);
+        break;
+      }
+
+      case 'delete': {
+        const name = args[1];
+        if (!name) {
+          console.error('Usage: swarm delete <name>');
+          process.exit(1);
+        }
+        const db = getDb();
+        const swarm = deleteSwarm(db, name);
+        if (!swarm) {
+          console.error(`Swarm "${name}" not found.`);
+          process.exit(1);
+        }
+        console.log(`Deleted swarm "${swarm.name}".`);
+        break;
+      }
+
       case 'join': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm join <name> [--description <text>] [--headless]');
+          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--swarm <name>]');
           process.exit(1);
         }
         const headless = hasFlag('--headless');
         const description = getFlag('--description');
         const db = getDb();
-        const existing = getAgent(db, name);
+        const swarm = explicitSwarmName
+          ? getOrCreateSwarm(db, explicitSwarmName, getFlag('--root'))
+          : resolveSelectedSwarm(db, true);
+
+        const reaped = await reapIfDead(db, swarm.id, name);
+        if (reaped) {
+          console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
+        }
+
+        const existing = getAgent(db, swarm.id, name);
         if (existing && existing.agent_type === 'a2a') {
-          console.error(`Agent "${name}" is already registered as an A2A agent. Choose a different name or run "swarm unregister-a2a ${name}" first.`);
+          console.error(`Agent "${name}" is already registered as a live A2A agent in swarm "${swarm.name}". Choose a different name or run "swarm unregister-a2a ${name} --swarm ${swarm.name}" first.`);
           process.exit(1);
         }
 
         if (headless) {
-          joinAsHeadless(db, name, description);
+          joinAsHeadless(db, swarm, name, description);
         } else {
           const { surfaceId, workspaceId } = identify();
           if (!surfaceId) {
-            // Auto-detect: if not in Cmux, fall back to headless
-            joinAsHeadless(db, name, description);
+            joinAsHeadless(db, swarm, name, description);
           } else {
-            const agent = joinAgent(db, name, surfaceId, workspaceId, process.ppid, description);
-            renameTab(surfaceId, name, workspaceId);
-            console.log(`Joined swarm as "${agent.name}" (surface: ${agent.surface_id})`);
+            const agent = joinAgent(db, swarm.id, name, surfaceId, workspaceId, process.ppid, description);
+            renameTab(surfaceId, `${swarm.name}/${name}`, workspaceId);
+            console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (surface: ${agent.surface_id})`);
           }
         }
         break;
       }
 
       case 'leave': {
-        const { db, self } = requireSelf();
+        const { db, self, swarm } = requireSelf();
         if (self.agent_type === 'headless') {
-          leaveHeadlessAgent(db, self.name);
-          removeSurface(self.name);
+          leaveHeadlessAgent(db, self.swarm_id, self.name);
+          removeSurface(self.swarm_id, self.name);
           const host = detectHost();
           if (host) {
-            removeHook(host, self.name);
+            removeHook(host, self.name, self.swarm_id);
           }
         } else {
-          leaveAgent(db, self.surface_id);
+          leaveAgent(db, self.swarm_id, self.surface_id);
         }
-        console.log(`Left swarm (was "${self.name}")`);
+        console.log(`Left swarm "${swarm.name}" (was "${self.name}")`);
         break;
       }
 
@@ -162,11 +328,10 @@ async function main() {
         const name = args[1];
         const endpoint = getFlag('--endpoint');
         if (!name || !endpoint) {
-          console.error('Usage: swarm register-a2a <name> --endpoint <url> [--description <text>]');
+          console.error('Usage: swarm register-a2a <name> --endpoint <url> [--description <text>] [--swarm <name>]');
           process.exit(1);
         }
 
-        // Validate endpoint URL
         let parsedUrl: URL;
         try {
           parsedUrl = new URL(endpoint);
@@ -179,7 +344,6 @@ async function main() {
           process.exit(1);
         }
 
-        // Probe agent — try agent card, then fall back to basic reachability
         let agentDescription = getFlag('--description');
         let reachable = false;
         try {
@@ -192,7 +356,6 @@ async function main() {
             agentDescription = card.description;
           }
         } catch {
-          // Agent card not available — try basic reachability
           try {
             await fetch(endpoint, { method: 'HEAD', signal: AbortSignal.timeout(5000) });
             reachable = true;
@@ -205,23 +368,29 @@ async function main() {
         }
 
         const db = getDb();
-        const agent = joinA2AAgent(db, name, endpoint, agentDescription);
-        console.log(`Registered A2A agent "${agent.name}" @ ${endpoint}`);
+        const swarm = resolveSelectedSwarm(db, true);
+        const reaped = await reapIfDead(db, swarm.id, name);
+        if (reaped) {
+          console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
+        }
+        const agent = joinA2AAgent(db, swarm.id, name, endpoint, agentDescription);
+        console.log(`Registered A2A agent "${agent.name}" in swarm "${swarm.name}" @ ${endpoint}`);
         break;
       }
 
       case 'unregister-a2a': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm unregister-a2a <name>');
+          console.error('Usage: swarm unregister-a2a <name> [--swarm <name>]');
           process.exit(1);
         }
         const db = getDb();
-        const removed = leaveA2AAgent(db, name);
+        const swarm = resolveSelectedSwarm(db);
+        const removed = leaveA2AAgent(db, swarm.id, name);
         if (removed) {
-          console.log(`Removed A2A agent "${name}"`);
+          console.log(`Removed A2A agent "${name}" from swarm "${swarm.name}"`);
         } else {
-          console.error(`A2A agent "${name}" not found.`);
+          console.error(`A2A agent "${name}" not found in swarm "${swarm.name}".`);
           process.exit(1);
         }
         break;
@@ -262,7 +431,7 @@ async function main() {
           console.error('Cannot send a message to yourself.');
           process.exit(1);
         }
-        const result = await sendMessage(db, self.name, targetName, message);
+        const result = await sendMessage(db, self.swarm_id, self.name, targetName, message);
         console.log(result.message);
         break;
       }
@@ -274,7 +443,7 @@ async function main() {
           console.error('Usage: swarm broadcast <message>');
           process.exit(1);
         }
-        const result = await broadcastMessage(db, self.name, message);
+        const result = await broadcastMessage(db, self.swarm_id, self.name, message);
         console.log(`Broadcast to ${result.sent} agent(s)${result.failed > 0 ? `, ${result.failed} failed` : ''}`);
         break;
       }
@@ -282,14 +451,13 @@ async function main() {
       case 'inbox': {
         const { db, self } = requireSelf();
         const peek = hasFlag('--peek');
-        const messages = getInbox(db, self.name, peek);
+        const messages = getInbox(db, self.swarm_id, self.name, peek);
         if (messages.length === 0) {
           console.log('No new messages.');
         } else {
           for (const msg of messages) {
-            const from = msg.from_agent;
             const time = new Date(msg.created_at).toLocaleTimeString();
-            console.log(`[${time}] ${from}: ${msg.body}`);
+            console.log(`[${time}] ${msg.from_agent}: ${msg.body}`);
           }
           console.log(`\n${messages.length} message(s)${peek ? ' (peek mode, not marked as read)' : ''}`);
         }
@@ -298,12 +466,13 @@ async function main() {
 
       case 'members': {
         const db = getDb();
-        const agents = await listAgents(db);
+        const swarm = resolveSelectedSwarm(db);
+        const agents = await listAgents(db, swarm.id);
         if (agents.length === 0) {
-          console.log('No agents in swarm.');
+          console.log(`No agents in swarm "${swarm.name}".`);
         } else {
-          const db2 = getDb();
-          const self = getSelf(db2);
+          const self = getSelf(db, swarm.id);
+          console.log(`Swarm: ${swarm.name}`);
           for (const agent of agents) {
             const you = self && agent.name.toLowerCase() === self.name.toLowerCase() ? ' (you)' : '';
             const desc = agent.description ? ` — ${agent.description}` : '';
@@ -321,13 +490,14 @@ async function main() {
 
         if (setDesc) {
           const { db, self } = requireSelf();
-          updateStatus(db, self.surface_id, setDesc);
+          updateStatus(db, self.swarm_id, self.surface_id, setDesc);
           console.log(`Status updated: ${setDesc}`);
         } else if (agentName) {
           const db = getDb();
-          const agent = getAgent(db, agentName);
+          const swarm = resolveSelectedSwarm(db);
+          const agent = getAgent(db, swarm.id, agentName);
           if (!agent) {
-            console.error(`Agent "${agentName}" not found.`);
+            console.error(`Agent "${agentName}" not found in swarm "${swarm.name}".`);
             process.exit(1);
           }
           console.log(`${agent.name}: ${agent.description ?? '(no status set)'}`);
@@ -339,8 +509,10 @@ async function main() {
       }
 
       case 'whoami': {
-        const { self } = requireSelf();
+        const { self, swarm } = requireSelf();
         console.log(`Name: ${self.name}`);
+        console.log(`Swarm: ${swarm.name}`);
+        console.log(`Swarm ID: ${self.swarm_id}`);
         console.log(`Type: ${self.agent_type}`);
         console.log(`Surface: ${self.surface_id}`);
         console.log(`Workspace: ${self.workspace_id ?? 'N/A'}`);
@@ -351,16 +523,15 @@ async function main() {
       }
 
       case 'read': {
-        requireSelf(); // ensure we're in the swarm
+        const { db, self } = requireSelf();
         const targetName = args[1];
         if (!targetName) {
           console.error('Usage: swarm read <agent> [--lines <n>]');
           process.exit(1);
         }
-        const db = getDb();
-        const target = getAgent(db, targetName);
+        const target = getAgent(db, self.swarm_id, targetName);
         if (!target) {
-          console.error(`Agent "${targetName}" not found.`);
+          console.error(`Agent "${targetName}" not found in this swarm.`);
           process.exit(1);
         }
         requireCmuxAgent(target, 'read terminal');
@@ -372,66 +543,90 @@ async function main() {
       }
 
       case 'spawn': {
+        const db = getDb();
+        const swarm = resolveSelectedSwarm(db, true);
         const name = getFlag('--name');
         const cwd = getFlag('--cwd') || process.cwd();
         const autonomous = hasFlag('--autonomous');
-        const agentKind = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
+        const agentFlag = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
+        const { workspaceId } = identify();
 
-        let commandText: string;
-        let label: string;
-        if (agentKind === 'claude') {
-          const perms = autonomous ? ' --dangerously-skip-permissions' : '';
-          commandText = `claude${perms}`;
-          label = 'Claude Code';
-        } else if (agentKind === 'codex') {
-          const perms = autonomous ? ' --dangerously-bypass-approvals-and-sandbox' : '';
+        let agentCmd: string;
+        let agentLabel: string;
+        if (agentFlag === 'claude') {
+          agentCmd = autonomous ? 'claude --dangerously-skip-permissions' : 'claude';
+          agentLabel = 'Claude Code';
+        } else if (agentFlag === 'codex') {
+          // Codex doesn't have a /join-swarm slash command; pass the join
+          // instructions as Codex's initial prompt instead of relying on
+          // a post-spawn keystroke.
+          const perms = autonomous ? ' --yolo' : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
+          const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
-            ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}". Then run ${swarmBin} inbox and ${swarmBin} members. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
-            : `Join the local swarm. First run ${swarmBin} members. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>". Then run ${swarmBin} inbox and ${swarmBin} members. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
-          commandText = `codex --cd ${shellQuote(cwd)}${perms} ${shellQuote(joinInstruction)}`;
-          label = 'Codex CLI';
+            ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
+            : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
+          agentCmd = `codex --cd ${shellQuote(cwd)}${perms} ${shellQuote(joinInstruction)}`;
+          agentLabel = 'Codex CLI';
         } else {
-          console.error('Usage: swarm spawn [--agent claude|codex] [--name <name>] [--cwd <path>] [--autonomous]');
+          console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex.`);
           process.exit(1);
         }
 
-        const result = spawnWorkspace(cwd, commandText);
+        let result: { workspaceRef: string | null; surfaceRef: string } | null = null;
+        let spawnedInCurrentWorkspace = false;
+
+        if (workspaceId) {
+          try {
+            result = spawnSurfaceInWorkspace(cwd, agentCmd, workspaceId);
+            spawnedInCurrentWorkspace = !!result;
+          } catch {
+            result = null;
+          }
+        }
+
         if (!result) {
-          console.error('Failed to spawn workspace');
+          result = spawnWorkspace(cwd, agentCmd);
+        }
+
+        if (!result) {
+          console.error(`Failed to spawn ${agentLabel} session`);
           process.exit(1);
         }
 
         const joinArg = name || '';
-        console.log(`Spawned new ${label} session in ${cwd} (${result.workspaceRef}, ${result.surfaceRef})`);
+        const swarmArg = `--swarm ${swarm.name}`;
+        const location = spawnedInCurrentWorkspace ? 'new tab' : 'new workspace';
+        console.log(`Spawned new ${agentLabel} session in ${cwd} (${location}: ${result.workspaceRef ?? 'current workspace'}, ${result.surfaceRef})`);
 
-        if (agentKind === 'codex') {
+        if (agentFlag === 'codex') {
           console.log('Codex received the join instructions as its initial prompt.');
           break;
         }
 
+        console.log(`Waiting for ${agentLabel} to initialize...`);
+        sleep(8);
+
         try {
-          console.log('Waiting for Claude Code to initialize...');
-          sleep(8);
-          sendToSurface(result.surfaceRef, `/join-swarm ${joinArg}`, result.workspaceRef);
-          console.log(`Sent /join-swarm ${joinArg} to new session`);
+          sendToSurface(result.surfaceRef, `/join-swarm ${joinArg} ${swarmArg}`.trim(), result.workspaceRef);
+          console.log(`Sent /join-swarm ${joinArg} ${swarmArg}`.trim());
         } catch {
-          console.log(`Could not auto-join. Run /join-swarm ${joinArg} manually in the new tab.`);
+          console.log(`Could not auto-join. Run /join-swarm ${joinArg} ${swarmArg}`.trim());
         }
         break;
       }
 
       case 'rename': {
+        const { db, self } = requireSelf();
         const targetName = args[1];
         const title = args.slice(2).join(' ');
         if (!targetName || !title) {
           console.error('Usage: swarm rename <agent> <title>');
           process.exit(1);
         }
-        const db = getDb();
-        const target = getAgent(db, targetName);
+        const target = getAgent(db, self.swarm_id, targetName);
         if (!target) {
-          console.error(`Agent "${targetName}" not found.`);
+          console.error(`Agent "${targetName}" not found in this swarm.`);
           process.exit(1);
         }
         requireCmuxAgent(target, 'rename tab');
@@ -441,22 +636,22 @@ async function main() {
       }
 
       case 'move': {
+        const { db, self } = requireSelf();
         const targetName = args[1];
         const targetWorkspace = getFlag('--workspace');
         if (!targetName || !targetWorkspace) {
           console.error('Usage: swarm move <agent> --workspace <id>');
           process.exit(1);
         }
-        const db = getDb();
-        const target = getAgent(db, targetName);
+        const target = getAgent(db, self.swarm_id, targetName);
         if (!target) {
-          console.error(`Agent "${targetName}" not found.`);
+          console.error(`Agent "${targetName}" not found in this swarm.`);
           process.exit(1);
         }
         requireCmuxAgent(target, 'move');
         try {
           moveSurface(target.surface_id, targetWorkspace);
-          updateWorkspace(db, target.surface_id, targetWorkspace);
+          updateWorkspace(db, target.swarm_id, target.surface_id, targetWorkspace);
           console.log(`Moved ${targetName} to workspace ${targetWorkspace}`);
         } catch (err: any) {
           console.error(`Failed to move ${targetName}: ${err.message}`);
@@ -488,24 +683,94 @@ async function main() {
         break;
       }
 
-      case 'reset': {
+      case 'reap': {
         const db = getDb();
-        const agents = listAgentsSync(db);
-        // Clean up hooks and surfaces for any headless agents before wiping the DB
-        const headlessAgents = agents.filter(a => a.agent_type === 'headless');
-        if (headlessAgents.length > 0) {
-          const host = detectHost();
-          for (const a of headlessAgents) {
-            removeSurface(a.name);
-            if (host) removeHook(host, a.name);
+        const name = getFlag('--name');
+        const force = hasFlag('--force');
+        const all = hasFlag('--all');
+        const swarm = all ? null : resolveSelectedSwarm(db);
+
+        if (force && !name) {
+          console.error('Usage: swarm reap --name <agent> --force  (--force requires --name)');
+          process.exit(1);
+        }
+
+        if (name) {
+          if (!swarm) {
+            console.error('Usage: swarm reap --name <agent> [--force] [--swarm <name>]  (--name cannot be used with --all)');
+            process.exit(1);
+          }
+          if (force) {
+            const removed = forceReap(db, swarm.id, name);
+            if (removed) {
+              if (removed.agent_type === 'headless') {
+                removeSurface(removed.swarm_id, removed.name);
+                const host = detectHost();
+                if (host) removeHook(host, removed.name, removed.swarm_id);
+              }
+              console.log(`Force-reaped "${removed.name}" (${removed.agent_type}) from swarm "${swarm.name}".`);
+            } else {
+              console.error(`No agent named "${name}" found in swarm "${swarm.name}".`);
+              process.exit(1);
+            }
+          } else {
+            const removed = await reapIfDead(db, swarm.id, name);
+            if (removed) {
+              console.log(`Reaped "${removed.name}" (${removed.agent_type}) from swarm "${swarm.name}" — surface confirmed dead.`);
+            } else {
+              const still = getAgent(db, swarm.id, name);
+              if (!still) {
+                console.error(`No agent named "${name}" found in swarm "${swarm.name}".`);
+                process.exit(1);
+              } else if (still.agent_type === 'headless') {
+                console.error(`"${name}" is a headless agent; has no probeable surface. Use --force to remove.`);
+                process.exit(1);
+              } else {
+                console.log(`"${name}" is alive; not reaped. Use --force to remove anyway.`);
+              }
+            }
+          }
+        } else {
+          const removed = await reapAll(db, swarm?.id);
+          if (removed.length === 0) {
+            console.log('No dead agents found.');
+          } else {
+            console.log(`Reaped ${removed.length} agent(s):`);
+            for (const a of removed) console.log(`  ${a.name} (${a.agent_type})${swarm ? '' : ` from ${getSwarmById(db, a.swarm_id)?.name ?? a.swarm_id}`}`);
           }
         }
-        db.exec('DELETE FROM agents');
-        db.exec('DELETE FROM messages');
-        db.exec('DELETE FROM inbox_cursors');
-        console.log(`Swarm reset. Cleared ${agents.length} agent(s) and all messages.`);
         break;
       }
+
+      case 'reset': {
+        const db = getDb();
+        const all = hasFlag('--all');
+        const agents = listAgentsSync(db, all ? undefined : resolveSelectedSwarm(db).id);
+        const host = detectHost();
+        for (const a of agents.filter(agent => agent.agent_type === 'headless')) {
+          removeSurface(a.swarm_id, a.name);
+          if (host) removeHook(host, a.name, a.swarm_id);
+        }
+
+        if (all) {
+          db.exec('DELETE FROM agents');
+          db.exec('DELETE FROM messages');
+          db.exec('DELETE FROM inbox_cursors');
+          db.prepare('DELETE FROM swarms WHERE id != ?').run(DEFAULT_SWARM_ID);
+          console.log(`Swarm reset. Cleared ${agents.length} agent(s), all messages, and all non-default swarms.`);
+        } else {
+          const swarm = resolveSelectedSwarm(db);
+          db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(swarm.id);
+          db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
+          db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
+          console.log(`Swarm "${swarm.name}" reset. Cleared ${agents.length} agent(s) and its messages.`);
+        }
+        break;
+      }
+
+      case 'hook-context':
+        printHookContext();
+        break;
 
       case 'help':
       case '--help':

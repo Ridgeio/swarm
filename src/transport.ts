@@ -53,6 +53,10 @@ export function sleep(seconds: number): void {
   execFileSync('sleep', [String(seconds)], STDIO_OPTS);
 }
 
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
 // File-based lock to prevent concurrent sends to the same surface from interleaving chunks.
 // Uses mkdir atomicity: mkdir fails if the dir already exists, providing a cross-process mutex.
 const LOCK_DIR = path.join(os.homedir(), '.swarm', 'locks');
@@ -152,6 +156,25 @@ export function spawnWorkspace(cwd: string, command: string): { workspaceRef: st
   if (!surfMatch) return null;
 
   return { workspaceRef, surfaceRef: surfMatch[0] };
+}
+
+export function spawnSurfaceInWorkspace(
+  cwd: string,
+  command: string,
+  workspaceId?: string | null
+): { workspaceRef: string | null; surfaceRef: string } | null {
+  const cmux = resolveCmux();
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  const out = execFileSync(cmux, ['new-surface', ...wsArgs], STDIO_OPTS).toString().trim();
+  const surfaceMatch = out.match(/surface[:=]\d+/);
+  if (!surfaceMatch) return null;
+
+  const workspaceMatch = out.match(/workspace[:=]\d+/);
+  const surfaceRef = surfaceMatch[0].replace('=', ':');
+  const workspaceRef = workspaceMatch ? workspaceMatch[0].replace('=', ':') : workspaceId ?? null;
+  const startCommand = `cd ${shellQuote(cwd)} && ${command}`;
+  sendToSurface(surfaceRef, startCommand, workspaceRef);
+  return { workspaceRef, surfaceRef };
 }
 
 export function readScreen(surfaceId: string, lines?: number, workspaceId?: string | null): string {

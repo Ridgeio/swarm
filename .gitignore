@@ -1,5 +1,7 @@
 node_modules/
 dist/
+build/
+pnpm-lock.yaml
 *.db
 *.db-wal
 *.db-shm

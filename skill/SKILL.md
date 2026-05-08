@@ -1,15 +1,23 @@
 ---
 name: swarm
-description: Coordinate with other AI coding agents through the local swarm CLI, including joining a swarm, checking messages, sending direct messages or broadcasts, updating status, and reading other Cmux agent terminals.
+description: Use when coordinating with other AI coding agents through the local swarm CLI, including checking members, reading inbox messages, sending direct messages, broadcasting, and updating swarm status.
 ---
 
 # Swarm Coordination Protocol
 
-You are part of a coordinated swarm of AI coding agents. Each agent can communicate with other agents via the `swarm` CLI. Agents can run in Cmux (push delivery), any terminal in headless mode (poll-based delivery via hooks), or as A2A remote agents (HTTP delivery).
+You are part of a coordinated swarm of AI coding agents. Each swarm is scoped to one project/codebase, so the same machine can run multiple independent swarms at the same time. Agents can run in Cmux (push delivery), any terminal in headless mode (poll-based delivery via hooks), or as A2A remote agents (HTTP delivery).
 
 ## Your Identity
 
-When you joined this swarm, you were registered with a name and a terminal surface ID. Run `swarm whoami` to see your registration. Run `swarm members` to see who else is active.
+When you joined this swarm, you were registered with an agent name, a swarm name, and a terminal/session marker. Run `swarm whoami` to confirm your current swarm. Run `swarm members` to see who else is active in this same swarm.
+
+Use `--swarm <name>` when joining or when you need to address a swarm explicitly:
+```
+swarm join Lead --swarm ridge
+swarm members --swarm ridge
+```
+
+Once joined, normal commands infer the current swarm from your terminal/session.
 
 ## Communication
 
@@ -29,6 +37,8 @@ Send to everyone:
 swarm broadcast "<message>"
 ```
 
+Messages and broadcasts stay inside the current swarm. A `Lead` in one project will not receive messages from a different project's swarm.
+
 ### Receiving Messages
 Messages are pushed directly into your terminal. When you see `[SWARM from <name>]:` followed by text, that is a message from another agent. Read it, understand it, and respond appropriately.
 
@@ -44,6 +54,14 @@ swarm read <agent-name> --lines 30
 ```
 
 This lets you monitor progress without interrupting them.
+
+### Spawning New Agents
+When you need another local Claude Code agent, spawn it from the lead/current agent:
+```
+swarm spawn --name DevA --cwd /path/to/project --swarm <swarm-name>
+```
+
+When run inside Cmux, this opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm. If no name is provided, the spawned session receives `/join-swarm --swarm <swarm-name>` and can choose its own name.
 
 ## Coordination Protocol
 
@@ -70,8 +88,29 @@ Check what someone else is doing:
 swarm status --agent Bob
 ```
 
+### Swarm Selection
+List known swarms:
+```
+swarm swarms
+```
+
+Create or update a project swarm:
+```
+swarm create ridge --root /path/to/codebase
+```
+
+Reset only the current swarm:
+```
+swarm reset
+```
+
+Reset every swarm only when explicitly asked:
+```
+swarm reset --all
+```
+
 ### Workflow
-1. **Before starting new work**: Run `swarm inbox` to check for pending messages. Run `swarm members` to see who's active.
+1. **Before starting new work**: Run `swarm whoami` if unsure which project swarm you are in. Run `swarm inbox` to check for pending messages. Run `swarm members` to see who's active.
 2. **When starting a task**: Run `swarm status --set "description of what I'm doing"`
 3. **When you need help**: Send a targeted message to the right agent, or broadcast if unsure who can help.
 4. **When you finish a task**: Notify anyone who was waiting on it via `swarm send`.
@@ -83,5 +122,5 @@ When a message appears in your terminal as `[SWARM from <name>]: <text>`, treat 
 ## Rules
 - Be concise in messages. Other agents have limited context windows too.
 - Don't argue over messages. If there's a disagreement, one message each, then move on.
-- If an agent doesn't respond after one message, they may be busy. Check with `swarm read` before resending.
+- If an agent doesn't respond after one message, they may be busy. Check with `swarm read` before resending when that agent is a local terminal agent.
 - This is a trusted environment. All agents can read each other's terminal output. Don't put secrets in your terminal that you wouldn't want other agents to see.

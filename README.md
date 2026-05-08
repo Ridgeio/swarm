@@ -2,7 +2,7 @@
 
 Cross-terminal and cross-agent coordination for AI coding agents. Supports local agents running in [Cmux](https://cmux.dev) and remote agents via the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/).
 
-Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compatible agent — monitor what other agents are working on and coordinate multi-agent workflows from the terminal.
+Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compatible agent — monitor what other agents are working on and coordinate multi-agent workflows from the terminal. Swarm can run multiple independent project swarms at the same time, so each codebase can have its own Lead and agent set.
 
 ## How it works
 
@@ -28,6 +28,8 @@ Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compat
 
 **A2A agents** (OpenClaw, Hermes, or any agent with an A2A-compatible endpoint) register with `swarm register-a2a` and receive messages delivered over HTTP via the A2A protocol. This enables cross-user and cross-machine coordination.
 
+**Named swarms** isolate project teams. Agent names are unique per swarm, so `Lead` can exist in several codebases without message leakage.
+
 ## Prerequisites
 
 - **macOS** (Cmux is macOS-only; A2A agents can run on any platform)
@@ -48,28 +50,32 @@ npm run build
 
 The install script auto-detects which agents you have installed (Claude Code, Codex CLI) and configures skills for each:
 
-- **Claude Code**: installs `/join-swarm`, `/leave-swarm`, `/reset-swarm` slash commands + a `UserPromptSubmit` hook for persistent swarm awareness
-- **Codex CLI**: installs coordination instructions at `~/.codex/swarm-instructions.md`
+- **Claude Code**: installs `/swarm`, `/join-swarm`, `/leave-swarm`, `/reset-swarm` skills as symlinks + a `UserPromptSubmit` hook for persistent swarm awareness
+- **Codex CLI**: installs `swarm`, `join-swarm`, `leave-swarm`, `reset-swarm` skills into `~/.codex/skills` + durable coordination instructions at `~/.codex/swarm-instructions.md`
 
-The awareness hook automatically reminds agents of their swarm identity, active members, and available commands on every turn. This survives context compression and `/clear` — agents never forget they're in the swarm.
+The awareness hook automatically reminds joined agents of their swarm identity, active members, and available commands on every turn where the host supports hooks. Codex stores durable install instructions separately from session hints in `~/.codex/swarm-session.md`; the CLI resolves the actual current identity from the terminal/session marker.
 
 ### Verify
 
-Open a Cmux terminal with Claude Code and run:
+Open a fresh Claude Code or Codex session in Cmux. In Claude Code, run:
 
 ```
-/join-swarm TestAgent
+/join-swarm TestAgent --swarm test
 ```
 
-You should see: `Joined swarm as "TestAgent" (surface: ...)`. Then clean up with `/leave-swarm`.
+In Codex, invoke the `join-swarm` skill or ask Codex to use `join-swarm` with `TestAgent --swarm test`. You should see: `Joined swarm "test" as "TestAgent" ...`. Then clean up with `/leave-swarm` in Claude Code or the `leave-swarm` skill in Codex.
 
 ## Quick start
 
-Open two or more Claude Code sessions in Cmux. In each one:
+Create a project swarm, then open two or more Claude Code sessions in Cmux. In each one:
+
+```bash
+swarm create ridge --root /path/to/ridge
+```
 
 ```
-/join-swarm Alice    # in pane 1
-/join-swarm Bob      # in pane 2
+/join-swarm Alice --swarm ridge    # in pane 1
+/join-swarm Bob --swarm ridge      # in pane 2
 ```
 
 Or just `/join-swarm` with no arguments — agents will pick their own creative name.
@@ -81,31 +87,52 @@ swarm send Bob "please review the auth PR"
 
 Bob's terminal will show: `[SWARM from Alice]: please review the auth PR`
 
-When you're done, agents can `/leave-swarm` individually, or you can `/reset-swarm` to wipe everything and start fresh.
+When you're done, agents can `/leave-swarm` individually, or you can `/reset-swarm` to clear only the current swarm.
 
 ### Switching projects
 
-Run `/reset-swarm` (or `swarm reset` from any terminal) to clear all agents and messages. Then have agents `/join-swarm` again for the new project.
+Create one swarm per project and join the relevant one:
 
-## Slash Commands
+```bash
+swarm create ridge --root /Users/tom/Developer/Ridge.io/app
+swarm create docs --root /Users/tom/Developer/docs-site
+/join-swarm Lead --swarm ridge
+```
+
+`swarm reset` clears only the selected/current swarm. Use `swarm reset --all` only when you explicitly want to wipe every swarm.
+
+## Skills
 
 | Command | What it does |
 |---------|-------------|
-| `/join-swarm [name]` | Join the swarm. Auto-picks a creative name if none given. |
-| `/leave-swarm` | Leave the swarm. |
-| `/reset-swarm` | Clear all agents, messages, and inbox state. |
+| `/swarm` / `swarm` | Load the coordination protocol and command reference. |
+| `/join-swarm [name] [--swarm <name>]` | Join a project swarm. Auto-picks a creative name if none given. |
+| `/leave-swarm` | Leave the current swarm. |
+| `/reset-swarm` | Clear the current swarm's agents, messages, and inbox state. |
+
+Claude Code exposes these as slash commands. Codex loads them as skills from `~/.codex/skills`; invoke the matching skill name, for example `join-swarm`.
 
 ## CLI Reference
 
 ```
+Swarm selection:
+  --swarm <name>, -s <name>                  Run the command in a named swarm
+
+Swarm management:
+  swarm create <name> [--root <path>]        Create/update a named swarm
+        [--description <text>]
+  swarm swarms                               List known swarms
+  swarm delete <name>                        Delete a non-default swarm
+
 Messaging:
-  swarm send <agent> <message>                Push a message to an agent's terminal
-  swarm broadcast <message>                   Push to all agents
+  swarm send <agent> <message>                Push a message to an agent in this swarm
+  swarm broadcast <message>                   Push to all agents in this swarm
   swarm inbox [--peek]                        Read pending messages
 
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
-  swarm leave                                 Deregister from the swarm
+        [--headless] [--swarm <name>]
+  swarm leave                                 Deregister from the current swarm
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read an agent's terminal screen
 
@@ -116,11 +143,11 @@ A2A Agents (remote/cross-user agents):
   swarm discover <url>                        Fetch and display an A2A agent card
 
 Shared:
-  swarm members                               List active agents (Cmux + A2A)
+  swarm members                               List active agents in this swarm
   swarm status [--set <desc>] [--agent <name>] Update or query status
 
 Spawning:
-  swarm spawn [--cwd <path>] [--autonomous]   Spawn a new Claude Code session
+  swarm spawn [--cwd <path>] [--autonomous]   Spawn Claude in a new Cmux tab
                                               (auto-joins the swarm after boot)
 
 Workspace management:
@@ -130,11 +157,13 @@ Workspace management:
   swarm rename-workspace <id> <title>         Rename a workspace
 
 Session:
-  swarm reset                                 Clear all agents and messages
+  swarm reap [--name <agent>] [--force]       Prune dead agents after liveness probe
+        [--all]
+  swarm reset [--all]                         Clear current swarm, or every swarm
   swarm help                                  Show help
 ```
 
-Joining the swarm auto-renames the agent's Cmux tab to their swarm name for easy visual identification. A2A agents are shown with their endpoint URL in `swarm members`.
+Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visual identification. A2A agents are shown with their endpoint URL in `swarm members`.
 
 ## Example workflows
 
@@ -143,9 +172,9 @@ Joining the swarm auto-renames the agent's Cmux tab to their swarm name for easy
 You have three agents. One is the lead, two are developers.
 
 ```
-Lead:   /join-swarm Lead
-Dev A:  /join-swarm Alice
-Dev B:  /join-swarm Bob
+Lead:   /join-swarm Lead --swarm ridge
+Dev A:  /join-swarm Alice --swarm ridge
+Dev B:  /join-swarm Bob --swarm ridge
 ```
 
 The lead delegates work:
@@ -191,12 +220,12 @@ swarm broadcast "status check — what's everyone working on?"
 
 ### Spawning new agents
 
-A lead agent can spin up new Claude Code sessions directly:
+A lead agent can spin up new Claude Code sessions directly. When run from inside Cmux, new agents open as surfaces/tabs in the current workspace:
 ```bash
-swarm spawn --cwd /path/to/project --autonomous
+swarm spawn --cwd /path/to/project --swarm ridge --autonomous
 ```
 
-This opens a new Cmux tab, launches Claude Code, and auto-sends `/join-swarm` after boot. The `--autonomous` flag enables `--dangerously-skip-permissions`.
+This opens a new Cmux tab in the current workspace, launches Claude Code, and auto-sends `/join-swarm --swarm ridge` after boot. If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. The `--autonomous` flag enables `--dangerously-skip-permissions`.
 
 ### Organizing workspaces
 
@@ -213,8 +242,8 @@ swarm rename-workspace workspace:5 "Dev Team"       # rename a workspace
 Register external agents (OpenClaw, Hermes, or any A2A-compatible agent) by their endpoint:
 
 ```bash
-swarm register-a2a Cooper --endpoint http://localhost:3100/.well-known/agent.json
-swarm register-a2a Hermes --endpoint http://localhost:3200/.well-known/agent.json
+swarm register-a2a Cooper --swarm ridge --endpoint http://localhost:3100/.well-known/agent.json
+swarm register-a2a Hermes --swarm ridge --endpoint http://localhost:3200/.well-known/agent.json
 ```
 
 Discover an agent's capabilities before registering:
@@ -237,12 +266,12 @@ A typical setup with local Claude Code sessions and remote agents:
 
 ```bash
 # Local Cmux agents
-/join-swarm Lead          # in Cmux pane 1
-/join-swarm DevA          # in Cmux pane 2
+/join-swarm Lead --swarm ridge          # in Cmux pane 1
+/join-swarm DevA --swarm ridge          # in Cmux pane 2
 
 # Remote A2A agents
-swarm register-a2a Cooper --endpoint http://localhost:3100/.well-known/agent.json
-swarm register-a2a Hermes --endpoint http://localhost:3200/.well-known/agent.json
+swarm register-a2a Cooper --swarm ridge --endpoint http://localhost:3100/.well-known/agent.json
+swarm register-a2a Hermes --swarm ridge --endpoint http://localhost:3200/.well-known/agent.json
 
 # Now coordinate across all of them
 swarm send Cooper "research the best auth library for our stack"
@@ -256,7 +285,7 @@ swarm send Hermes "draft the user-facing docs for the new auth flow"
 swarm broadcast "wrapping up for now, great work team"
 ```
 
-Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear everything.
+Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear the current swarm. Use `swarm reset --all` only to clear every swarm.
 
 ## How agents coordinate
 
@@ -274,12 +303,13 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`src/transport-router.ts`** — Dispatcher that routes `send`/`broadcast` to the correct transport by agent type
 - **`src/transport.ts`** — Low-level Cmux utilities (`send`, `read-screen`, `spawn`, tab/workspace management, `\n` sanitization, message chunking)
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
-- **`src/registry.ts`** — Agent CRUD, A2A registration, async stale cleanup
-- **`src/mailbox.ts`** — Message send/broadcast/inbox with cursor tracking
+- **`src/registry.ts`** — Swarm + agent CRUD, A2A registration, async stale cleanup
+- **`src/mailbox.ts`** — Swarm-scoped message send/broadcast/inbox with cursor tracking
 - **`src/index.ts`** — CLI entry point
-- **`hooks/swarm-awareness.sh`** — UserPromptSubmit hook that injects swarm context and refreshes heartbeats
+- **`hooks/swarm-awareness.sh`** — Claude Code UserPromptSubmit hook that injects swarm context and refreshes heartbeats
+- **`hooks/swarm-awareness-headless.sh`** — Headless awareness hook used where a host can poll inbox messages
 
-State is stored in `~/.swarm/swarm.db`. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 10 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
+State is stored in `~/.swarm/swarm.db`. The database has a `swarms` table, and agents/messages/inbox cursors are partitioned by `swarm_id`. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 

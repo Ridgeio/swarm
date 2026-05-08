@@ -4,6 +4,7 @@ import { getAgent, listAgents } from './registry.js';
 
 export interface Message {
   id: number;
+  swarm_id: string;
   from_agent: string;
   to_agent: string | null;
   body: string;
@@ -13,11 +14,12 @@ export interface Message {
 
 export async function sendMessage(
   db: Database.Database,
+  swarmId: string,
   fromName: string,
   toName: string,
   body: string
 ): Promise<{ delivered: boolean; message: string }> {
-  const target = getAgent(db, toName);
+  const target = getAgent(db, swarmId, toName);
   if (!target) {
     return { delivered: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
   }
@@ -26,8 +28,8 @@ export async function sendMessage(
   const formatted = `[SWARM from ${fromName}]: ${body}`;
 
   const result = db.prepare(
-    'INSERT INTO messages (from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, 0, ?)'
-  ).run(fromName, toName, body, now);
+    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, ?, 0, ?)'
+  ).run(swarmId, fromName, toName, body, now);
 
   const msgId = result.lastInsertRowid;
 
@@ -48,10 +50,11 @@ export async function sendMessage(
 
 export async function broadcastMessage(
   db: Database.Database,
+  swarmId: string,
   fromName: string,
   body: string
 ): Promise<{ sent: number; failed: number }> {
-  const agents = await listAgents(db);
+  const agents = await listAgents(db, swarmId);
   const recipients = agents.filter(a => a.name !== fromName);
 
   if (recipients.length === 0) {
@@ -63,8 +66,8 @@ export async function broadcastMessage(
 
   // Insert message row first (one broadcast row, to_agent = NULL)
   const result = db.prepare(
-    'INSERT INTO messages (from_agent, to_agent, body, delivered, created_at) VALUES (?, NULL, ?, 0, ?)'
-  ).run(fromName, body, now);
+    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, NULL, ?, 0, ?)'
+  ).run(swarmId, fromName, body, now);
 
   const msgId = result.lastInsertRowid;
 
@@ -89,28 +92,30 @@ export async function broadcastMessage(
 
 export function getInbox(
   db: Database.Database,
+  swarmId: string,
   agentName: string,
   peek: boolean = false
 ): Message[] {
   // Get cursor
-  const cursor = db.prepare('SELECT last_read_id FROM inbox_cursors WHERE agent_name = ?')
-    .get(agentName) as { last_read_id: number } | undefined;
+  const cursor = db.prepare('SELECT last_read_id FROM inbox_cursors WHERE swarm_id = ? AND agent_name = ?')
+    .get(swarmId, agentName) as { last_read_id: number } | undefined;
   const lastReadId = cursor?.last_read_id ?? 0;
 
   // Fetch messages: direct messages to me + broadcasts, after cursor, not from me
   const messages = db.prepare(`
     SELECT * FROM messages
-    WHERE (to_agent = ? OR to_agent IS NULL)
+    WHERE swarm_id = ?
+      AND (to_agent = ? OR to_agent IS NULL)
       AND from_agent != ?
       AND id > ?
     ORDER BY created_at ASC
-  `).all(agentName, agentName, lastReadId) as Message[];
+  `).all(swarmId, agentName, agentName, lastReadId) as Message[];
 
   if (!peek && messages.length > 0) {
     const maxId = messages[messages.length - 1].id;
     db.prepare(
-      'INSERT OR REPLACE INTO inbox_cursors (agent_name, last_read_id) VALUES (?, ?)'
-    ).run(agentName, maxId);
+      'INSERT OR REPLACE INTO inbox_cursors (swarm_id, agent_name, last_read_id) VALUES (?, ?, ?)'
+    ).run(swarmId, agentName, maxId);
   }
 
   return messages;

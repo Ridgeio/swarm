@@ -9,7 +9,7 @@ import fs from 'fs';
  * (Terminal.app, iTerm2). Uses osascript to send text as simulated input.
  *
  * On join, the agent's terminal app and window/tab identifiers are stored
- * in ~/.swarm/surfaces/<agent-name>.json
+ * in ~/.swarm/surfaces/<swarm-id>/<agent-name>.json
  */
 
 interface AppleScriptSurface {
@@ -21,9 +21,22 @@ interface AppleScriptSurface {
 
 const SURFACES_DIR = path.join(os.homedir(), '.swarm', 'surfaces');
 
-function ensureSurfacesDir(): void {
-  if (!fs.existsSync(SURFACES_DIR)) {
-    fs.mkdirSync(SURFACES_DIR, { recursive: true });
+function safePathSegment(value: string): string {
+  return value.replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+function surfacePath(swarmId: string, agentName: string): string {
+  return path.join(SURFACES_DIR, safePathSegment(swarmId), `${safePathSegment(agentName)}.json`);
+}
+
+function legacySurfacePath(agentName: string): string {
+  return path.join(SURFACES_DIR, `${agentName}.json`);
+}
+
+function ensureSurfacesDir(swarmId: string): void {
+  const dir = path.join(SURFACES_DIR, safePathSegment(swarmId));
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
 }
 
@@ -100,7 +113,7 @@ function findTerminalWindowForTty(ttyDevice: string): { windowId: number; tabInd
  * Register the current terminal surface for an agent.
  * Called during `swarm join` for headless agents in supported terminals.
  */
-export function registerSurface(agentName: string): AppleScriptSurface | null {
+export function registerSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
   const app = detectTerminalApp();
   if (!app || app === 'Warp') return null;
 
@@ -115,9 +128,9 @@ export function registerSurface(agentName: string): AppleScriptSurface | null {
     }
   }
 
-  ensureSurfacesDir();
+  ensureSurfacesDir(swarmId);
   fs.writeFileSync(
-    path.join(SURFACES_DIR, `${agentName}.json`),
+    surfacePath(swarmId, agentName),
     JSON.stringify(surface, null, 2)
   );
   return surface;
@@ -126,19 +139,28 @@ export function registerSurface(agentName: string): AppleScriptSurface | null {
 /**
  * Remove the registered surface for an agent.
  */
-export function removeSurface(agentName: string): void {
-  const surfacePath = path.join(SURFACES_DIR, `${agentName}.json`);
-  if (fs.existsSync(surfacePath)) fs.unlinkSync(surfacePath);
+export function removeSurface(swarmId: string, agentName: string): void {
+  const scoped = surfacePath(swarmId, agentName);
+  if (fs.existsSync(scoped)) fs.unlinkSync(scoped);
+
+  const legacy = legacySurfacePath(agentName);
+  if (fs.existsSync(legacy)) fs.unlinkSync(legacy);
+}
+
+export function hasSurface(swarmId: string, agentName: string): boolean {
+  return fs.existsSync(surfacePath(swarmId, agentName)) || fs.existsSync(legacySurfacePath(agentName));
 }
 
 /**
  * Load the registered surface for an agent.
  */
-function loadSurface(agentName: string): AppleScriptSurface | null {
-  const surfacePath = path.join(SURFACES_DIR, `${agentName}.json`);
-  if (!fs.existsSync(surfacePath)) return null;
+function loadSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
+  const scoped = surfacePath(swarmId, agentName);
+  const legacy = legacySurfacePath(agentName);
+  const selectedPath = fs.existsSync(scoped) ? scoped : legacy;
+  if (!fs.existsSync(selectedPath)) return null;
   try {
-    return JSON.parse(fs.readFileSync(surfacePath, 'utf-8'));
+    return JSON.parse(fs.readFileSync(selectedPath, 'utf-8'));
   } catch {
     return null;
   }
@@ -219,7 +241,7 @@ function sendToITerm2(surface: AppleScriptSurface, text: string): void {
 
 export class AppleScriptTransport implements Transport {
   async deliverMessage(agent: TransportAgent, formattedText: string): Promise<TransportDeliveryResult> {
-    const surface = loadSurface(agent.name);
+    const surface = loadSurface(agent.swarm_id, agent.name);
     if (!surface) {
       return { delivered: false, error: `No terminal surface registered for ${agent.name}` };
     }

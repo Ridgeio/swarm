@@ -33,7 +33,7 @@ import {
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
-import { registerSurface, removeSurface } from './applescript-transport.js';
+import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -236,6 +236,19 @@ function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string
 
 function printHookContext(): void {
   const { db, self, swarm } = requireSelf();
+
+  // Re-emit the Warp OSC tab title so that agents like Claude Code,
+  // which set their own title on startup/activity, can't permanently
+  // shadow the swarm/<swarm>/<agent> marker we use for accessibility
+  // tab targeting (Phase 4). The hook fires on every UserPromptSubmit,
+  // so the title is refreshed on each turn.
+  if (self.agent_type === 'headless') {
+    const surface = loadSurfaceForHook(self.swarm_id, self.name);
+    if (surface && surface.app === 'Warp') {
+      writeWarpOscTitle(surface, swarm.name, self.name);
+    }
+  }
+
   const agents = listAgentsSync(db, self.swarm_id);
   const members = agents.map(agent => agent.name).join(', ');
   const inbox = getInbox(db, self.swarm_id, self.name);

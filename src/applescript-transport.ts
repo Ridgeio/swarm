@@ -163,7 +163,7 @@ export function hasSurface(swarmId: string, agentName: string): boolean {
 /**
  * Load the registered surface for an agent.
  */
-function loadSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
+export function loadSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
   const scoped = surfacePath(swarmId, agentName);
   const legacy = legacySurfacePath(agentName);
   const selectedPath = fs.existsSync(scoped) ? scoped : legacy;

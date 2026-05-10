@@ -34,6 +34,7 @@ import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
+import { ensureCodexTrust } from './codex-trust.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -607,6 +608,18 @@ async function main() {
           agentCmd = autonomous ? 'claude --dangerously-skip-permissions' : 'claude';
           agentLabel = 'Claude Code';
         } else if (agentFlag === 'codex') {
+          // Pre-trust the cwd in ~/.codex/config.toml so spawned codex
+          // sessions don't get stuck on the "Do you trust this folder?"
+          // prompt. The prompt blocks the agent until someone presses
+          // Enter to select "Yes" — fatal for unattended swarm workers.
+          // Codex stores trust as: [projects."<absolute-path>"]
+          //                         trust_level = "trusted"
+          // Use the resolved absolute path everywhere — Codex keys its
+          // trust map by absolute path, and we want our trust write and
+          // codex --cd to agree on the same string.
+          const absoluteCwd = path.resolve(cwd);
+          ensureCodexTrust(absoluteCwd);
+
           // Codex doesn't have a /join-swarm slash command; pass the join
           // instructions as Codex's initial prompt instead of relying on
           // a post-spawn keystroke.
@@ -616,7 +629,7 @@ async function main() {
           const joinInstruction = name
             ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
             : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
-          agentCmd = `codex --cd ${shellQuote(cwd)}${perms} ${shellQuote(joinInstruction)}`;
+          agentCmd = `codex --cd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
           agentLabel = 'Codex CLI';
         } else {
           console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex.`);

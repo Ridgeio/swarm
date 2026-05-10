@@ -49,6 +49,8 @@ swarm inbox
 
 Warp terminals default to inbox/hook delivery. To opt into experimental Warp push delivery, join with `swarm join <name> --push`; macOS Accessibility access must be granted to the parent terminal binary that runs `swarm`, because delivery activates Warp, pastes through the clipboard, and presses Return with System Events.
 
+**Warp push caveat:** Warp's accessibility tree only exposes the active tab's title at the window level — there's no API to enumerate or focus tabs by name. Phase 4's window-title lookup works reliably when each Warp agent has its own *window* (e.g., `swarm spawn --terminal warp --window`); when several agents share one window as tabs, sends fall through to "frontmost Warp tab" with a warning, and you must manually focus the target tab before sending. For multi-agent reliability without focus management, prefer Cmux, or use `--window` for each Warp agent.
+
 ### Checking on Others
 See what another agent's terminal currently shows:
 ```
@@ -63,7 +65,12 @@ When you need another local Claude Code agent, spawn it from the lead/current ag
 swarm spawn --name DevA --cwd /path/to/project --swarm <swarm-name>
 ```
 
-By default, `swarm spawn` auto-selects the terminal: Warp when running inside Warp, otherwise Cmux. Use `--terminal cmux` or `--terminal warp` to force one. Cmux opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm. Warp opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex agents receive join instructions as their initial prompt.
+By default, `swarm spawn` auto-selects the terminal: Warp when running inside Warp, otherwise Cmux. Use `--terminal cmux` or `--terminal warp` to force one. Cmux opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm.
+
+In Warp:
+- Default: opens a new **tab** in the active Warp window via `warp://action/new_tab`, then pastes the join+exec command via Accessibility. Compact, but tabs in one window can't be individually targeted by `swarm send` (see "Warp push caveat" above).
+- `--window`: opens a separate Warp window via a Launch Configuration YAML (auto-runs the join command without keystrokes). Better for `--push` reliability since each window has a unique accessibility-visible title.
+- Codex agents (`--agent codex`) receive join instructions as their initial prompt instead of auto-running `swarm join`.
 
 ## Coordination Protocol
 

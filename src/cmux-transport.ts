@@ -1,6 +1,6 @@
 import { execFileSync } from 'child_process';
 import { Transport, TransportAgent, TransportDeliveryResult } from './transport-interface.js';
-import { sendToSurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
+import { sendToSurface, SurfaceGoneError, isSurfaceAlive, sanitize } from './transport.js';
 
 /**
  * Deliver a message to a Cmux tab via AppleScript clipboard paste.
@@ -10,8 +10,9 @@ import { sendToSurface, SurfaceGoneError, isSurfaceAlive } from './transport.js'
  * via Cmd+<number> before pasting. Requires: cmux app running, System Events access.
  */
 function deliverViaAppleScript(agent: TransportAgent, text: string): void {
-  // Escape for AppleScript string (backslashes and quotes)
-  const escaped = text.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  // Collapse newlines/tabs (the socket path sanitizes; this fallback must too), then
+  // escape for the AppleScript string literal (backslashes and quotes).
+  const escaped = sanitize(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
   // Parse workspace index from workspace_id (e.g., "workspace:2" → 2)
   let switchTabScript = '';

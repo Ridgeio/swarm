@@ -39,6 +39,17 @@ interface SessionMarker {
   agent_name: string;
 }
 
+/**
+ * Options for headless join/leave. The per-TTY session marker is a fallback
+ * identity mechanism for interactive terminals that have no SWARM_AGENT_NAME
+ * injected by a hook. Only the interactive CLI session should manage it; pure
+ * DB callers (tests, programmatic use, batch registration) must not, otherwise
+ * multiple agents sharing a controlling TTY would reap each other on join.
+ */
+export interface HeadlessSessionOptions {
+  trackSession?: boolean;
+}
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -49,7 +60,6 @@ function normalizeSwarmName(name?: string | null): string {
 }
 
 function getSessionMarkerPath(): string | null {
-  if (process.env.SWARM_DISABLE_SESSION_MARKER === '1') return null;
   try {
     let pid = process.ppid?.toString() || '';
     for (let i = 0; i < 5 && pid; i++) {
@@ -260,12 +270,17 @@ export function joinHeadlessAgent(
   db: Database.Database,
   swarmId: string,
   name: string,
-  description?: string
+  description?: string,
+  options: HeadlessSessionOptions = {}
 ): Agent {
-  const currentMarker = readSessionMarker();
-  if (currentMarker && (currentMarker.swarm_id !== swarmId || currentMarker.agent_name.toLowerCase() !== name.toLowerCase())) {
-    db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'")
-      .run(currentMarker.swarm_id, currentMarker.agent_name);
+  if (options.trackSession) {
+    // This TTY previously joined under a different identity — reap it so a
+    // single interactive session never leaves a ghost behind after a rename.
+    const currentMarker = readSessionMarker();
+    if (currentMarker && (currentMarker.swarm_id !== swarmId || currentMarker.agent_name.toLowerCase() !== name.toLowerCase())) {
+      db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'")
+        .run(currentMarker.swarm_id, currentMarker.agent_name);
+    }
   }
 
   const existing = getAgent(db, swarmId, name);
@@ -274,14 +289,23 @@ export function joinHeadlessAgent(
   }
   const syntheticSurfaceId = `headless:${swarmId}:${name}`;
   const agent = joinAgent(db, swarmId, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
-  writeSessionMarker(swarmId, name);
+  if (options.trackSession) {
+    writeSessionMarker(swarmId, name);
+  }
   return agent;
 }
 
-export function leaveHeadlessAgent(db: Database.Database, swarmId: string, name: string): boolean {
+export function leaveHeadlessAgent(
+  db: Database.Database,
+  swarmId: string,
+  name: string,
+  options: HeadlessSessionOptions = {}
+): boolean {
   const result = db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'")
     .run(swarmId, name);
-  removeSessionMarker(swarmId, name);
+  if (options.trackSession) {
+    removeSessionMarker(swarmId, name);
+  }
   return result.changes > 0;
 }
 
@@ -300,7 +324,10 @@ export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
       ? 'SELECT * FROM agents WHERE swarm_id = ? AND surface_id = ? ORDER BY joined_at DESC LIMIT 1'
       : 'SELECT * FROM agents WHERE surface_id = ? ORDER BY joined_at DESC LIMIT 1';
     const params = resolvedSwarmId ? [resolvedSwarmId, surfaceId] : [surfaceId];
-    return db.prepare(sql).get(...params) as Agent | undefined ?? null;
+    const bySurface = db.prepare(sql).get(...params) as Agent | undefined;
+    if (bySurface) return bySurface;
+    // No Cmux agent owns this surface — fall through to the headless resolution paths so an
+    // agent that joined with `--headless` from inside a Cmux tab can still find itself.
   }
 
   const agentName = process.env.SWARM_AGENT_NAME;
@@ -362,8 +389,6 @@ export function updateHeartbeat(db: Database.Database, swarmId: string, surfaceI
 }
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
-const failedChecks = new Map<string, number>();
-const REQUIRED_FAILURES = 3;
 
 async function cleanupStale(db: Database.Database, swarmId?: string): Promise<void> {
   const agents = swarmId
@@ -372,29 +397,30 @@ async function cleanupStale(db: Database.Database, swarmId?: string): Promise<vo
   const now = Date.now();
 
   const checks = agents.map(async (agent) => {
-    if (agent.agent_type === 'headless') return;
+    if (agent.agent_type === 'headless') return; // no probeable surface; never auto-pruned
 
-    let alive: boolean;
-    if (agent.agent_type === 'a2a') {
-      alive = await isAgentAlive(agent);
-    } else {
-      alive = isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    // First probe. Cmux heartbeats are refreshed by the awareness hook; A2A heartbeats
+    // are only refreshed here, so bump them whenever the endpoint is reachable.
+    const aliveNow = agent.agent_type === 'a2a'
+      ? await isAgentAlive(agent)
+      : isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    if (aliveNow) {
+      if (agent.agent_type === 'a2a') updateHeartbeat(db, agent.swarm_id, agent.surface_id);
+      return;
     }
 
-    if (alive) {
-      failedChecks.delete(agent.id);
-      if (agent.agent_type === 'a2a') {
-        updateHeartbeat(db, agent.swarm_id, agent.surface_id);
-      }
-    } else {
-      const failures = (failedChecks.get(agent.id) ?? 0) + 1;
-      failedChecks.set(agent.id, failures);
+    // Unreachable. Only prune once the heartbeat is also stale (so a briefly-unreachable
+    // but recently-active agent is spared) AND a second probe still fails (guards against a
+    // transient socket/HTTP blip). This replaces a module-level failure counter that never
+    // accumulated across the short-lived one-shot CLI process, so auto-pruning never fired.
+    const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
+    if (heartbeatAge <= STALE_THRESHOLD_MS) return;
 
-      const heartbeatAge = now - new Date(agent.last_heartbeat).getTime();
-      if (failures >= REQUIRED_FAILURES && heartbeatAge > STALE_THRESHOLD_MS) {
-        db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
-        failedChecks.delete(agent.id);
-      }
+    const stillDead = agent.agent_type === 'a2a'
+      ? !(await isAgentAlive(agent))
+      : !isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    if (stillDead) {
+      db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
     }
   });
 
@@ -416,7 +442,6 @@ export async function reapIfDead(db: Database.Database, swarmId: string, name: s
   if (existing.agent_type === 'headless') return null;
   if (await isConfirmedDead(existing)) {
     db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);
-    failedChecks.delete(existing.id);
     return existing;
   }
   return null;
@@ -431,7 +456,6 @@ export async function reapAll(db: Database.Database, swarmId?: string): Promise<
     if (agent.agent_type === 'headless') continue;
     if (await isConfirmedDead(agent)) {
       db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
-      failedChecks.delete(agent.id);
       reaped.push(agent);
     }
   }
@@ -442,6 +466,5 @@ export function forceReap(db: Database.Database, swarmId: string, name: string):
   const existing = getAgent(db, swarmId, name);
   if (!existing) return null;
   db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);
-  failedChecks.delete(existing.id);
   return existing;
 }

@@ -1,5 +1,7 @@
 import childProcess from 'child_process';
 import { Transport, TransportAgent, TransportDeliveryResult } from './transport-interface.js';
+import { sanitize } from './transport.js';
+import { DEFAULT_SWARM_ID } from './db.js';
 import os from 'os';
 import path from 'path';
 import fs from 'fs';
@@ -152,12 +154,17 @@ export function removeSurface(swarmId: string, agentName: string): void {
   const scoped = surfacePath(swarmId, agentName);
   if (fs.existsSync(scoped)) fs.unlinkSync(scoped);
 
-  const legacy = legacySurfacePath(agentName);
-  if (fs.existsSync(legacy)) fs.unlinkSync(legacy);
+  // The unscoped legacy file belongs to the pre-multi-swarm (default) layout only —
+  // never delete it on behalf of a non-default swarm that merely shares an agent name.
+  if (swarmId === DEFAULT_SWARM_ID) {
+    const legacy = legacySurfacePath(agentName);
+    if (fs.existsSync(legacy)) fs.unlinkSync(legacy);
+  }
 }
 
 export function hasSurface(swarmId: string, agentName: string): boolean {
-  return fs.existsSync(surfacePath(swarmId, agentName)) || fs.existsSync(legacySurfacePath(agentName));
+  if (fs.existsSync(surfacePath(swarmId, agentName))) return true;
+  return swarmId === DEFAULT_SWARM_ID && fs.existsSync(legacySurfacePath(agentName));
 }
 
 /**
@@ -165,9 +172,12 @@ export function hasSurface(swarmId: string, agentName: string): boolean {
  */
 export function loadSurface(swarmId: string, agentName: string): AppleScriptSurface | null {
   const scoped = surfacePath(swarmId, agentName);
-  const legacy = legacySurfacePath(agentName);
-  const selectedPath = fs.existsSync(scoped) ? scoped : legacy;
-  if (!fs.existsSync(selectedPath)) return null;
+  // Only fall back to the unscoped legacy file for the default swarm, so a same-named
+  // agent in another swarm can't be delivered into the default swarm's terminal.
+  const selectedPath = fs.existsSync(scoped)
+    ? scoped
+    : (swarmId === DEFAULT_SWARM_ID ? legacySurfacePath(agentName) : null);
+  if (!selectedPath || !fs.existsSync(selectedPath)) return null;
   try {
     return JSON.parse(fs.readFileSync(selectedPath, 'utf-8'));
   } catch {
@@ -300,13 +310,18 @@ export class AppleScriptTransport implements Transport {
       return { delivered: false, error: `No terminal surface registered for ${agent.name}` };
     }
 
+    // Collapse newlines/tabs before they reach the osascript string literal — an embedded
+    // newline would break the `do script`/`write text` line or submit prematurely (the
+    // same protection the cmux socket path already applies via sanitize()).
+    const safeText = sanitize(formattedText);
+
     try {
       switch (surface.app) {
         case 'Terminal':
-          sendToTerminalApp(surface, formattedText);
+          sendToTerminalApp(surface, safeText);
           break;
         case 'iTerm2':
-          sendToITerm2(surface, formattedText);
+          sendToITerm2(surface, safeText);
           break;
         case 'Warp':
           if (!surface.pushEnabled) {

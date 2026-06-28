@@ -16,7 +16,7 @@ Swarm supports these transport modes:
 - **Warp agents** register as headless terminal agents with Warp surface metadata. `swarm spawn --terminal warp` opens a new Warp tab via `warp://action/new_tab`; push delivery is deferred, so messages queue for `swarm inbox`.
 - **A2A agents** (OpenClaw, Hermes, etc.) register via `swarm register-a2a <name> --endpoint <url>`. Messages are delivered via the A2A protocol over HTTP. This enables cross-user and cross-machine coordination.
 
-Stale agents are cleaned up by checking liveness (Cmux surface check or A2A agent card ping) combined with a 10-minute heartbeat threshold.
+Stale agents are cleaned up by checking liveness (Cmux surface check or A2A agent card ping) combined with a 30-minute heartbeat threshold (confirmed with a second probe before removal). Headless agents have no probeable surface and are never auto-pruned.
 
 ## Architecture
 

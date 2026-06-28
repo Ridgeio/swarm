@@ -19,7 +19,7 @@ import {
   reapIfDead as reapIfDeadRaw,
   updateStatus as updateStatusRaw,
 } from '../src/registry.js';
-import { getInbox as getInboxRaw } from '../src/mailbox.js';
+import { getInbox as getInboxRaw, sendMessage as sendMessageRaw } from '../src/mailbox.js';
 import type Database from 'better-sqlite3';
 
 let db: Database.Database;
@@ -72,6 +72,10 @@ function forceReap(testDb: Database.Database, name: string) {
 
 function getInbox(testDb: Database.Database, agentName: string, peek: boolean = false) {
   return getInboxRaw(testDb, SWARM_ID, agentName, peek);
+}
+
+function sendMessage(testDb: Database.Database, fromName: string, toName: string, body: string) {
+  return sendMessageRaw(testDb, SWARM_ID, fromName, toName, body);
 }
 
 beforeEach(() => {
@@ -147,20 +151,16 @@ describe('registry', () => {
   });
 
   test('stale surface cleanup removes dead agents with stale heartbeat', async () => {
-    // Insert agents with fake surfaces and stale heartbeats (>30min old)
+    // Two cmux agents with fake (unreachable) surfaces and heartbeats older than the
+    // 30min stale window. cmux is unavailable in tests, so both probe as dead.
     const staleTime = new Date(Date.now() - 35 * 60 * 1000).toISOString();
     db.prepare(`INSERT OR REPLACE INTO agents (id, swarm_id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
-      VALUES ('g1', ?, 'Ghost', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?, 'cmux', NULL)`).run(SWARM_ID, staleTime, staleTime);
+      VALUES ('g1', ?, 'GhostA', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?, 'cmux', NULL)`).run(SWARM_ID, staleTime, staleTime);
     db.prepare(`INSERT OR REPLACE INTO agents (id, swarm_id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
-      VALUES ('a1', ?, 'Alive', NULL, 'surface-alive', 'workspace-1', ${process.ppid}, ?, ?, 'cmux', NULL)`).run(SWARM_ID, staleTime, staleTime);
-    const before = db.prepare('SELECT * FROM agents').all() as any[];
-    assert.strictEqual(before.length, 2);
-    // Cleanup requires 3 consecutive failed surface checks before pruning
-    await listAgents(db); // strike 1
+      VALUES ('a1', ?, 'GhostB', NULL, 'surface-ghost-b', 'workspace-1', 999999, ?, ?, 'cmux', NULL)`).run(SWARM_ID, staleTime, staleTime);
     assert.strictEqual((db.prepare('SELECT * FROM agents').all() as any[]).length, 2);
-    await listAgents(db); // strike 2
-    assert.strictEqual((db.prepare('SELECT * FROM agents').all() as any[]).length, 2);
-    // Strike 3 — now agents should be pruned
+    // A single listAgents() confirms each dead via a double-probe and prunes it in one
+    // process — the old design needed 3 calls, but a one-shot CLI never accumulated them.
     const after = await listAgents(db);
     assert.strictEqual(after.length, 0);
   });
@@ -341,6 +341,21 @@ describe('mailbox', () => {
     assert.strictEqual(messages[0].body, 'attention everyone');
   });
 
+  test('case-mismatched direct message still reaches the recipient inbox', async () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
+    joinAgent(db, 'Bob', 'surface-2', 'workspace-1', process.ppid);
+
+    // Bob addresses 'alice' (wrong case); getAgent resolves it case-insensitively, so the
+    // send must store the canonical 'Alice' or the recipient's case-sensitive inbox query misses it.
+    const res = await sendMessage(db, 'Bob', 'alice', 'ping');
+    assert.strictEqual(res.delivered, true);
+
+    const inbox = getInbox(db, 'Alice');
+    assert.strictEqual(inbox.length, 1);
+    assert.strictEqual(inbox[0].body, 'ping');
+    assert.strictEqual(inbox[0].to_agent, 'Alice'); // canonical, not the 'alice' that was typed
+  });
+
   test('inbox excludes own messages', () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
 
@@ -461,6 +476,91 @@ describe('migration', () => {
       assert.strictEqual(agent.agent_type, 'cmux');
       assert.strictEqual(message.swarm_id, DEFAULT_SWARM_ID);
       assert.strictEqual(cursor.swarm_id, DEFAULT_SWARM_ID);
+    } finally {
+      migrated.close();
+      try { fs.unlinkSync(legacyPath); } catch {}
+      try { fs.unlinkSync(legacyPath + '-wal'); } catch {}
+      try { fs.unlinkSync(legacyPath + '-shm'); } catch {}
+    }
+  });
+
+  test('a leftover *_new table from a prior failed migration does not wedge migrate()', () => {
+    const legacyPath = path.join(os.tmpdir(), `swarm-wedge-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const legacy = new SQLite(legacyPath);
+    legacy.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT,
+        surface_id TEXT NOT NULL, workspace_id TEXT, ppid INTEGER NOT NULL,
+        joined_at TEXT NOT NULL, last_heartbeat TEXT NOT NULL
+      );
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, to_agent TEXT,
+        body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      );
+      CREATE TABLE inbox_cursors (
+        agent_name TEXT PRIMARY KEY, last_read_id INTEGER NOT NULL DEFAULT 0
+      );
+      -- Simulate a half-built scratch table left behind by an interrupted/failed prior
+      -- migration. Pre-fix, the unguarded CREATE TABLE agents_new would throw
+      -- "table agents_new already exists" on every subsequent run, wedging the whole CLI.
+      CREATE TABLE agents_new (id TEXT PRIMARY KEY, leftover TEXT);
+    `);
+    const now = new Date().toISOString();
+    legacy.prepare(`INSERT INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
+      VALUES ('a', 'Alice', 'x', 's1', 'w1', 1, ?, ?)`).run(now, now);
+    legacy.close();
+
+    const migrated = getDbAt(legacyPath); // must not throw
+    try {
+      const cols = (migrated.prepare('PRAGMA table_info(agents)').all() as any[]).map(c => c.name);
+      assert.ok(cols.includes('swarm_id'), 'agents migrated to the multi-swarm schema');
+      const agent = migrated.prepare('SELECT * FROM agents WHERE name = ?').get('Alice') as any;
+      assert.strictEqual(agent.swarm_id, DEFAULT_SWARM_ID);
+      const leftover = migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agents_new'").get();
+      assert.strictEqual(leftover, undefined, 'scratch agents_new table is cleaned up');
+    } finally {
+      migrated.close();
+      try { fs.unlinkSync(legacyPath); } catch {}
+      try { fs.unlinkSync(legacyPath + '-wal'); } catch {}
+      try { fs.unlinkSync(legacyPath + '-shm'); } catch {}
+    }
+  });
+
+  test('migration de-duplicates case-variant names the new NOCASE unique would reject', () => {
+    const legacyPath = path.join(os.tmpdir(), `swarm-nocase-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const legacy = new SQLite(legacyPath);
+    legacy.exec(`
+      CREATE TABLE agents (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT,
+        surface_id TEXT NOT NULL, workspace_id TEXT, ppid INTEGER NOT NULL,
+        joined_at TEXT NOT NULL, last_heartbeat TEXT NOT NULL
+      );
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, to_agent TEXT,
+        body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      );
+      CREATE TABLE inbox_cursors (
+        agent_name TEXT PRIMARY KEY, last_read_id INTEGER NOT NULL DEFAULT 0
+      );
+    `);
+    const older = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const newer = new Date().toISOString();
+    // The legacy binary UNIQUE allows 'Bob' and 'bob'; the new schema's NOCASE unique does not.
+    legacy.prepare(`INSERT INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
+      VALUES ('id-old', 'Bob', 'old', 's-old', 'w', 1, ?, ?)`).run(older, older);
+    legacy.prepare(`INSERT INTO agents (id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat)
+      VALUES ('id-new', 'bob', 'new', 's-new', 'w', 1, ?, ?)`).run(newer, newer);
+    legacy.prepare('INSERT INTO inbox_cursors (agent_name, last_read_id) VALUES (?, ?)').run('Bob', 5);
+    legacy.prepare('INSERT INTO inbox_cursors (agent_name, last_read_id) VALUES (?, ?)').run('bob', 9);
+    legacy.close();
+
+    const migrated = getDbAt(legacyPath); // must not throw on the NOCASE unique constraint
+    try {
+      const agents = migrated.prepare("SELECT * FROM agents WHERE name = 'bob' COLLATE NOCASE").all() as any[];
+      assert.strictEqual(agents.length, 1, 'one row survives per case-insensitive name');
+      assert.strictEqual(agents[0].id, 'id-new', 'the most-recently-active row is kept');
+      const cursor = migrated.prepare("SELECT * FROM inbox_cursors WHERE agent_name = 'bob' COLLATE NOCASE").get() as any;
+      assert.strictEqual(cursor.last_read_id, 9, 'the furthest-read cursor is kept');
     } finally {
       migrated.close();
       try { fs.unlinkSync(legacyPath); } catch {}

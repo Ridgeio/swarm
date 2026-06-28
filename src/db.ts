@@ -106,35 +106,53 @@ function migrateAgents(db: Database.Database): void {
   const columns = tableColumns(db, 'agents');
   if (columns.has('swarm_id')) return;
 
-  db.exec(`
-    CREATE TABLE agents_new (
-      id TEXT PRIMARY KEY,
-      swarm_id TEXT NOT NULL,
-      name TEXT NOT NULL COLLATE NOCASE,
-      description TEXT,
-      surface_id TEXT NOT NULL,
-      workspace_id TEXT,
-      ppid INTEGER NOT NULL,
-      joined_at TEXT NOT NULL,
-      last_heartbeat TEXT NOT NULL,
-      agent_type TEXT NOT NULL DEFAULT 'cmux',
-      endpoint_url TEXT,
-      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
-      UNIQUE (swarm_id, name)
-    );
+  // Run the rebuild atomically (DDL is transactional in SQLite). The leading
+  // DROP ... IF EXISTS clears any half-built table from a prior interrupted/failed
+  // run; without atomicity a failed INSERT would leave agents_new committed and
+  // permanently wedge every future migrate() with "table agents_new already exists".
+  db.transaction(() => {
+    db.exec(`
+      DROP TABLE IF EXISTS agents_new;
 
-    INSERT INTO agents_new (
-      id, swarm_id, name, description, surface_id, workspace_id, ppid,
-      joined_at, last_heartbeat, agent_type, endpoint_url
-    )
-    SELECT
-      id, '${DEFAULT_SWARM_ID}', name, description, surface_id, workspace_id, ppid,
-      joined_at, last_heartbeat, agent_type, endpoint_url
-    FROM agents;
+      CREATE TABLE agents_new (
+        id TEXT PRIMARY KEY,
+        swarm_id TEXT NOT NULL,
+        name TEXT NOT NULL COLLATE NOCASE,
+        description TEXT,
+        surface_id TEXT NOT NULL,
+        workspace_id TEXT,
+        ppid INTEGER NOT NULL,
+        joined_at TEXT NOT NULL,
+        last_heartbeat TEXT NOT NULL,
+        agent_type TEXT NOT NULL DEFAULT 'cmux',
+        endpoint_url TEXT,
+        FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+        UNIQUE (swarm_id, name)
+      );
 
-    DROP TABLE agents;
-    ALTER TABLE agents_new RENAME TO agents;
-  `);
+      -- The new schema makes name COLLATE NOCASE UNIQUE(swarm_id,name); the legacy schema
+      -- used a case-sensitive UNIQUE, so a legacy DB could hold 'Bob' and 'bob'. Keep one
+      -- row per case-insensitive name (the most recently active) so the INSERT can't trip
+      -- the NOCASE unique constraint and leave the migration permanently failing.
+      INSERT INTO agents_new (
+        id, swarm_id, name, description, surface_id, workspace_id, ppid,
+        joined_at, last_heartbeat, agent_type, endpoint_url
+      )
+      SELECT
+        id, '${DEFAULT_SWARM_ID}', name, description, surface_id, workspace_id, ppid,
+        joined_at, last_heartbeat, agent_type, endpoint_url
+      FROM agents a
+      WHERE NOT EXISTS (
+        SELECT 1 FROM agents b
+        WHERE b.name = a.name COLLATE NOCASE AND b.id <> a.id
+          AND (b.last_heartbeat > a.last_heartbeat
+               OR (b.last_heartbeat = a.last_heartbeat AND b.id > a.id))
+      );
+
+      DROP TABLE agents;
+      ALTER TABLE agents_new RENAME TO agents;
+    `);
+  })();
 }
 
 function migrateMessages(db: Database.Database): void {
@@ -146,25 +164,29 @@ function migrateMessages(db: Database.Database): void {
   const columns = tableColumns(db, 'messages');
   if (columns.has('swarm_id')) return;
 
-  db.exec(`
-    CREATE TABLE messages_new (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      swarm_id TEXT NOT NULL,
-      from_agent TEXT NOT NULL,
-      to_agent TEXT,
-      body TEXT NOT NULL,
-      delivered INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
-    );
+  db.transaction(() => {
+    db.exec(`
+      DROP TABLE IF EXISTS messages_new;
 
-    INSERT INTO messages_new (id, swarm_id, from_agent, to_agent, body, delivered, created_at)
-    SELECT id, '${DEFAULT_SWARM_ID}', from_agent, to_agent, body, delivered, created_at
-    FROM messages;
+      CREATE TABLE messages_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL,
+        from_agent TEXT NOT NULL,
+        to_agent TEXT,
+        body TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+      );
 
-    DROP TABLE messages;
-    ALTER TABLE messages_new RENAME TO messages;
-  `);
+      INSERT INTO messages_new (id, swarm_id, from_agent, to_agent, body, delivered, created_at)
+      SELECT id, '${DEFAULT_SWARM_ID}', from_agent, to_agent, body, delivered, created_at
+      FROM messages;
+
+      DROP TABLE messages;
+      ALTER TABLE messages_new RENAME TO messages;
+    `);
+  })();
 }
 
 function migrateInboxCursors(db: Database.Database): void {
@@ -176,22 +198,34 @@ function migrateInboxCursors(db: Database.Database): void {
   const columns = tableColumns(db, 'inbox_cursors');
   if (columns.has('swarm_id')) return;
 
-  db.exec(`
-    CREATE TABLE inbox_cursors_new (
-      swarm_id TEXT NOT NULL,
-      agent_name TEXT NOT NULL COLLATE NOCASE,
-      last_read_id INTEGER NOT NULL DEFAULT 0,
-      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
-      PRIMARY KEY (swarm_id, agent_name)
-    );
+  db.transaction(() => {
+    db.exec(`
+      DROP TABLE IF EXISTS inbox_cursors_new;
 
-    INSERT INTO inbox_cursors_new (swarm_id, agent_name, last_read_id)
-    SELECT '${DEFAULT_SWARM_ID}', agent_name, last_read_id
-    FROM inbox_cursors;
+      CREATE TABLE inbox_cursors_new (
+        swarm_id TEXT NOT NULL,
+        agent_name TEXT NOT NULL COLLATE NOCASE,
+        last_read_id INTEGER NOT NULL DEFAULT 0,
+        FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+        PRIMARY KEY (swarm_id, agent_name)
+      );
 
-    DROP TABLE inbox_cursors;
-    ALTER TABLE inbox_cursors_new RENAME TO inbox_cursors;
-  `);
+      -- inbox_cursors.agent_name is now COLLATE NOCASE in the PRIMARY KEY; dedupe legacy
+      -- case-variant cursors (keep the furthest-read) so the INSERT cannot violate the PK.
+      INSERT INTO inbox_cursors_new (swarm_id, agent_name, last_read_id)
+      SELECT '${DEFAULT_SWARM_ID}', agent_name, last_read_id
+      FROM inbox_cursors a
+      WHERE NOT EXISTS (
+        SELECT 1 FROM inbox_cursors b
+        WHERE b.agent_name = a.agent_name COLLATE NOCASE AND b.agent_name <> a.agent_name
+          AND (b.last_read_id > a.last_read_id
+               OR (b.last_read_id = a.last_read_id AND b.agent_name > a.agent_name))
+      );
+
+      DROP TABLE inbox_cursors;
+      ALTER TABLE inbox_cursors_new RENAME TO inbox_cursors;
+    `);
+  })();
 }
 
 function migrate(db: Database.Database): void {

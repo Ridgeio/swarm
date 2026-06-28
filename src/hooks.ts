@@ -65,7 +65,9 @@ function ensureHeadlessHook(): void {
   const quotedSwarmBin = shellDoubleQuote(swarmBin);
   const script = `#!/usr/bin/env bash
 # Swarm awareness hook (headless) — runs on UserPromptSubmit
-${quotedSwarmBin} hook-context 2>/dev/null
+# \`|| true\` keeps it a clean no-op after leaving the swarm (hook-context exits 1 when
+# this session isn't joined).
+${quotedSwarmBin} hook-context 2>/dev/null || true
 `;
 
   fs.writeFileSync(HOOK_SCRIPT, script, { mode: 0o755 });

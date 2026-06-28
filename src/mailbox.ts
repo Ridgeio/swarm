@@ -27,9 +27,13 @@ export async function sendMessage(
   const now = new Date().toISOString();
   const formatted = `[SWARM from ${fromName}]: ${body}`;
 
+  // Store the canonical registered name (getAgent matches case-insensitively).
+  // messages.to_agent is compared case-sensitively in getInbox, so persisting the
+  // raw sender-typed casing would make a case-mismatched message invisible to the
+  // recipient's inbox while still reporting success.
   const result = db.prepare(
     'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, ?, 0, ?)'
-  ).run(swarmId, fromName, toName, body, now);
+  ).run(swarmId, fromName, target.name, body, now);
 
   const msgId = result.lastInsertRowid;
 
@@ -53,12 +57,12 @@ export async function broadcastMessage(
   swarmId: string,
   fromName: string,
   body: string
-): Promise<{ sent: number; failed: number }> {
+): Promise<{ sent: number; queued: number; failed: number }> {
   const agents = await listAgents(db, swarmId);
   const recipients = agents.filter(a => a.name !== fromName);
 
   if (recipients.length === 0) {
-    return { sent: 0, failed: 0 };
+    return { sent: 0, queued: 0, failed: 0 };
   }
 
   const now = new Date().toISOString();
@@ -73,21 +77,31 @@ export async function broadcastMessage(
 
   // Deliver to all recipients in parallel
   const results = await Promise.all(
-    recipients.map(agent => deliverToAgent(agent, formatted))
+    recipients.map(async agent => ({ agent, result: await deliverToAgent(agent, formatted) }))
   );
 
   let sent = 0;
+  let queued = 0;
   let failed = 0;
-  for (const r of results) {
-    if (r.delivered) sent++;
-    else failed++;
+  for (const { agent, result } of results) {
+    if (result.delivered) {
+      sent++;
+    } else if (agent.agent_type === 'a2a') {
+      // A2A agents can't read the local inbox, so a failed push is a real miss.
+      failed++;
+    } else {
+      // Cmux/headless: the broadcast row is in the DB and is inbox-readable
+      // (to_agent IS NULL), so the recipient still receives it on their next
+      // inbox poll even though the immediate push nudge failed. Mirrors sendMessage.
+      queued++;
+    }
   }
 
-  if (sent > 0) {
+  if (sent + queued > 0) {
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
   }
 
-  return { sent, failed };
+  return { sent, queued, failed };
 }
 
 export function getInbox(
@@ -102,11 +116,13 @@ export function getInbox(
   const lastReadId = cursor?.last_read_id ?? 0;
 
   // Fetch messages: direct messages to me + broadcasts, after cursor, not from me
+  // Match names case-insensitively (agents register COLLATE NOCASE) so a message addressed
+  // with non-canonical casing still lands, and an agent never sees its own messages.
   const messages = db.prepare(`
     SELECT * FROM messages
     WHERE swarm_id = ?
-      AND (to_agent = ? OR to_agent IS NULL)
-      AND from_agent != ?
+      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND from_agent != ? COLLATE NOCASE
       AND id > ?
     ORDER BY created_at ASC
   `).all(swarmId, agentName, agentName, lastReadId) as Message[];

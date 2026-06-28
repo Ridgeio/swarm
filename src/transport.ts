@@ -34,7 +34,7 @@ function resolveCmux(): string {
   );
 }
 
-function sanitize(text: string): string {
+export function sanitize(text: string): string {
   // Strip escape sequences that cmux interprets (\n -> Enter, \t -> Tab)
   // Also strip actual newlines/tabs to prevent multi-line injection
   return text
@@ -225,7 +225,21 @@ export function listWorkspaces(): string {
 
 export function renameWorkspace(workspaceId: string, title: string): void {
   const cmux = resolveCmux();
-  execFileSync(cmux, ['rename-workspace', '--workspace', workspaceId, '--', title], STDIO_OPTS);
+  try {
+    execFileSync(cmux, ['rename-workspace', '--workspace', workspaceId, '--', title], STDIO_OPTS);
+  } catch (err: any) {
+    // execFileSync only throws on a non-zero exit, so this is a genuine cmux failure
+    // (e.g. "not_found: Workspace not found" when a Surface id is passed instead of a
+    // Workspace id). The useful detail is on stderr; cmux also prints a deprecation
+    // notice there even on success, so strip that line and surface the real error.
+    const stderr: string = (err.stderr?.toString() ?? '').trim();
+    const real = stderr
+      .split('\n')
+      .filter((line: string) => !/deprecat|alias for/i.test(line))
+      .join(' ')
+      .trim();
+    throw new Error(real || err.message || `cmux rename-workspace failed for "${workspaceId}"`);
+  }
 }
 
 export function identify(): { surfaceId: string | undefined; workspaceId: string | undefined } {

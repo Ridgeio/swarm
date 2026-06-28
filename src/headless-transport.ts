@@ -3,7 +3,8 @@ import { Transport, TransportAgent, TransportDeliveryResult } from './transport-
 /**
  * Headless transport — no push delivery. Messages are stored in the DB
  * and picked up by the agent via `swarm inbox` (polled by the awareness hook).
- * isAlive checks heartbeat freshness since there's no surface to ping.
+ * There is no surface to ping, so isAlive always returns true and headless agents
+ * are never auto-pruned by registry.cleanupStale.
  */
 export class HeadlessTransport implements Transport {
   async deliverMessage(_agent: TransportAgent, _formattedText: string): Promise<TransportDeliveryResult> {
@@ -13,8 +14,9 @@ export class HeadlessTransport implements Transport {
   }
 
   async isAlive(_agent: TransportAgent): Promise<boolean> {
-    // Headless agents are alive as long as their heartbeat is fresh.
-    // The stale cleanup in registry.ts handles expiry via heartbeat threshold.
+    // Headless agents have no probeable surface, so they are treated as alive and are
+    // never auto-pruned by registry.cleanupStale (which skips agent_type === 'headless').
+    // Stale headless rows are cleared only by an explicit reap or a same-name re-join.
     return true;
   }
 }

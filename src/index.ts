@@ -35,29 +35,9 @@ import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTa
 import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
 import { ensureCodexTrust } from './codex-trust.js';
+import { parseGlobalFlags } from './args.js';
 
 const rawArgs = process.argv.slice(2);
-
-function parseGlobalFlags(input: string[]): { args: string[]; swarmName: string | undefined } {
-  const stripped: string[] = [];
-  let swarmName: string | undefined;
-
-  for (let i = 0; i < input.length; i += 1) {
-    const arg = input[i];
-    if (arg === '--swarm' || arg === '-s') {
-      swarmName = input[i + 1];
-      i += 1;
-      continue;
-    }
-    if (arg.startsWith('--swarm=')) {
-      swarmName = arg.slice('--swarm='.length);
-      continue;
-    }
-    stripped.push(arg);
-  }
-
-  return { args: stripped, swarmName };
-}
 
 const parsed = parseGlobalFlags(rawArgs);
 const args = parsed.args;
@@ -156,10 +136,10 @@ Swarm Management:
 
 Agent Management:
   swarm join <name> [--description <text>]        Register in the selected swarm
-    [--headless] [--push] [--root <path>]         Force headless / opt into Warp push / set root
+    [--headless] [--push] [--force] [--root <path>]  Force headless / Warp push / reclaim name / set root
   swarm leave                                      Deregister from the current swarm
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
-    [--description <text>]
+    [--description <text>] [--force]
   swarm unregister-a2a <name>                      Remove an A2A agent
   swarm discover <url>                             Fetch and display an A2A agent card
 
@@ -210,7 +190,7 @@ function writeWarpOscTitle(surface: { ttyDevice?: string }, swarmName: string, a
 }
 
 function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string, description?: string, pushEnabled?: boolean): void {
-  const agent = joinHeadlessAgent(db, swarm.id, name, description);
+  const agent = joinHeadlessAgent(db, swarm.id, name, description, { trackSession: true });
   const parts: string[] = [`swarm: ${swarm.name}`, 'headless'];
 
   const surface = registerSurface(swarm.id, name, pushEnabled);
@@ -233,6 +213,34 @@ function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string
   if (!surface && !host) {
     console.log('Tip: Run "swarm inbox" periodically to check for messages.');
   }
+}
+
+// Headless registrations can't be liveness-probed (no surface to ping) and are orphaned by
+// a session resume (the controlling TTY changes, so the per-TTY identity marker no longer
+// resolves) — leaving the name registered but un-reclaimable, and blocking re-join under the
+// same name. Reclaiming a headless name lets the agent re-attach, but because we can't tell a
+// dead orphan from a busy-but-live agent (the heartbeat only refreshes on a prompt turn, not
+// during a long autonomous task), reclaiming ALWAYS requires explicit --force. That way a
+// same-name join from a different session can never silently knock out an active agent.
+function reclaimHeadlessNameOrExit(
+  db: ReturnType<typeof getDb>,
+  swarm: Swarm,
+  existing: Agent | null,
+  force: boolean
+): void {
+  if (!existing || existing.agent_type !== 'headless') return;
+
+  if (!force) {
+    const mins = Math.max(1, Math.round((Date.now() - new Date(existing.last_heartbeat).getTime()) / 60000));
+    console.error(`Agent "${existing.name}" is already held by a headless agent (last active ~${mins} min ago). If this is your prior session (e.g. you resumed into Cmux) or you are sure it is gone, re-run with --force to reclaim the name; otherwise choose a different name.`);
+    process.exit(1);
+  }
+
+  forceReap(db, swarm.id, existing.name);
+  removeSurface(swarm.id, existing.name);
+  const priorHost = detectHost();
+  if (priorHost) removeHook(priorHost, existing.name, swarm.id);
+  console.log(`Reclaimed headless registration "${existing.name}" from a prior session.`);
 }
 
 function printHookContext(): void {
@@ -313,11 +321,12 @@ async function main() {
       case 'join': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--swarm <name>]');
+          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--force] [--swarm <name>]');
           process.exit(1);
         }
         const headless = hasFlag('--headless');
         const pushEnabled = hasFlag('--push');
+        const force = hasFlag('--force');
         const description = getFlag('--description');
         const db = getDb();
         const swarm = explicitSwarmName
@@ -334,6 +343,8 @@ async function main() {
           console.error(`Agent "${name}" is already registered as a live A2A agent in swarm "${swarm.name}". Choose a different name or run "swarm unregister-a2a ${name} --swarm ${swarm.name}" first.`);
           process.exit(1);
         }
+
+        reclaimHeadlessNameOrExit(db, swarm, existing, force);
 
         if (headless) {
           joinAsHeadless(db, swarm, name, description, pushEnabled);
@@ -353,7 +364,7 @@ async function main() {
       case 'leave': {
         const { db, self, swarm } = requireSelf();
         if (self.agent_type === 'headless') {
-          leaveHeadlessAgent(db, self.swarm_id, self.name);
+          leaveHeadlessAgent(db, self.swarm_id, self.name, { trackSession: true });
           removeSurface(self.swarm_id, self.name);
           const host = detectHost();
           if (host) {
@@ -370,7 +381,7 @@ async function main() {
         const name = args[1];
         const endpoint = getFlag('--endpoint');
         if (!name || !endpoint) {
-          console.error('Usage: swarm register-a2a <name> --endpoint <url> [--description <text>] [--swarm <name>]');
+          console.error('Usage: swarm register-a2a <name> --endpoint <url> [--description <text>] [--force] [--swarm <name>]');
           process.exit(1);
         }
 
@@ -415,6 +426,7 @@ async function main() {
         if (reaped) {
           console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
         }
+        reclaimHeadlessNameOrExit(db, swarm, getAgent(db, swarm.id, name), hasFlag('--force'));
         const agent = joinA2AAgent(db, swarm.id, name, endpoint, agentDescription);
         console.log(`Registered A2A agent "${agent.name}" in swarm "${swarm.name}" @ ${endpoint}`);
         break;
@@ -486,7 +498,11 @@ async function main() {
           process.exit(1);
         }
         const result = await broadcastMessage(db, self.swarm_id, self.name, message);
-        console.log(`Broadcast to ${result.sent} agent(s)${result.failed > 0 ? `, ${result.failed} failed` : ''}`);
+        const reached = result.sent + result.queued;
+        let line = `Broadcast to ${reached} agent(s)`;
+        if (result.queued > 0) line += ` (${result.queued} via inbox)`;
+        if (result.failed > 0) line += `, ${result.failed} failed`;
+        console.log(line);
         break;
       }
 
@@ -808,17 +824,28 @@ async function main() {
       }
 
       case 'rename-workspace': {
-        const wsId = args[1];
+        const givenId = args[1];
         const title = args.slice(2).join(' ');
-        if (!wsId || !title) {
+        if (!givenId || !title) {
           console.error('Usage: swarm rename-workspace <workspace-id> <title>');
           process.exit(1);
+        }
+        const db = getDb();
+        // `swarm whoami` prints both a Surface id and a Workspace id; agents frequently
+        // pass the Surface id by mistake (cmux then fails with "Workspace not found").
+        // If the given id matches a known agent's surface, resolve to its workspace id.
+        let wsId = givenId;
+        const bySurface = db.prepare('SELECT name, workspace_id FROM agents WHERE surface_id = ? LIMIT 1')
+          .get(givenId) as { name: string; workspace_id: string | null } | undefined;
+        if (bySurface?.workspace_id && bySurface.workspace_id !== givenId) {
+          wsId = bySurface.workspace_id;
+          console.log(`Note: "${givenId}" is ${bySurface.name}'s Surface id; using their Workspace id ${wsId}.`);
         }
         try {
           renameWorkspace(wsId, title);
           console.log(`Renamed workspace ${wsId} to "${title}"`);
         } catch (err: any) {
-          console.error(`Failed to rename workspace: ${err.message}`);
+          console.error(`Failed to rename workspace ${wsId}: ${err.message} (Tip: pass the Workspace id from "swarm whoami", not the Surface id.)`);
           process.exit(1);
         }
         break;

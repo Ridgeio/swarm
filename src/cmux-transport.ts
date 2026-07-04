@@ -1,69 +1,23 @@
-import { execFileSync } from 'child_process';
 import { Transport, TransportAgent, TransportDeliveryResult } from './transport-interface.js';
-import { sendToSurface, SurfaceGoneError, isSurfaceAlive, sanitize } from './transport.js';
-
-/**
- * Deliver a message to a Cmux tab via AppleScript clipboard paste.
- * Used as fallback when the Cmux socket is inaccessible (e.g., sender is outside Cmux).
- *
- * Uses the workspace_id (e.g., "workspace:2") to switch to the correct tab
- * via Cmd+<number> before pasting. Requires: cmux app running, System Events access.
- */
-function deliverViaAppleScript(agent: TransportAgent, text: string): void {
-  // Collapse newlines/tabs (the socket path sanitizes; this fallback must too), then
-  // escape for the AppleScript string literal (backslashes and quotes).
-  const escaped = sanitize(text).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-
-  // Parse workspace index from workspace_id (e.g., "workspace:2" → 2)
-  let switchTabScript = '';
-  if (agent.workspace_id) {
-    const match = agent.workspace_id.match(/workspace:(\d+)/);
-    if (match) {
-      const wsIndex = parseInt(match[1], 10);
-      // Cmux uses Cmd+1 through Cmd+9 for workspace switching
-      if (wsIndex >= 1 && wsIndex <= 9) {
-        switchTabScript = `
-        keystroke "${wsIndex}" using command down
-        delay 0.3`;
-      }
-    }
-  }
-
-  const script = `
-    set oldClip to the clipboard
-    set the clipboard to "${escaped}"
-    tell application "cmux" to activate
-    delay 0.3
-    tell application "System Events"
-      tell process "cmux"${switchTabScript}
-        keystroke "v" using command down
-        delay 0.1
-        keystroke return
-      end tell
-    end tell
-    delay 0.1
-    set the clipboard to oldClip
-  `;
-
-  execFileSync('osascript', ['-e', script], { encoding: 'utf-8', timeout: 10000 });
-}
+import { sendToSurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
 
 export class CmuxTransport implements Transport {
   async deliverMessage(agent: TransportAgent, formattedText: string): Promise<TransportDeliveryResult> {
-    // Try Cmux socket first (works when sender is inside Cmux)
+    // Cmux socket only. There used to be an AppleScript clipboard-paste fallback here,
+    // but it could not target a surface — it activated the cmux app and pasted into
+    // whatever tab was FOCUSED (its Cmd+N workspace switch only understood legacy
+    // "workspace:N" refs, never UUIDs), stole focus, clobbered the clipboard, and
+    // falsely reported delivered=true. Field-observed misrouting messages into the
+    // user's active tab (the "[SWARM from Bob]: ping" incident — the test suite's
+    // fake-surface sends fell back to it and pasted into the frontmost terminal).
+    // A socket failure is handled gracefully instead: the message stays queued in the
+    // DB (inbox/hook pickup) and the redeliver worker retries the socket path.
     try {
       sendToSurface(agent.surface_id, formattedText, agent.workspace_id);
       return { delivered: true };
     } catch (err) {
       if (!(err instanceof SurfaceGoneError)) throw err;
-    }
-
-    // Fallback: AppleScript clipboard paste into cmux app
-    try {
-      deliverViaAppleScript(agent, formattedText);
-      return { delivered: true };
-    } catch {
-      return { delivered: false, error: `${agent.name}'s terminal is no longer active` };
+      return { delivered: false, error: `${agent.name}'s terminal is not reachable via the cmux socket` };
     }
   }
 

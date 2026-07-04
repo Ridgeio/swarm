@@ -18,10 +18,10 @@ export async function sendMessage(
   fromName: string,
   toName: string,
   body: string
-): Promise<{ delivered: boolean; message: string }> {
+): Promise<{ delivered: boolean; queued: boolean; message: string }> {
   const target = getAgent(db, swarmId, toName);
   if (!target) {
-    return { delivered: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
+    return { delivered: false, queued: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
   }
 
   const now = new Date().toISOString();
@@ -40,15 +40,17 @@ export async function sendMessage(
   const deliveryResult = await deliverToAgent(target, formatted);
   if (deliveryResult.delivered) {
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
-    return { delivered: true, message: `Message sent to ${toName}` };
+    return { delivered: true, queued: false, message: `Message sent to ${toName}` };
   } else {
     // A2A agents can't read the local swarm inbox, so don't claim it was saved there
     if (target.agent_type === 'a2a') {
-      return { delivered: false, message: `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}` };
+      return { delivered: false, queued: false, message: `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}` };
     }
     // For Cmux and headless agents: push failed but message is in the DB.
-    // The recipient will pick it up via `swarm inbox`.
-    return { delivered: true, message: `Message sent to ${toName} (queued for inbox)` };
+    // The recipient will pick it up via `swarm inbox`, and the caller should
+    // spawn a redeliver worker so an idle recipient isn't stuck waiting for
+    // a turn that never comes (see redeliver.ts).
+    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for inbox)` };
   }
 }
 

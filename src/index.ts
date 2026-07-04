@@ -31,6 +31,7 @@ import {
   updateWorkspace,
 } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
+import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
@@ -147,6 +148,7 @@ Communication:
   swarm send <agent> <message>                     Send message within the current swarm
   swarm broadcast <message>                        Send to all agents in the current swarm
   swarm inbox [--peek]                             Read pending messages
+  swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Status:
   swarm members                                    List agents in the current swarm
@@ -272,6 +274,11 @@ function printHookContext(): void {
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"${readCommand}
 When you see [SWARM from <name>]: treat it as a message from another agent and respond.${inboxSection}`);
+
+  // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
+  // message, kick a detached retry worker. One indexed SELECT when idle, so this
+  // adds no meaningful latency to the prompt hook.
+  if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
 }
 
 async function main() {
@@ -487,6 +494,9 @@ async function main() {
         }
         const result = await sendMessage(db, self.swarm_id, self.name, targetName, message);
         console.log(result.message);
+        // Push failed → the recipient may be idle with no upcoming turn to poll
+        // the inbox. A detached worker retries the push on a backoff schedule.
+        if (result.queued) spawnRedeliverWorker();
         break;
       }
 
@@ -503,6 +513,9 @@ async function main() {
         if (result.queued > 0) line += ` (${result.queued} via inbox)`;
         if (result.failed > 0) line += `, ${result.failed} failed`;
         console.log(line);
+        // Note: broadcast rows (to_agent NULL) are not retried per-recipient —
+        // but a direct-message backlog may exist; sweep it while we're here.
+        if (result.queued > 0 && hasPendingRedeliveries(db)) spawnRedeliverWorker();
         break;
       }
 
@@ -519,6 +532,7 @@ async function main() {
           }
           console.log(`\n${messages.length} message(s)${peek ? ' (peek mode, not marked as read)' : ''}`);
         }
+        if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
         break;
       }
 
@@ -932,6 +946,23 @@ async function main() {
           db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
           db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
           console.log(`Swarm "${swarm.name}" reset. Cleared ${agents.length} agent(s) and its messages.`);
+        }
+        break;
+      }
+
+      case 'redeliver': {
+        const db = getDb();
+        if (hasFlag('--worker')) {
+          // Detached background retry loop (spawned on push failure). Exits when drained.
+          await runRedeliverWorker(db);
+          break;
+        }
+        const dryRun = hasFlag('--dry-run');
+        const result = await redeliverPending(db, { dryRun });
+        if (dryRun) {
+          console.log(`${result.eligible} message(s) eligible for redelivery (dry run, nothing pushed).`);
+        } else {
+          console.log(`Redelivered ${result.redelivered}/${result.eligible} pending message(s).`);
         }
         break;
       }

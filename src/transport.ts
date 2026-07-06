@@ -133,10 +133,18 @@ export function sendToSurface(surfaceId: string, text: string, workspaceId?: str
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
   const lockPath = acquireSurfaceLock(surfaceId);
   try {
-    // Retry once on failure to handle transient cmux errors
-    for (let attempt = 0; attempt < 2; attempt++) {
+    for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
       try {
-        // Chunk long messages to avoid Claude Code paste-bracket detection
+        // Before a RETRY, clear the input line: a prior attempt may have typed
+        // part of the text before failing, and re-typing from the start would
+        // duplicate or garble it in the recipient's prompt buffer (field-observed
+        // "…STREAM…STREAM" duplication). ctrl+u clears the current line.
+        if (attempt > 0) {
+          try { execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'ctrl+u'], STDIO_OPTS); } catch {}
+        }
+        // Chunk long text to avoid Claude Code paste-bracket detection. (Message
+        // delivery caps payloads to a single chunk upstream — see cmux-transport's
+        // nudge — so multi-chunk sends here are spawn commands to fresh surfaces.)
         if (safe.length <= CHUNK_SIZE) {
           execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
         } else {

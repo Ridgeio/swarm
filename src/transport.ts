@@ -48,6 +48,27 @@ export function sanitize(text: string): string {
 
 const CHUNK_SIZE = 60;
 const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe', 'pipe'] };
+const MAX_SEND_ATTEMPTS = 5;
+const SEND_BACKOFF_BASE_S = 0.3;
+
+// A cmux send/read can fail two ways: the surface is genuinely gone, or the cmux
+// server dropped the connection under load ("Broken pipe", errno 32 / EPIPE /
+// connection reset). The latter is transient — the surface is alive, just busy —
+// and should be retried rather than treated as a dead surface (which would let
+// cleanupStale prune a live-but-busy agent).
+export function isTransientCmuxError(err: any): boolean {
+  const haystack = `${err?.stderr?.toString() ?? ''} ${err?.message ?? ''} ${err?.code ?? ''}`.toLowerCase();
+  return (
+    haystack.includes('broken pipe') ||
+    haystack.includes('errno 32') ||
+    haystack.includes('epipe') ||
+    haystack.includes('connection reset') ||
+    haystack.includes('econnreset') ||
+    haystack.includes('resource temporarily unavailable') ||
+    haystack.includes('eagain') ||
+    haystack.includes('socket')
+  );
+}
 
 export function sleep(seconds: number): void {
   execFileSync('sleep', [String(seconds)], STDIO_OPTS);
@@ -130,8 +151,17 @@ export function sendToSurface(surfaceId: string, text: string, workspaceId?: str
         execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
         return; // success
       } catch (err: any) {
-        if (attempt === 0) {
-          sleep(0.5); // brief pause before retry
+        // A "broken pipe"/socket-reset means the cmux server dropped the connection
+        // under load — the surface is alive but momentarily busy (recipient mid-turn).
+        // These are transient and worth several backoff retries; a genuine "surface
+        // not found" is terminal and should fail fast. (Field-measured: ~10% of sends
+        // to active agents hit broken pipe, roughly independent of message length.)
+        const transient = isTransientCmuxError(err);
+        const lastAttempt = attempt === MAX_SEND_ATTEMPTS - 1;
+        if (!lastAttempt && (transient || attempt === 0)) {
+          // Escalating backoff: 0.3, 0.6, 1.2, 2.4s. Rides out brief contention
+          // spikes without hammering a sustained-busy surface (the hook covers that).
+          sleep(SEND_BACKOFF_BASE_S * Math.pow(2, attempt));
           continue;
         }
         throw new SurfaceGoneError(surfaceId);
@@ -185,20 +215,27 @@ export function readScreen(surfaceId: string, lines?: number, workspaceId?: stri
   try {
     return execFileSync(cmux, args, STDIO_OPTS).toString();
   } catch (err: any) {
-    throw new SurfaceGoneError(surfaceId);
+    const gone = new SurfaceGoneError(surfaceId);
+    // Preserve the underlying cause so callers (isSurfaceAlive) can tell a genuinely
+    // gone surface from a transient "busy" broken pipe.
+    (gone as any).cause = err;
+    throw gone;
   }
 }
 
 export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean {
-  // Retry once after a short delay to handle transient cmux socket errors
-  for (let attempt = 0; attempt < 2; attempt++) {
+  // Retry a few times with backoff. Critically: a TRANSIENT socket error (broken
+  // pipe from a busy surface) must NOT be read as "dead" — the surface is alive, just
+  // busy. Only a genuine non-transient failure (surface not found) counts as dead,
+  // so cleanupStale can never prune a live-but-busy agent.
+  for (let attempt = 0; attempt < 3; attempt++) {
     try {
       readScreen(surfaceId, 1, workspaceId);
       return true;
-    } catch {
-      if (attempt === 0) {
-        // Brief pause before retry — transient socket contention
-        execFileSync('sleep', ['0.5'], STDIO_OPTS);
+    } catch (err: any) {
+      if (isTransientCmuxError(err?.cause)) return true; // busy, not gone
+      if (attempt < 2) {
+        execFileSync('sleep', [String(0.3 * (attempt + 1))], STDIO_OPTS);
       }
     }
   }

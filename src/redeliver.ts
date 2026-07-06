@@ -105,7 +105,12 @@ export async function redeliverPending(
 // that retries on a backoff schedule and exits as soon as the queue drains
 // (or after the last delay, when remaining messages are near the age-out window).
 
-const WORKER_DELAYS_SEC = [0, 30, 60, 120, 300];
+// Tight early retries catch the recipient's first idle window fast (once a busy
+// surface stops throwing broken pipe, the push lands); the long tail keeps trying
+// for a recipient that stays busy or goes idle without taking another turn. Total
+// span ~17 min. Active recipients recover sooner via their own inbox hook; this
+// worker is the safety net for the idle case that the hook can't cover.
+const WORKER_DELAYS_SEC = [0, 3, 7, 15, 30, 60, 120, 240, 480];
 const WORKER_LOCK = path.join(os.homedir(), '.swarm', 'locks', 'redeliver-worker.lock');
 const WORKER_LOCK_STALE_MS = 10 * 60 * 1000;
 

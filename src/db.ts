@@ -36,6 +36,11 @@ function ensureLegacyAgentColumns(db: Database.Database): void {
   if (!columns.has('endpoint_url')) {
     db.exec("ALTER TABLE agents ADD COLUMN endpoint_url TEXT");
   }
+  // Host harness (claude-code | codex | grok). Used for delivery quirks such as
+  // Grok needing a second Enter to submit interjected input instead of queueing it.
+  if (!columns.has('host_agent')) {
+    db.exec('ALTER TABLE agents ADD COLUMN host_agent TEXT');
+  }
 }
 
 function createSwarmsTable(db: Database.Database): void {
@@ -71,6 +76,7 @@ function createCurrentTables(db: Database.Database): void {
       last_heartbeat TEXT NOT NULL,
       agent_type TEXT NOT NULL DEFAULT 'cmux',
       endpoint_url TEXT,
+      host_agent TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       UNIQUE (swarm_id, name)
     );
@@ -126,6 +132,7 @@ function migrateAgents(db: Database.Database): void {
         last_heartbeat TEXT NOT NULL,
         agent_type TEXT NOT NULL DEFAULT 'cmux',
         endpoint_url TEXT,
+        host_agent TEXT,
         FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
         UNIQUE (swarm_id, name)
       );
@@ -136,11 +143,11 @@ function migrateAgents(db: Database.Database): void {
       -- the NOCASE unique constraint and leave the migration permanently failing.
       INSERT INTO agents_new (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
       )
       SELECT
         id, '${DEFAULT_SWARM_ID}', name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
       FROM agents a
       WHERE NOT EXISTS (
         SELECT 1 FROM agents b

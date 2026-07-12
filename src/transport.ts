@@ -127,9 +127,63 @@ function releaseSurfaceLock(lockPath: string): void {
   try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {}
 }
 
-export function sendToSurface(surfaceId: string, text: string, workspaceId?: string | null): void {
+export interface SendToSurfaceOptions {
+  /**
+   * How many times to press Enter after typing. Grok's TUI queues interjected
+   * input on a single Enter and only submits on the second; Claude/Codex submit
+   * on the first. Default 1.
+   */
+  enterCount?: number;
+}
+
+/**
+ * Non-invasive surface wake-up via Cmux notifications (no keystrokes into the TUI).
+ * Preferred for Codex: typing into the prompt can open reasoning-level pickers or
+ * queue mid-turn and leave the agent stuck. Callers still store the full message
+ * in the DB for `swarm inbox`.
+ */
+export function notifySurface(
+  surfaceId: string,
+  title: string,
+  body: string,
+  workspaceId?: string | null
+): void {
+  const cmux = resolveCmux();
+  const safeTitle = sanitize(title).slice(0, 80) || 'SWARM';
+  const safeBody = sanitize(body).slice(0, 200) || 'New message — run: swarm inbox';
+  const args = ['notify', '--title', safeTitle, '--body', safeBody, '--surface', surfaceId];
+  if (workspaceId) args.push('--workspace', workspaceId);
+  try {
+    execFileSync(cmux, args, STDIO_OPTS);
+  } catch (err: any) {
+    if (isTransientCmuxError(err)) {
+      // One quick retry for flaky sockets.
+      sleep(0.2);
+      try {
+        execFileSync(cmux, args, STDIO_OPTS);
+      } catch {
+        // Still failing (busy surface under load). Surface as "gone" so the
+        // caller reports delivered=false and the message stays queued for the
+        // redeliver worker — a raw throw here crashed the whole CLI with the
+        // message already inserted, making successful queueing look like a
+        // failed send (field-observed on notify-path recipients under load).
+        throw new SurfaceGoneError(surfaceId);
+      }
+      return;
+    }
+    throw new SurfaceGoneError(surfaceId);
+  }
+}
+
+export function sendToSurface(
+  surfaceId: string,
+  text: string,
+  workspaceId?: string | null,
+  options?: SendToSurfaceOptions
+): void {
   const cmux = resolveCmux();
   const safe = sanitize(text);
+  const enterCount = Math.max(1, options?.enterCount ?? 1);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
   const lockPath = acquireSurfaceLock(surfaceId);
   try {
@@ -156,7 +210,10 @@ export function sendToSurface(surfaceId: string, text: string, workspaceId?: str
         }
         // Let input settle before submitting
         sleep(0.1);
-        execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
+        for (let e = 0; e < enterCount; e++) {
+          execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
+          if (e + 1 < enterCount) sleep(0.05);
+        }
         return; // success
       } catch (err: any) {
         // A "broken pipe"/socket-reset means the cmux server dropped the connection

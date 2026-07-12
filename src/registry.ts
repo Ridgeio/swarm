@@ -20,6 +20,8 @@ export interface Swarm {
   last_active_at: string;
 }
 
+export type HostAgentKind = 'claude-code' | 'codex' | 'grok';
+
 export interface Agent {
   id: string;
   swarm_id: string;
@@ -27,6 +29,8 @@ export interface Agent {
   description: string | null;
   agent_type: AgentType;
   endpoint_url: string | null;
+  /** Host harness that owns this terminal (claude-code | codex | grok). */
+  host_agent: HostAgentKind | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -197,10 +201,12 @@ export function joinAgent(
   ppid: number,
   description?: string,
   agentType: AgentType = 'cmux',
-  endpointUrl?: string
+  endpointUrl?: string,
+  hostAgent?: HostAgentKind | null
 ): Agent {
   const id = randomUUID();
   const now = nowIso();
+  const host = hostAgent ?? null;
 
   const tx = db.transaction(() => {
     const existing = getAgent(db, swarmId, name);
@@ -216,10 +222,10 @@ export function joinAgent(
     db.prepare(`
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null, host);
 
     db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
   });
@@ -232,6 +238,7 @@ export function joinAgent(
     description: description ?? null,
     agent_type: agentType,
     endpoint_url: endpointUrl ?? null,
+    host_agent: host,
     surface_id: surfaceId,
     workspace_id: workspaceId ?? null,
     ppid,
@@ -271,7 +278,7 @@ export function joinHeadlessAgent(
   swarmId: string,
   name: string,
   description?: string,
-  options: HeadlessSessionOptions = {}
+  options: HeadlessSessionOptions & { hostAgent?: HostAgentKind | null } = {}
 ): Agent {
   if (options.trackSession) {
     // This TTY previously joined under a different identity — reap it so a
@@ -288,7 +295,10 @@ export function joinHeadlessAgent(
     throw new Error(`Agent "${name}" is already registered as a ${existing.agent_type} agent in this swarm. Choose a different name or remove the existing agent first.`);
   }
   const syntheticSurfaceId = `headless:${swarmId}:${name}`;
-  const agent = joinAgent(db, swarmId, name, syntheticSurfaceId, undefined, process.ppid, description, 'headless');
+  const agent = joinAgent(
+    db, swarmId, name, syntheticSurfaceId, undefined, process.ppid,
+    description, 'headless', undefined, options.hostAgent
+  );
   if (options.trackSession) {
     writeSessionMarker(swarmId, name);
   }
@@ -332,9 +342,11 @@ export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
 
   const agentName = process.env.SWARM_AGENT_NAME;
   if (agentName) {
+    // Headless agents resolve by name; a2a agents too, so a remote agent can
+    // act as itself over SSH (e.g. `SWARM_AGENT_NAME=Fable swarm send ...`).
     const sql = resolvedSwarmId
-      ? "SELECT * FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless' ORDER BY joined_at DESC LIMIT 1"
-      : "SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type = 'headless' ORDER BY joined_at DESC LIMIT 1";
+      ? "SELECT * FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type IN ('headless', 'a2a') ORDER BY joined_at DESC LIMIT 1"
+      : "SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type IN ('headless', 'a2a') ORDER BY joined_at DESC LIMIT 1";
     const params = resolvedSwarmId ? [resolvedSwarmId, agentName] : [agentName];
     return db.prepare(sql).get(...params) as Agent | undefined ?? null;
   }
@@ -380,6 +392,16 @@ export function updateStatus(db: Database.Database, swarmId: string, surfaceId: 
 
 export function updateWorkspace(db: Database.Database, swarmId: string, surfaceId: string, workspaceId: string): void {
   db.prepare('UPDATE agents SET workspace_id = ? WHERE swarm_id = ? AND surface_id = ?').run(workspaceId, swarmId, surfaceId);
+}
+
+export function updateHostAgent(
+  db: Database.Database,
+  swarmId: string,
+  surfaceId: string,
+  hostAgent: HostAgentKind
+): void {
+  db.prepare('UPDATE agents SET host_agent = ? WHERE swarm_id = ? AND surface_id = ?')
+    .run(hostAgent, swarmId, surfaceId);
 }
 
 export function updateHeartbeat(db: Database.Database, swarmId: string, surfaceId: string): void {

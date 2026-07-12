@@ -1,16 +1,41 @@
-#!/usr/bin/env node
-try {
-  await import('../dist/index.js');
-} catch (err) {
-  if (err?.message?.includes('NODE_MODULE_VERSION')) {
-    const { execFileSync } = await import('node:child_process');
-    const path = await import('node:path');
-    const root = path.dirname(path.dirname(new URL(import.meta.url).pathname));
-    process.stderr.write('Rebuilding native modules for current Node version...\n');
-    execFileSync('npm', ['rebuild', 'better-sqlite3'], { cwd: root, stdio: 'inherit' });
-    // Re-exec the process since Node caches native modules
-    execFileSync(process.execPath, process.argv.slice(1), { cwd: process.cwd(), stdio: 'inherit' });
-  } else {
-    throw err;
-  }
+#!/usr/bin/env bash
+# Swarm CLI launcher.
+# Prefer a pinned Node so better-sqlite3's native ABI matches across agents:
+#   1. $SWARM_NODE (absolute path to node binary)
+#   2. ~/.swarm/node-path (machine-local pin — do not commit)
+#   3. first `node` on PATH
+set -euo pipefail
+
+# Resolve through symlinks (e.g. /opt/homebrew/bin/swarm → repo bin/swarm)
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "${SOURCE}" ]; do
+  DIR="$(cd -P "$(dirname "${SOURCE}")" && pwd)"
+  SOURCE="$(readlink "${SOURCE}")"
+  [[ "${SOURCE}" != /* ]] && SOURCE="${DIR}/${SOURCE}"
+done
+ROOT="$(cd -P "$(dirname "${SOURCE}")/.." && pwd)"
+ENTRY="${ROOT}/bin/swarm-entry.mjs"
+
+resolve_node() {
+  if [ -n "${SWARM_NODE:-}" ] && [ -x "${SWARM_NODE}" ]; then
+    printf '%s\n' "${SWARM_NODE}"
+    return
+  fi
+  if [ -f "${HOME}/.swarm/node-path" ]; then
+    local pinned
+    pinned="$(head -1 "${HOME}/.swarm/node-path" | tr -d '\r\n')"
+    if [ -n "${pinned}" ] && [ -x "${pinned}" ]; then
+      printf '%s\n' "${pinned}"
+      return
+    fi
+  fi
+  command -v node
 }
+
+NODE="$(resolve_node)"
+if [ -z "${NODE}" ] || [ ! -x "${NODE}" ]; then
+  echo "swarm: node not found. Install Node >= 20 or set SWARM_NODE / ~/.swarm/node-path" >&2
+  exit 1
+fi
+
+exec "${NODE}" "${ENTRY}" "$@"

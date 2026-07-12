@@ -2,7 +2,7 @@
 
 Cross-terminal and cross-agent coordination for AI coding agents. Supports local agents running in [Cmux](https://cmux.dev) and remote agents via the [A2A (Agent-to-Agent) protocol](https://google.github.io/A2A/).
 
-Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compatible agent — monitor what other agents are working on and coordinate multi-agent workflows from the terminal. Swarm can run multiple independent project swarms at the same time, so each codebase can have its own Lead and agent set.
+Send messages between Claude Code, Codex, Grok CLI, OpenClaw, Hermes, and any A2A-compatible agent — monitor what other agents are working on and coordinate multi-agent workflows from the terminal. Swarm can run multiple independent project swarms at the same time, so each codebase can have its own Lead and agent set.
 
 ## How it works
 
@@ -24,7 +24,7 @@ Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compat
                                   └──────────────┘
 ```
 
-**Cmux agents** (Claude Code, Codex CLI) register with `swarm join` and receive messages pushed directly into their terminal via Cmux's native `send` command.
+**Cmux agents** (Claude Code, Codex CLI, Grok CLI) register with `swarm join` and receive messages pushed directly into their terminal via Cmux's native `send` command.
 
 **A2A agents** (OpenClaw, Hermes, or any agent with an A2A-compatible endpoint) register with `swarm register-a2a` and receive messages delivered over HTTP via the A2A protocol. This enables cross-user and cross-machine coordination.
 
@@ -35,7 +35,7 @@ Send messages between Claude Code sessions, OpenClaw, Hermes, and any A2A-compat
 - **macOS** (Cmux is macOS-only; A2A agents can run on any platform)
 - **[Cmux](https://cmux.dev)** installed and running (for local terminal agents)
 - **Node.js >= 20** (`node --version` to check)
-- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** and/or **[Codex CLI](https://github.com/openai/codex)** for Cmux agents
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)**, **[Codex CLI](https://github.com/openai/codex)**, and/or **[Grok CLI](https://x.ai/cli)** for Cmux agents
 - Any A2A-compatible agent (e.g., OpenClaw, Hermes) for remote coordination
 
 ## Install
@@ -48,22 +48,23 @@ npm run build
 ./install.sh
 ```
 
-The install script auto-detects which agents you have installed (Claude Code, Codex CLI) and configures skills for each:
+The install script auto-detects which agents you have installed (Claude Code, Codex CLI, Grok CLI, Gemini) and configures skills for each:
 
 - **Claude Code**: installs `/swarm`, `/join-swarm`, `/leave-swarm`, `/reset-swarm` skills as symlinks + a `UserPromptSubmit` hook for persistent swarm awareness
 - **Codex CLI**: installs `swarm`, `join-swarm`, `leave-swarm`, `reset-swarm` skills into `~/.codex/skills` + durable coordination instructions at `~/.codex/swarm-instructions.md`
+- **Grok CLI**: installs the same skills as symlinks under `~/.grok/skills` + a global `UserPromptSubmit` hook at `~/.grok/hooks/swarm-awareness.json`
 
 The awareness hook automatically reminds joined agents of their swarm identity, active members, and available commands on every turn where the host supports hooks. Codex stores durable install instructions separately from session hints in `~/.codex/swarm-session.md`; the CLI resolves the actual current identity from the terminal/session marker.
 
 ### Verify
 
-Open a fresh Claude Code or Codex session in Cmux. In Claude Code, run:
+Open a fresh Claude Code, Codex, or Grok session in Cmux. In Claude Code or Grok, run:
 
 ```
 /join-swarm TestAgent --swarm test
 ```
 
-In Codex, invoke the `join-swarm` skill or ask Codex to use `join-swarm` with `TestAgent --swarm test`. You should see: `Joined swarm "test" as "TestAgent" ...`. Then clean up with `/leave-swarm` in Claude Code or the `leave-swarm` skill in Codex.
+In Codex, invoke the `join-swarm` skill or ask Codex to use `join-swarm` with `TestAgent --swarm test`. You should see: `Joined swarm "test" as "TestAgent" ...`. Then clean up with `/leave-swarm` (Claude/Grok) or the `leave-swarm` skill (Codex).
 
 ## Quick start
 
@@ -110,7 +111,7 @@ swarm create docs --root /Users/tom/Developer/docs-site
 | `/leave-swarm` | Leave the current swarm. |
 | `/reset-swarm` | Clear the current swarm's agents, messages, and inbox state. |
 
-Claude Code exposes these as slash commands. Codex loads them as skills from `~/.codex/skills`; invoke the matching skill name, for example `join-swarm`.
+Claude Code and Grok CLI expose these as slash commands (`/join-swarm`, etc.). Codex loads them as skills from `~/.codex/skills`; invoke the matching skill name, for example `join-swarm`.
 
 ## CLI Reference
 
@@ -147,7 +148,8 @@ Shared:
   swarm status [--set <desc>] [--agent <name>] Update or query status
 
 Spawning:
-  swarm spawn [--cwd <path>] [--autonomous]   Spawn Claude in a new Cmux tab
+  swarm spawn [--cwd <path>] [--autonomous]   Spawn Claude/Codex/Grok in a new tab
+    [--agent claude|codex|grok] [--name <n>]
                                               (auto-joins the swarm after boot)
 
 Workspace management:
@@ -220,13 +222,14 @@ swarm broadcast "status check — what's everyone working on?"
 
 ### Spawning new agents
 
-A lead agent can spin up new Claude Code or Codex sessions directly. By default, `swarm spawn` opens Warp tabs when run inside Warp and Cmux surfaces otherwise:
+A lead agent can spin up new Claude Code, Codex, or Grok sessions directly. By default, `swarm spawn` opens Warp tabs when run inside Warp and Cmux surfaces otherwise:
 ```bash
 swarm spawn --cwd /path/to/project --swarm ridge --autonomous
+swarm spawn --agent grok --name Brillo --cwd /path/to/project --swarm ridge
 swarm spawn --terminal warp --name DevA --cwd /path/to/project --swarm ridge
 ```
 
-In Cmux, this opens a new tab in the current workspace, launches the agent, and auto-sends `/join-swarm --swarm ridge` after boot. If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. In Warp, it opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex agents receive join instructions as their initial prompt. The `--autonomous` flag enables `--dangerously-skip-permissions` for Claude and `--yolo` for Codex.
+In Cmux, this opens a new tab in the current workspace, launches the agent, and auto-sends `/join-swarm --swarm ridge` after boot (Claude). If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. In Warp, it opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex/Grok agents receive join instructions as their initial prompt. The `--autonomous` flag enables `--dangerously-skip-permissions` for Claude, `--yolo` for Codex, and `--always-approve` for Grok.
 
 ### Organizing workspaces
 

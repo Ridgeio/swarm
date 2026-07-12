@@ -1,5 +1,5 @@
-import { Transport, TransportAgent, TransportDeliveryResult } from './transport-interface.js';
-import { sendToSurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
+import { Transport, TransportAgent, TransportDeliveryResult, DeliveryOptions } from './transport-interface.js';
+import { sendToSurface, notifySurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
 
 // A keystroke push is reliable only for a single short send. Typing a long,
 // multi-chunk message into a live Claude Code TUI silently drops chunks (the
@@ -20,18 +20,61 @@ export function buildPushText(formattedText: string): string {
   return nudge.length <= PUSH_MAX_CHARS ? nudge : nudge.slice(0, PUSH_MAX_CHARS);
 }
 
+/**
+ * How many Enter keypresses after typing. Grok queues mid-turn input on a single
+ * Enter (Ctrl+; queue path); a second Enter is send-now/interject. Default is 1
+ * so normal swarm traffic does not interrupt a running Grok turn.
+ */
+export function enterCountForDelivery(
+  hostAgent: string | null | undefined,
+  options?: DeliveryOptions
+): number {
+  if (options?.interject && hostAgent === 'grok') return 2;
+  return 1;
+}
+
+/** Codex TUIs are fragile under keystroke injection (reasoning-level pickers, mid-turn queues). */
+export function prefersNotifyDelivery(hostAgent: string | null | undefined, options?: DeliveryOptions): boolean {
+  // Explicit interject still uses keystrokes so a human/lead can force-submit.
+  if (options?.interject) return false;
+  return hostAgent === 'codex';
+}
+
 export class CmuxTransport implements Transport {
-  async deliverMessage(agent: TransportAgent, formattedText: string): Promise<TransportDeliveryResult> {
+  async deliverMessage(
+    agent: TransportAgent,
+    formattedText: string,
+    options?: DeliveryOptions
+  ): Promise<TransportDeliveryResult> {
     // Cmux socket only. There used to be an AppleScript clipboard-paste fallback
     // here, but it pasted into whatever tab was FOCUSED and misrouted messages
     // (the "[SWARM from Bob]" incident); it was removed. A socket failure now
     // returns delivered=false: the message stays queued in the DB (inbox/hook
     // pickup) and the redeliver worker retries the socket path.
+    const pushText = buildPushText(formattedText);
     try {
-      sendToSurface(agent.surface_id, buildPushText(formattedText), agent.workspace_id);
+      if (prefersNotifyDelivery(agent.host_agent, options)) {
+        const match = formattedText.match(/^\[SWARM from ([^\]]+)\]/);
+        const sender = match ? match[1] : 'swarm';
+        notifySurface(
+          agent.surface_id,
+          `SWARM from ${sender}`,
+          `${pushText} — run: swarm inbox`,
+          agent.workspace_id
+        );
+        return { delivered: true };
+      }
+
+      const enterCount = enterCountForDelivery(agent.host_agent, options);
+      sendToSurface(agent.surface_id, pushText, agent.workspace_id, { enterCount });
       return { delivered: true };
     } catch (err) {
       if (!(err instanceof SurfaceGoneError)) throw err;
+      // Codex notify-only path: if notify fails, try one keystroke nudge as last resort
+      // only when interject was requested; otherwise leave it for inbox/redeliver.
+      if (prefersNotifyDelivery(agent.host_agent, options)) {
+        return { delivered: false, error: `${agent.name}'s terminal is not reachable via cmux notify` };
+      }
       return { delivered: false, error: `${agent.name}'s terminal is not reachable via the cmux socket` };
     }
   }

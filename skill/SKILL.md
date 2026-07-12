@@ -32,6 +32,11 @@ The message appears directly in their terminal as input. They will see:
 [SWARM from YourName]: <message>
 ```
 
+On **Grok**, a normal send **queues** mid-turn (does not interrupt). Only use `--interject` / `--now` when you intentionally want send-now:
+```
+swarm send <agent-name> "<urgent message>" --interject
+```
+
 Send to everyone:
 ```
 swarm broadcast "<message>"
@@ -60,17 +65,18 @@ swarm read <agent-name> --lines 30
 This lets you monitor progress without interrupting them.
 
 ### Spawning New Agents
-When you need another local Claude Code agent, spawn it from the lead/current agent:
+When you need another local agent, spawn it from the lead/current agent:
 ```
 swarm spawn --name DevA --cwd /path/to/project --swarm <swarm-name>
+swarm spawn --agent grok --name Brillo --cwd /path/to/project --swarm <swarm-name>
 ```
 
-By default, `swarm spawn` auto-selects the terminal: Warp when running inside Warp, otherwise Cmux. Use `--terminal cmux` or `--terminal warp` to force one. Cmux opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm.
+Supported `--agent` values: `claude` (default), `codex`, `grok`. By default, `swarm spawn` auto-selects the terminal: Warp when running inside Warp, otherwise Cmux. Use `--terminal cmux` or `--terminal warp` to force one. Cmux opens the new agent in a new tab/surface in the current workspace and auto-joins it to the selected swarm.
 
 In Warp:
 - Default: opens a new **tab** in the active Warp window via `warp://action/new_tab`, then pastes the join+exec command via Accessibility. Compact, but tabs in one window can't be individually targeted by `swarm send` (see "Warp push caveat" above).
 - `--window`: opens a separate Warp window via a Launch Configuration YAML (auto-runs the join command without keystrokes). Better for `--push` reliability since each window has a unique accessibility-visible title.
-- Codex agents (`--agent codex`) receive join instructions as their initial prompt instead of auto-running `swarm join`.
+- Codex and Grok agents (`--agent codex` / `--agent grok`) receive join instructions as their initial prompt instead of auto-running `swarm join`.
 
 ## Coordination Protocol
 

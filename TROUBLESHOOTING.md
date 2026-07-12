@@ -27,7 +27,7 @@ Error: Could not locate the bindings file. Tried:
 
 ### Cause
 
-The swarm CLI uses native `better-sqlite3` via `bin/swarm` (`#!/usr/bin/env node`). The native module ships prebuilds keyed to specific node ABIs:
+`better-sqlite3` is a native addon keyed to a specific Node ABI. Agents on the same machine often have different `node` first on PATH (Homebrew Node 25 vs nvm Node 24), so `#!/usr/bin/env node` would load a mismatched binary.
 
 | Node version | NODE_MODULE_VERSION (ABI) |
 |---|---|
@@ -35,37 +35,45 @@ The swarm CLI uses native `better-sqlite3` via `bin/swarm` (`#!/usr/bin/env node
 | node 24.x | 137 |
 | node 25.x | 141 |
 
-`prebuild-install` (run automatically on `npm install` / `npm rebuild`) frequently fetches the wrong ABI's prebuild, and the `build/Release/better_sqlite3.node` binary ends up incompatible with the active node. Compiling from source on Darwin currently fails with a Python 3.14 expat symbol error (`_XML_SetAllocTrackerActivationThreshold`), so source-build isn't a reliable fallback.
+### Preferred fix — pin Node for swarm (machine-local)
 
-### Reliable fix — direct prebuild download
+`bin/swarm` is a bash launcher that prefers:
+
+1. `$SWARM_NODE` (absolute path to a node binary)
+2. `~/.swarm/node-path` (one line: absolute path — **not in the git repo**)
+3. first `node` on PATH
+
+Pin this host once (match the ABI of the installed prebuild; currently Node 24 / ABI 137):
 
 ```bash
-# 1. Get the active node ABI
+mkdir -p ~/.swarm
+echo '/Users/tom/.nvm/versions/node/v24.14.1/bin/node' > ~/.swarm/node-path
+swarm members   # should work even if Homebrew node 25 is first on PATH
+```
+
+### Auto-repair — official prebuild download
+
+If the active node still mismatches, `bin/swarm-entry.mjs` downloads the matching WiseLibs prebuild for the current ABI (does **not** run `npm rebuild`, which thrash-fetches the wrong ABI mid-session). One re-exec after download.
+
+Manual equivalent:
+
+```bash
 ABI=$(node -e "console.log(process.versions.modules)")  # e.g. "137"
-
-# 2. Get the installed better-sqlite3 version
 VERSION=$(node -p "require('/Users/tom/Developer/Ridge.io/swarm/node_modules/better-sqlite3/package.json').version")
-
-# 3. Download the matching prebuild
 cd /tmp
 curl -sL "https://github.com/WiseLibs/better-sqlite3/releases/download/v${VERSION}/better-sqlite3-v${VERSION}-node-v${ABI}-darwin-arm64.tar.gz" -o bsq.tgz
-
-# 4. Replace the broken build dir
 cd /Users/tom/Developer/Ridge.io/swarm/node_modules/better-sqlite3
 rm -rf build
 tar -xzf /tmp/bsq.tgz
-
-# 5. Verify
 swarm members
 ```
-
-Confirmed working on 2026-04-29 with `v12.9.0` + `v137` (node 24) + darwin-arm64.
 
 ### Anti-patterns to avoid
 
 - ❌ `npm install` / `npm rebuild` in the swarm dir during a live session — repeatedly deletes and re-fetches the wrong prebuild, breaking every connected agent's swarm CLI for minutes at a time.
 - ❌ `--build-from-source` — fails on Python 3.14 expat issue.
 - ❌ Pinning to an older `better-sqlite3` (e.g. 11.10.0) hoping a different prebuild — the same ABI mismatch logic applies.
+- ❌ Un-pinning `~/.swarm/node-path` while multiple agents share one install — each agent's PATH may thrash the single shared `.node` binary.
 
 ---
 
@@ -111,6 +119,45 @@ When cmux workspaces are closed, the agent rows persist in `~/.swarm/swarm.db`. 
 ```bash
 sqlite3 ~/.swarm/swarm.db \
   "DELETE FROM agents WHERE name IN ('Stale1','Stale2',...)"
+```
+
+---
+
+## Local reserved agent names (not in the git repo)
+
+Some machines keep OpenClaw / A2A identities that local Cmux agents must not claim.
+
+- Config file (machine-local): `~/.swarm/reserved-names` — one name per line, `#` comments OK
+- Or env: `SWARM_RESERVED_NAMES=Forge,Cooper` / `SWARM_RESERVED_NAMES_FILE=/path/to/file`
+
+`swarm join` rejects reserved names. The list is **never** committed to the swarm repo — each host maintains its own. A2A registration is not blocked (those names are intended for remote agents).
+
+---
+
+## Grok CLI: queue vs send-now (Enter)
+
+### Behavior
+
+Grok's TUI mid-turn input has two modes (footer: `Enter:send now` / `Ctrl+;:queue`):
+
+- **Single Enter after a push** — message is **queued** (does not interrupt the current turn). This is the default for `swarm send` / `swarm broadcast`.
+- **Double Enter** — force **send-now / interject**. Only used when the sender opts in.
+
+### Opt-in interject
+
+```bash
+swarm send Brillo "urgent: stop and review" --interject
+swarm broadcast "drop everything" --now
+```
+
+`--interject` / `--now` only changes delivery for agents with `host_agent = 'grok'` (second Enter). Claude/Codex still get one Enter.
+
+### Host tagging
+
+Join records `host_agent` via `detectHost()` (`GROK_AGENT` / `CMUX_AGENT_LAUNCH_KIND=grok`). Existing sessions refresh on whoami/inbox/status. Manual tag:
+
+```bash
+sqlite3 ~/.swarm/swarm.db "UPDATE agents SET host_agent = 'grok' WHERE name IN ('Forge','Brillo','Quill');"
 ```
 
 ---

@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { isTransientCmuxError } from '../src/transport.js';
-import { buildPushText, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
+import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
 
 // The transient/gone classification decides whether a failed cmux send is retried
 // (busy surface) or treated as a dead surface (which lets cleanupStale prune the
@@ -75,6 +75,25 @@ describe('buildPushText (single-chunk push, nudge for long messages)', () => {
     const long = `[SWARM from ${'N'.repeat(200)}]: ` + 'body '.repeat(50);
     const push = buildPushText(long);
     assert.ok(push.length <= PUSH_MAX_CHARS, `nudge too long: ${push.length}`);
+  });
+
+  test('default delivery is single Enter (queue on Grok); interject doubles only for Grok', () => {
+    assert.strictEqual(enterCountForDelivery('grok'), 1);
+    assert.strictEqual(enterCountForDelivery('grok', {}), 1);
+    assert.strictEqual(enterCountForDelivery('grok', { interject: false }), 1);
+    assert.strictEqual(enterCountForDelivery('grok', { interject: true }), 2);
+    assert.strictEqual(enterCountForDelivery('claude-code', { interject: true }), 1);
+    assert.strictEqual(enterCountForDelivery('codex', { interject: true }), 1);
+    assert.strictEqual(enterCountForDelivery(null, { interject: true }), 1);
+  });
+
+  test('Codex prefers non-invasive notify unless interject is requested', () => {
+    assert.strictEqual(prefersNotifyDelivery('codex'), true);
+    assert.strictEqual(prefersNotifyDelivery('codex', {}), true);
+    assert.strictEqual(prefersNotifyDelivery('codex', { interject: true }), false);
+    assert.strictEqual(prefersNotifyDelivery('grok'), false);
+    assert.strictEqual(prefersNotifyDelivery('claude-code'), false);
+    assert.strictEqual(prefersNotifyDelivery(null), false);
   });
 
   test('a long message with no parseable sender still nudges within one chunk', () => {

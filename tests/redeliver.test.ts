@@ -84,13 +84,19 @@ describe('redeliverPending', () => {
     assert.strictEqual(result.eligible, 0);
   });
 
-  test('skips broadcast rows, already-delivered messages, and a2a recipients', async () => {
-    addAgent('Remote', 'a2a');
+  test('skips broadcast rows and already-delivered messages', async () => {
     addMessage({ from: 'Alice', to: null });                 // broadcast
     addMessage({ from: 'Alice', to: 'Bob', delivered: 1 });  // push already succeeded
-    addMessage({ from: 'Alice', to: 'Remote' });             // a2a — sender was told it failed
     const result = await redeliverPending(db, { deliver: deliverOk });
     assert.strictEqual(result.eligible, 0);
+  });
+
+  test('retries queued a2a recipients (endpoint may have been briefly down)', async () => {
+    addAgent('Remote', 'a2a');
+    const id = addMessage({ from: 'Alice', to: 'Remote' }); // a2a push failed -> queued
+    const result = await redeliverPending(db, { deliver: deliverOk });
+    assert.deepStrictEqual(result, { eligible: 1, redelivered: 1, attempted: 1 });
+    assert.strictEqual(deliveredFlag(id), 1);
   });
 
   test('cursor guard matches case-insensitively', async () => {

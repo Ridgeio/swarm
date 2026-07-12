@@ -35,8 +35,10 @@ interface RedeliverOptions {
  *   - recipient's inbox cursor has NOT passed the message (cursor-passed means
  *     the hook/inbox already surfaced it — re-pushing would duplicate)
  *   - younger than REDELIVER_WINDOW_MS (never resurface resolved work)
- *   - recipient is not a2a (a failed a2a send was reported to the sender as a
- *     real failure; the sender may have already re-sent — re-pushing risks dupes)
+ *
+ * A2A recipients are eligible too: a failed a2a push is reported to the sender
+ * as queued (mailbox.ts), so the retry here is the delivery path — it covers
+ * a remote endpoint that was briefly down (service restart, network blip).
  *
  * Concurrency-safe: each message is claimed with an atomic
  * `UPDATE ... WHERE delivered = 0` before pushing and reverted on push failure,
@@ -57,7 +59,6 @@ export async function redeliverPending(
       ON c.swarm_id = m.swarm_id AND c.agent_name = m.to_agent COLLATE NOCASE
     WHERE m.delivered = 0
       AND m.to_agent IS NOT NULL
-      AND a.agent_type != 'a2a'
       AND m.id > COALESCE(c.last_read_id, 0)
       AND m.created_at > ?
     ORDER BY m.id ASC
@@ -173,7 +174,6 @@ export function hasPendingRedeliveries(db: Database.Database): boolean {
       ON c.swarm_id = m.swarm_id AND c.agent_name = m.to_agent COLLATE NOCASE
     WHERE m.delivered = 0
       AND m.to_agent IS NOT NULL
-      AND a.agent_type != 'a2a'
       AND m.id > COALESCE(c.last_read_id, 0)
       AND m.created_at > ?
     LIMIT 1

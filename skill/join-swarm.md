@@ -25,6 +25,8 @@ Omit `--swarm` when no swarm name was provided and the CLI can infer the current
 
 - If the selected swarm is **empty** (no agents or "No agents in swarm"), join as **"Lead"** — you're the first agent in this project swarm, so you coordinate the team.
 - If agents **already exist in this swarm**, pick a short creative name that's unique within this swarm. Don't ask the user, just pick one.
+- **Never name yourself after your model or any AI model/product** (Fable, Claude, Codex, Sonnet, Grok, GPT, Gemini, …, with or without version suffixes). The CLI rejects these — a model-named agent is ambiguous the moment a second instance of that model joins.
+- This machine may reserve names for remote/OpenClaw agents via a **local-only** file `~/.swarm/reserved-names` (not in the repo). If `swarm join` rejects a name as reserved, pick another.
 
 2. Join the swarm with your chosen name. The CLI auto-detects your environment — if you're in Cmux it uses push delivery, otherwise it joins in headless mode with automatic message polling.
 

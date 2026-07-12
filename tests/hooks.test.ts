@@ -7,12 +7,15 @@ import { detectHost, installHook, removeHook } from '../src/hooks.js';
 
 const ORIGINAL_HOME = process.env.HOME;
 const CODEX_ENV_KEYS = ['CODEX_CLI', 'CODEX_CI', 'CODEX_THREAD_ID', 'CODEX_MANAGED_BY_NPM', 'CODEX_HOME'];
+const GROK_ENV_KEYS = ['GROK_AGENT', 'GROK_HOME', 'CMUX_AGENT_LAUNCH_KIND'];
 const ORIGINAL_CLAUDE_CODE = process.env.CLAUDE_CODE;
 const ORIGINAL_CODEX_ENV = new Map(CODEX_ENV_KEYS.map(key => [key, process.env[key]]));
+const ORIGINAL_GROK_ENV = new Map(GROK_ENV_KEYS.map(key => [key, process.env[key]]));
 
 function clearRuntimeEnv(): void {
   delete process.env.CLAUDE_CODE;
   for (const key of CODEX_ENV_KEYS) delete process.env[key];
+  for (const key of GROK_ENV_KEYS) delete process.env[key];
 }
 
 function withTempHome(): string {
@@ -31,6 +34,11 @@ afterEach(() => {
     if (value === undefined) delete process.env[key];
     else process.env[key] = value;
   }
+  for (const key of GROK_ENV_KEYS) {
+    const value = ORIGINAL_GROK_ENV.get(key);
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 });
 
 describe('hook host detection', () => {
@@ -45,6 +53,21 @@ describe('hook host detection', () => {
     assert.strictEqual(detectHost(), 'codex');
   });
 
+  test('Grok runtime env is detected via GROK_AGENT or CMUX_AGENT_LAUNCH_KIND', () => {
+    const home = withTempHome();
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    fs.mkdirSync(path.join(home, '.grok'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.claude', 'settings.json'), '{}\n');
+    fs.writeFileSync(path.join(home, '.grok', 'config.toml'), 'model = "test"\n');
+
+    process.env.GROK_AGENT = '1';
+    assert.strictEqual(detectHost(), 'grok');
+
+    delete process.env.GROK_AGENT;
+    process.env.CMUX_AGENT_LAUNCH_KIND = 'grok';
+    assert.strictEqual(detectHost(), 'grok');
+  });
+
   test('config fallback only detects a host when unambiguous', () => {
     const home = withTempHome();
     fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
@@ -56,6 +79,11 @@ describe('hook host detection', () => {
 
     fs.rmSync(path.join(home, '.claude'), { recursive: true, force: true });
     assert.strictEqual(detectHost(), 'codex');
+
+    fs.rmSync(path.join(home, '.codex'), { recursive: true, force: true });
+    fs.mkdirSync(path.join(home, '.grok'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.grok', 'config.toml'), 'model = "test"\n');
+    assert.strictEqual(detectHost(), 'grok');
   });
 });
 
@@ -125,5 +153,26 @@ describe('Claude hook state', () => {
     const settings = JSON.parse(fs.readFileSync(settingsPath, 'utf-8'));
     const commands = settings.hooks.UserPromptSubmit.flatMap((entry: any) => entry.hooks.map((hook: any) => hook.command));
     assert.deepStrictEqual(commands, ['/repo/hooks/swarm-awareness.sh']);
+  });
+});
+
+describe('Grok hook state', () => {
+  test('installing Grok hook writes durable UserPromptSubmit hook under ~/.grok/hooks', () => {
+    const home = withTempHome();
+    process.env.GROK_HOME = path.join(home, '.grok');
+
+    installHook('grok', 'Forge', 'swarm-a', 'project-a');
+
+    const hookPath = path.join(home, '.grok', 'hooks', 'swarm-awareness.json');
+    assert.ok(fs.existsSync(hookPath));
+    const payload = JSON.parse(fs.readFileSync(hookPath, 'utf-8'));
+    const command = payload.hooks.UserPromptSubmit[0].hooks[0].command as string;
+    assert.match(command, /swarm-awareness/);
+    assert.strictEqual(payload.hooks.UserPromptSubmit[0].hooks[0].type, 'command');
+    assert.strictEqual(payload.hooks.UserPromptSubmit[0].hooks[0].timeout, 5);
+
+    // Leave keeps the durable global hook (same model as Claude installer).
+    removeHook('grok', 'Forge', 'swarm-a');
+    assert.ok(fs.existsSync(hookPath));
   });
 });

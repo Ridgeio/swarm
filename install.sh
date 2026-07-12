@@ -161,12 +161,32 @@ if command -v gemini &>/dev/null; then
   installed=$((installed + 1))
 fi
 
+# ── Grok CLI ─────────────────────────────────────────────────────────────────
+
+if command -v grok &>/dev/null; then
+  echo "Found: Grok CLI"
+  GROK_HOME="${GROK_HOME:-$HOME/.grok}"
+  GROK_SKILLS="${GROK_HOME}/skills"
+  mkdir -p "$GROK_SKILLS"
+
+  # Symlink each skill — same SKILL.md layout as Claude Code; git pull updates them.
+  for skill in "${SKILLS[@]}"; do
+    skill_dir="${GROK_SKILLS}/${skill}"
+    mkdir -p "$skill_dir"
+    src="$(skill_source "$skill")"
+    ln -sf "$src" "${skill_dir}/SKILL.md"
+    echo "  Linked: ${GROK_SKILLS/#$HOME/~}/${skill}/SKILL.md → ${src}"
+  done
+
+  installed=$((installed + 1))
+fi
+
 # ── Swarm awareness hook ─────────────────────────────────────────────────────
 
 HOOK_SCRIPT="${SWARM_DIR}/hooks/swarm-awareness.sh"
 if command -v claude &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
   echo ""
-  echo "Installing swarm awareness hook..."
+  echo "Installing swarm awareness hook (Claude Code)..."
 
   SETTINGS_FILE="$HOME/.claude/settings.json"
   if [ -f "$SETTINGS_FILE" ]; then
@@ -208,6 +228,33 @@ if command -v claude &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
   fi
 fi
 
+if command -v grok &>/dev/null && [ -f "$HOOK_SCRIPT" ]; then
+  echo ""
+  echo "Installing swarm awareness hook (Grok CLI)..."
+  GROK_HOME="${GROK_HOME:-$HOME/.grok}"
+  GROK_HOOKS="${GROK_HOME}/hooks"
+  mkdir -p "$GROK_HOOKS"
+  # Grok discovers always-trusted global hooks from ~/.grok/hooks/*.json
+  cat > "${GROK_HOOKS}/swarm-awareness.json" << HOOK
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${HOOK_SCRIPT}",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
+HOOK
+  echo "  Installed: ${GROK_HOOKS/#$HOME/~}/swarm-awareness.json"
+fi
+
 # ── swarm CLI in PATH ────────────────────────────────────────────────────────
 
 if ! command -v swarm &>/dev/null; then
@@ -230,11 +277,11 @@ fi
 
 echo ""
 if [ $installed -eq 0 ]; then
-  echo "No supported agents found (checked: claude, codex, gemini)."
+  echo "No supported agents found (checked: claude, codex, gemini, grok)."
   echo "You can still use the CLI directly: ${SWARM_BIN} help"
 else
   echo "Done. ${installed} agent platform(s) configured."
-  echo "Claude skills are symlinked. Codex skills are copied; rerun ./install.sh after pulling swarm updates."
+  echo "Claude/Grok skills are symlinked. Codex skills are copied; rerun ./install.sh after pulling swarm updates."
   echo ""
-  echo "To test: open a fresh Claude Code or Codex session and invoke join-swarm."
+  echo "To test: open a fresh Claude Code, Codex, or Grok session and invoke join-swarm."
 fi

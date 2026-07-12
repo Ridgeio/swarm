@@ -12,7 +12,7 @@ Cross-terminal agent coordination CLI via Cmux and A2A protocol.
 
 Swarm supports two transport types:
 
-- **Cmux agents** (Claude Code, Codex) register via `swarm join <name>`, which stores their Cmux surface ID in SQLite (`~/.swarm/swarm.db`). Messages are pushed via `cmux send` + `cmux send-key Enter`.
+- **Cmux agents** (Claude Code, Codex, Grok CLI) register via `swarm join <name>`, which stores their Cmux surface ID in SQLite (`~/.swarm/swarm.db`). Messages are pushed via `cmux send` + `cmux send-key Enter`.
 - **A2A agents** (OpenClaw, Hermes, etc.) register via `swarm register-a2a <name> --endpoint <url>`. Messages are delivered via the A2A protocol over HTTP. This enables cross-user and cross-machine coordination.
 
 Stale agents are cleaned up by checking liveness (Cmux surface check or A2A agent card ping) combined with a 30-minute heartbeat threshold, and only after several consecutive failed liveness probes. Headless agents are never auto-pruned (they have no probeable surface).

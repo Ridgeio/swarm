@@ -1,6 +1,7 @@
 import type Database from 'better-sqlite3';
 import { deliverToAgent } from './transport-router.js';
 import { getAgent, listAgents } from './registry.js';
+import type { DeliveryOptions } from './transport-interface.js';
 
 export interface Message {
   id: number;
@@ -17,7 +18,8 @@ export async function sendMessage(
   swarmId: string,
   fromName: string,
   toName: string,
-  body: string
+  body: string,
+  options?: DeliveryOptions
 ): Promise<{ delivered: boolean; queued: boolean; message: string }> {
   const target = getAgent(db, swarmId, toName);
   if (!target) {
@@ -37,20 +39,18 @@ export async function sendMessage(
 
   const msgId = result.lastInsertRowid;
 
-  const deliveryResult = await deliverToAgent(target, formatted);
+  const deliveryResult = await deliverToAgent(target, formatted, options);
   if (deliveryResult.delivered) {
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
     return { delivered: true, queued: false, message: `Message sent to ${toName}` };
   } else {
-    // A2A agents can't read the local swarm inbox, so don't claim it was saved there
-    if (target.agent_type === 'a2a') {
-      return { delivered: false, queued: false, message: `Failed to deliver to ${toName}: ${deliveryResult.error || 'endpoint unreachable'}` };
-    }
-    // For Cmux and headless agents: push failed but message is in the DB.
-    // The recipient will pick it up via `swarm inbox`, and the caller should
-    // spawn a redeliver worker so an idle recipient isn't stuck waiting for
-    // a turn that never comes (see redeliver.ts).
-    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for inbox)` };
+    // Push failed but the message is in the DB. Cmux/headless recipients pick it
+    // up via `swarm inbox`; a2a recipients get retried by the redeliver worker
+    // (their endpoint may be briefly down, e.g. a service restart) and can also
+    // read their inbox remotely (getSelf resolves SWARM_AGENT_NAME for a2a).
+    // The caller should spawn a redeliver worker so an idle recipient isn't
+    // stuck waiting for a turn that never comes (see redeliver.ts).
+    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for retry/inbox)` };
   }
 }
 
@@ -58,7 +58,8 @@ export async function broadcastMessage(
   db: Database.Database,
   swarmId: string,
   fromName: string,
-  body: string
+  body: string,
+  options?: DeliveryOptions
 ): Promise<{ sent: number; queued: number; failed: number }> {
   const agents = await listAgents(db, swarmId);
   const recipients = agents.filter(a => a.name !== fromName);
@@ -79,7 +80,7 @@ export async function broadcastMessage(
 
   // Deliver to all recipients in parallel
   const results = await Promise.all(
-    recipients.map(async agent => ({ agent, result: await deliverToAgent(agent, formatted) }))
+    recipients.map(async agent => ({ agent, result: await deliverToAgent(agent, formatted, options) }))
   );
 
   let sent = 0;
@@ -88,13 +89,11 @@ export async function broadcastMessage(
   for (const { agent, result } of results) {
     if (result.delivered) {
       sent++;
-    } else if (agent.agent_type === 'a2a') {
-      // A2A agents can't read the local inbox, so a failed push is a real miss.
-      failed++;
     } else {
-      // Cmux/headless: the broadcast row is in the DB and is inbox-readable
-      // (to_agent IS NULL), so the recipient still receives it on their next
-      // inbox poll even though the immediate push nudge failed. Mirrors sendMessage.
+      // The broadcast row is in the DB and is inbox-readable (to_agent IS NULL),
+      // so the recipient still receives it on their next inbox poll even though
+      // the immediate push failed — a2a agents included, since they can read
+      // their inbox remotely via SWARM_AGENT_NAME. Mirrors sendMessage.
       queued++;
     }
   }

@@ -2,10 +2,11 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 
-export type HostAgent = 'claude-code' | 'codex';
+export type HostAgent = 'claude-code' | 'codex' | 'grok';
 
 const SWARM_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
 const HOOK_SCRIPT = path.join(SWARM_DIR, 'hooks', 'swarm-awareness-headless.sh');
+const AWARENESS_HOOK_SCRIPT = path.join(SWARM_DIR, 'hooks', 'swarm-awareness.sh');
 const CODEX_BASE_MARKER = '<!-- swarm-instructions -->';
 
 /**
@@ -17,14 +18,22 @@ export function detectHost(): HostAgent | null {
     return 'codex';
   }
   if (process.env.CLAUDE_CODE) return 'claude-code';
+  // Grok sets GROK_AGENT (often "1") in interactive sessions; Cmux labels launch kind.
+  if (process.env.CMUX_AGENT_LAUNCH_KIND === 'grok' || process.env.GROK_AGENT) {
+    return 'grok';
+  }
 
   const hasCodexConfig = fs.existsSync(path.join(getCodexHome(), 'config.toml'));
   const hasClaudeConfig = fs.existsSync(path.join(os.homedir(), '.claude', 'settings.json'));
+  const hasGrokConfig = fs.existsSync(path.join(getGrokHome(), 'config.toml'));
 
-  if (hasCodexConfig && !hasClaudeConfig) return 'codex';
-  if (hasClaudeConfig && !hasCodexConfig) return 'claude-code';
+  const matches: HostAgent[] = [];
+  if (hasCodexConfig) matches.push('codex');
+  if (hasClaudeConfig) matches.push('claude-code');
+  if (hasGrokConfig) matches.push('grok');
 
-  return null;
+  // Only fall back to config when a single host is unambiguous.
+  return matches.length === 1 ? matches[0] : null;
 }
 
 /**
@@ -41,6 +50,9 @@ export function installHook(host: HostAgent, agentName: string, swarmId: string,
     case 'codex':
       installCodexHook(agentName, swarmId, swarmName);
       break;
+    case 'grok':
+      installGrokHook();
+      break;
   }
 }
 
@@ -54,6 +66,9 @@ export function removeHook(host: HostAgent, agentName: string, swarmId?: string)
       break;
     case 'codex':
       removeCodexHook(agentName, swarmId);
+      break;
+    case 'grok':
+      // Durable global hook stays installed (same model as Claude Code installer hook).
       break;
   }
 }
@@ -75,6 +90,14 @@ ${quotedSwarmBin} hook-context 2>/dev/null || true
 
 function getClaudeSettingsPath(): string {
   return path.join(os.homedir(), '.claude', 'settings.json');
+}
+
+function getGrokHome(): string {
+  return process.env.GROK_HOME || path.join(os.homedir(), '.grok');
+}
+
+function getGrokAwarenessHookPath(): string {
+  return path.join(getGrokHome(), 'hooks', 'swarm-awareness.json');
 }
 
 function getCodexHome(): string {
@@ -242,21 +265,31 @@ Your current identity is resolved by the swarm CLI from the terminal/session mar
   );
 
   const sessionPath = path.join(codexHome, 'swarm-session.md');
+  // Do NOT inject SWARM_AGENT_NAME=… — that only resolves headless rows and will
+  // mis-identify a Cmux Codex session that reuses a stale session file.
+  // Identity comes from CMUX_SURFACE_ID (auto) or `swarm whoami`.
   const sessionContent = `# Swarm Session
 
 This Codex terminal most recently joined swarm "${swarmName}" as "${agentName}".
-Do not rely on this file as the source of truth when multiple Codex sessions are open. Resolve the current terminal identity from the CLI:
+
+**Identity:** Always resolve from the live CLI (do not trust this file if multiple Codex tabs are open):
 
 \`\`\`bash
-SWARM_ID=${quotedSwarmId} ${quotedSwarmBin} whoami
-SWARM_ID=${quotedSwarmId} ${quotedSwarmBin} inbox
+${quotedSwarmBin} whoami
+${quotedSwarmBin} inbox
+${quotedSwarmBin} members
 \`\`\`
 
-To communicate in this swarm:
+When you see a Cmux **notification** titled \`SWARM from …\`, or a terminal nudge, run \`${swarmBin} inbox\` — full message bodies live in the inbox (Codex delivery uses notifications to avoid corrupting the TUI).
+
+To communicate:
 \`\`\`bash
-SWARM_ID=${quotedSwarmId} ${quotedSwarmBin} send <agent> "<message>"
-SWARM_ID=${quotedSwarmId} ${quotedSwarmBin} members
+${quotedSwarmBin} send <agent> "<message>"
+${quotedSwarmBin} broadcast "<message>"
+${quotedSwarmBin} status --set "<what you are doing>"
 \`\`\`
+
+Swarm id if needed: SWARM_ID=${quotedSwarmId}
 `;
   fs.writeFileSync(sessionPath, sessionContent);
   ensureInstructionsReference(
@@ -276,4 +309,32 @@ function removeCodexHook(agentName?: string, swarmId?: string): void {
     fs.unlinkSync(sessionPath);
     removeInstructionsReference('<!-- swarm-session -->');
   }
+}
+
+/**
+ * Install a durable global Grok UserPromptSubmit hook.
+ * Grok discovers hooks from ~/.grok/hooks/*.json (always trusted).
+ */
+function installGrokHook(): void {
+  const hookPath = getGrokAwarenessHookPath();
+  fs.mkdirSync(path.dirname(hookPath), { recursive: true });
+
+  // Prefer the durable awareness script; fall back to the generated headless one.
+  const command = fs.existsSync(AWARENESS_HOOK_SCRIPT) ? AWARENESS_HOOK_SCRIPT : HOOK_SCRIPT;
+  const payload = {
+    hooks: {
+      UserPromptSubmit: [
+        {
+          hooks: [
+            {
+              type: 'command',
+              command,
+              timeout: 5,
+            },
+          ],
+        },
+      ],
+    },
+  };
+  fs.writeFileSync(hookPath, `${JSON.stringify(payload, null, 2)}\n`);
 }

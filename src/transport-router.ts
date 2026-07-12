@@ -1,4 +1,4 @@
-import { Transport, TransportAgent, TransportDeliveryResult } from './transport-interface.js';
+import { Transport, TransportAgent, TransportDeliveryResult, DeliveryOptions } from './transport-interface.js';
 import { CmuxTransport } from './cmux-transport.js';
 import { A2ATransport } from './a2a-transport.js';
 import { HeadlessTransport } from './headless-transport.js';
@@ -21,9 +21,13 @@ export function getTransport(agentType: string, swarmId?: string, agentName?: st
   }
 }
 
-export async function deliverToAgent(agent: TransportAgent, text: string): Promise<TransportDeliveryResult> {
+export async function deliverToAgent(
+  agent: TransportAgent,
+  text: string,
+  options?: DeliveryOptions
+): Promise<TransportDeliveryResult> {
   const transport = getTransport(agent.agent_type, agent.swarm_id, agent.name);
-  return transport.deliverMessage(agent, text);
+  return transport.deliverMessage(agent, text, options);
 }
 
 export async function isAgentAlive(agent: TransportAgent): Promise<boolean> {

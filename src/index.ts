@@ -27,6 +27,7 @@ import {
   reapAll,
   reapIfDead,
   updateHeartbeat,
+  updateHostAgent,
   updateStatus,
   updateWorkspace,
 } from './registry.js';
@@ -37,6 +38,8 @@ import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
 import { ensureCodexTrust } from './codex-trust.js';
 import { parseGlobalFlags } from './args.js';
+import { assertNameNotReserved, assertNotModelName } from './reserved-names.js';
+import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -112,6 +115,14 @@ function requireSelf(): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swar
   }
 
   updateHeartbeat(db, self.swarm_id, self.surface_id);
+  // Persist host harness when known so delivery can apply host-specific quirks
+  // (e.g. Grok double-Enter). Refreshes existing sessions that joined before
+  // host_agent was recorded.
+  const host = detectHost();
+  if (host && self.host_agent !== host) {
+    updateHostAgent(db, self.swarm_id, self.surface_id, host);
+    self.host_agent = host;
+  }
   const swarm = getSwarmById(db, self.swarm_id) ?? getOrCreateSwarm(db);
   return { db, self, swarm, surfaceId: self.surface_id };
 }
@@ -143,11 +154,19 @@ Agent Management:
     [--description <text>] [--force]
   swarm unregister-a2a <name>                      Remove an A2A agent
   swarm discover <url>                             Fetch and display an A2A agent card
+  swarm serve [--name <agent>] [--port <n>]        Expose a local agent's inbox as an A2A
+    [--bind <ip>] [--advertise <url>]                endpoint (cross-machine delivery);
+    [--advertise-host <ip>] [--description <text>]   defaults: port 18790, bind 0.0.0.0,
+                                                     advertise Tailscale IPv4 when present
 
 Communication:
   swarm send <agent> <message>                     Send message within the current swarm
+    [--interject|--now]                              Grok: force send-now (double Enter);
+                                                     default single Enter queues mid-turn
   swarm broadcast <message>                        Send to all agents in the current swarm
-  swarm inbox [--peek]                             Read pending messages
+    [--interject|--now]
+  swarm inbox [--peek|--unread]                    Read pending messages
+                                                     (--unread is an alias; --peek does not advance cursor)
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Status:
@@ -157,10 +176,10 @@ Status:
 
 Local Agents:
   swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
-    [--agent claude|codex] [--name <name>]
+    [--agent claude|codex|grok] [--name <name>]
     [--terminal auto|cmux|warp]                      (default: auto; --autonomous adds
-                                                      --dangerously-skip-permissions for claude
-                                                      and --yolo for codex)
+                                                      --dangerously-skip-permissions for claude,
+                                                      --yolo for codex, --always-approve for grok)
 
 Cmux-only:
   swarm read <agent> [--lines <n>]                 Read agent's terminal
@@ -192,7 +211,8 @@ function writeWarpOscTitle(surface: { ttyDevice?: string }, swarmName: string, a
 }
 
 function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string, description?: string, pushEnabled?: boolean): void {
-  const agent = joinHeadlessAgent(db, swarm.id, name, description, { trackSession: true });
+  const host = detectHost();
+  const agent = joinHeadlessAgent(db, swarm.id, name, description, { trackSession: true, hostAgent: host });
   const parts: string[] = [`swarm: ${swarm.name}`, 'headless'];
 
   const surface = registerSurface(swarm.id, name, pushEnabled);
@@ -205,7 +225,6 @@ function joinAsHeadless(db: ReturnType<typeof getDb>, swarm: Swarm, name: string
     }
   }
 
-  const host = detectHost();
   if (host) {
     installHook(host, name, swarm.id, swarm.name);
     parts.push(`${host} hook`);
@@ -331,6 +350,13 @@ async function main() {
           console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--force] [--swarm <name>]');
           process.exit(1);
         }
+        try {
+          // Machine-local reserved list (~/.swarm/reserved-names) — never baked into the repo.
+          assertNameNotReserved(name);
+        } catch (err: any) {
+          console.error(err.message);
+          process.exit(1);
+        }
         const headless = hasFlag('--headless');
         const pushEnabled = hasFlag('--push');
         const force = hasFlag('--force');
@@ -360,9 +386,19 @@ async function main() {
           if (!surfaceId) {
             joinAsHeadless(db, swarm, name, description, pushEnabled);
           } else {
-            const agent = joinAgent(db, swarm.id, name, surfaceId, workspaceId, process.ppid, description);
+            const host = detectHost();
+            const agent = joinAgent(
+              db, swarm.id, name, surfaceId, workspaceId, process.ppid,
+              description, 'cmux', undefined, host
+            );
             renameTab(surfaceId, `${swarm.name}/${name}`, workspaceId);
-            console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (surface: ${agent.surface_id})`);
+            // Refresh host session files (critical for Codex: stale
+            // ~/.codex/swarm-session.md otherwise points at a previous agent name).
+            if (host) {
+              try { installHook(host, name, swarm.id, swarm.name); } catch { /* non-fatal */ }
+            }
+            const hostLabel = host ? ` [${host}]` : '';
+            console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (surface: ${agent.surface_id})${hostLabel}`);
           }
         }
         break;
@@ -391,6 +427,10 @@ async function main() {
           console.error('Usage: swarm register-a2a <name> --endpoint <url> [--description <text>] [--force] [--swarm <name>]');
           process.exit(1);
         }
+        // Model-name policy applies to A2A identities too, but NOT the machine-local
+        // reserved list — that list exists to hold names FOR remote A2A identities
+        // (see reserved-names.ts), so registration is how a reserved name gets claimed.
+        assertNotModelName(name);
 
         let parsedUrl: URL;
         try {
@@ -480,19 +520,63 @@ async function main() {
         break;
       }
 
+      case 'serve': {
+        const db = getDb();
+        let name = getFlag('--name');
+        let swarm: Swarm;
+        if (name) {
+          swarm = resolveSelectedSwarm(db);
+        } else {
+          const ctx = requireSelf();
+          name = ctx.self.name;
+          swarm = ctx.swarm;
+        }
+        if (!getAgent(db, swarm.id, name)) {
+          console.warn(`Warning: no agent named "${name}" in swarm "${swarm.name}" — incoming messages will queue in the inbox anyway, but join first so you can read them as yourself.`);
+        }
+        const port = parseInt(getFlag('--port') ?? '18790', 10);
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+          console.error(`Invalid --port: ${getFlag('--port')}`);
+          process.exit(1);
+        }
+        const bind = getFlag('--bind') ?? '0.0.0.0';
+        const advertiseHost = getFlag('--advertise-host') ?? detectAdvertiseHost();
+        const advertiseUrl = getFlag('--advertise') ?? `http://${advertiseHost}:${port}/`;
+        await startA2AServer({
+          db,
+          swarmId: swarm.id,
+          swarmName: swarm.name,
+          agentName: name,
+          port,
+          bind,
+          advertiseUrl,
+          description: getFlag('--description'),
+        });
+        console.log(`A2A server for "${name}" (swarm "${swarm.name}") listening on ${bind}:${port}`);
+        console.log(`Agent card: ${advertiseUrl.replace(/\/$/, '')}/.well-known/agent-card.json`);
+        console.log(`Register from a remote machine with:`);
+        console.log(`  swarm register-a2a ${name} --endpoint ${advertiseUrl.replace(/\/$/, '')}`);
+        // Keep serving until killed.
+        await new Promise(() => {});
+        break;
+      }
+
       case 'send': {
         const { db, self } = requireSelf();
-        const targetName = args[1];
-        const message = args.slice(2).join(' ');
+        // Flags may appear anywhere before/among free-text; strip them from the body.
+        const interject = hasFlag('--interject') || hasFlag('--now');
+        const tokens = args.slice(1).filter(a => a !== '--interject' && a !== '--now');
+        const targetName = tokens[0];
+        const message = tokens.slice(1).join(' ');
         if (!targetName || !message) {
-          console.error('Usage: swarm send <agent> <message>');
+          console.error('Usage: swarm send <agent> <message> [--interject|--now]');
           process.exit(1);
         }
         if (targetName.toLowerCase() === self.name.toLowerCase()) {
           console.error('Cannot send a message to yourself.');
           process.exit(1);
         }
-        const result = await sendMessage(db, self.swarm_id, self.name, targetName, message);
+        const result = await sendMessage(db, self.swarm_id, self.name, targetName, message, { interject });
         console.log(result.message);
         // Push failed → the recipient may be idle with no upcoming turn to poll
         // the inbox. A detached worker retries the push on a backoff schedule.
@@ -502,12 +586,13 @@ async function main() {
 
       case 'broadcast': {
         const { db, self } = requireSelf();
-        const message = args.slice(1).join(' ');
+        const interject = hasFlag('--interject') || hasFlag('--now');
+        const message = args.slice(1).filter(a => a !== '--interject' && a !== '--now').join(' ');
         if (!message) {
-          console.error('Usage: swarm broadcast <message>');
+          console.error('Usage: swarm broadcast <message> [--interject|--now]');
           process.exit(1);
         }
-        const result = await broadcastMessage(db, self.swarm_id, self.name, message);
+        const result = await broadcastMessage(db, self.swarm_id, self.name, message, { interject });
         const reached = result.sent + result.queued;
         let line = `Broadcast to ${reached} agent(s)`;
         if (result.queued > 0) line += ` (${result.queued} via inbox)`;
@@ -521,6 +606,8 @@ async function main() {
 
       case 'inbox': {
         const { db, self } = requireSelf();
+        // --unread: common agent habit; same as default (show unread, advance cursor).
+        // --peek: show without advancing.
         const peek = hasFlag('--peek');
         const messages = getInbox(db, self.swarm_id, self.name, peek);
         if (messages.length === 0) {
@@ -548,7 +635,12 @@ async function main() {
           for (const agent of agents) {
             const you = self && agent.name.toLowerCase() === self.name.toLowerCase() ? ' (you)' : '';
             const desc = agent.description ? ` — ${agent.description}` : '';
-            const type = agent.agent_type === 'a2a' ? ` [a2a] @ ${agent.endpoint_url}` : agent.agent_type === 'headless' ? ' [headless]' : ' [cmux]';
+            const host = agent.host_agent ? `/${agent.host_agent}` : '';
+            const type = agent.agent_type === 'a2a'
+              ? ` [a2a] @ ${agent.endpoint_url}`
+              : agent.agent_type === 'headless'
+                ? ` [headless${host}]`
+                : ` [cmux${host}]`;
             console.log(`  ${agent.name}${type}${you}${desc}`);
           }
           console.log(`\n${agents.length} agent(s)`);
@@ -586,6 +678,7 @@ async function main() {
         console.log(`Swarm: ${swarm.name}`);
         console.log(`Swarm ID: ${self.swarm_id}`);
         console.log(`Type: ${self.agent_type}`);
+        if (self.host_agent) console.log(`Host: ${self.host_agent}`);
         console.log(`Surface: ${self.surface_id}`);
         console.log(`Workspace: ${self.workspace_id ?? 'N/A'}`);
         console.log(`Joined: ${self.joined_at}`);
@@ -634,6 +727,8 @@ async function main() {
 
         let agentCmd: string;
         let agentLabel: string;
+        // Agents that receive join instructions as their initial prompt (no post-spawn /join-swarm).
+        let joinViaPrompt = false;
         if (agentFlag === 'claude') {
           agentCmd = autonomous ? 'claude --dangerously-skip-permissions' : 'claude';
           agentLabel = 'Claude Code';
@@ -661,8 +756,23 @@ async function main() {
             : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
           agentCmd = `codex --cd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
           agentLabel = 'Codex CLI';
+          joinViaPrompt = true;
+        } else if (agentFlag === 'grok') {
+          // Grok CLI: pass join as the initial TUI prompt (positional [PROMPT]),
+          // same reliability pattern as Codex. Skills install provides /join-swarm
+          // for interactive use, but spawn shouldn't depend on TUI boot timing.
+          const absoluteCwd = path.resolve(cwd);
+          const perms = autonomous ? ' --always-approve' : '';
+          const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
+          const swarmFlag = `--swarm ${swarm.name}`;
+          const joinInstruction = name
+            ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
+            : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
+          agentCmd = `grok --cwd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
+          agentLabel = 'Grok CLI';
+          joinViaPrompt = true;
         } else {
-          console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex.`);
+          console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex, grok.`);
           process.exit(1);
         }
 
@@ -688,7 +798,7 @@ async function main() {
           if (agentFlag === 'claude' && name) {
             warpCommand = `swarm join ${shellQuote(name)} --swarm ${shellQuote(swarm.name)}${pushFlag} && exec ${agentCmd}`;
             willAutoJoin = true;
-          } else if (agentFlag === 'codex') {
+          } else if (joinViaPrompt) {
             warpCommand = agentCmd;
             willAutoJoin = true;
           } else {
@@ -770,8 +880,8 @@ async function main() {
         const location = spawnedInCurrentWorkspace ? 'new tab' : 'new workspace';
         console.log(`Spawned new ${agentLabel} session in ${cwd} (${location}: ${result.workspaceRef ?? 'current workspace'}, ${result.surfaceRef})`);
 
-        if (agentFlag === 'codex') {
-          console.log('Codex received the join instructions as its initial prompt.');
+        if (joinViaPrompt) {
+          console.log(`${agentLabel} received the join instructions as its initial prompt.`);
           break;
         }
 

@@ -31,7 +31,7 @@ import {
   updateStatus,
   updateWorkspace,
 } from './registry.js';
-import { sendMessage, broadcastMessage, getInbox } from './mailbox.js';
+import { sendMessage, broadcastMessage, getInbox, getRecentMessages } from './mailbox.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
@@ -165,8 +165,9 @@ Communication:
                                                      default single Enter queues mid-turn
   swarm broadcast <message>                        Send to all agents in the current swarm
     [--interject|--now]
-  swarm inbox [--peek|--unread]                    Read pending messages
-                                                     (--unread is an alias; --peek does not advance cursor)
+  swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
+                                                     (--unread is an alias; --peek does not advance cursor;
+                                                      --recent N replays last N regardless of cursor)
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Status:
@@ -608,6 +609,24 @@ async function main() {
         const { db, self } = requireSelf();
         // --unread: common agent habit; same as default (show unread, advance cursor).
         // --peek: show without advancing.
+        // --recent [N]: replay last N messages (default 10) IGNORING the read
+        // cursor, never advancing it — recovers messages the awareness hook
+        // already consumed (agents otherwise stall on "empty inbox").
+        if (hasFlag('--recent')) {
+          const limitRaw = getFlag('--recent');
+          const limit = limitRaw && /^\d+$/.test(limitRaw) ? parseInt(limitRaw, 10) : 10;
+          const recent = getRecentMessages(db, self.swarm_id, self.name, limit);
+          if (recent.length === 0) {
+            console.log('No messages on record.');
+          } else {
+            for (const msg of recent) {
+              const time = new Date(msg.created_at).toLocaleTimeString();
+              console.log(`[${time}] ${msg.from_agent}: ${msg.body}`);
+            }
+            console.log(`\n${recent.length} recent message(s) (replay — cursor unchanged)`);
+          }
+          break;
+        }
         const peek = hasFlag('--peek');
         const messages = getInbox(db, self.swarm_id, self.name, peek);
         if (messages.length === 0) {

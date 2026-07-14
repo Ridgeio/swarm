@@ -137,3 +137,28 @@ export function getInbox(
 
   return messages;
 }
+
+/**
+ * Replay the last N messages addressed to this agent REGARDLESS of the read
+ * cursor, never advancing it. Exists because the awareness hook consumes
+ * messages into a turn's context (advancing the cursor) — an agent that missed
+ * the hook output then sees an empty `swarm inbox` and stalls on stale state
+ * (field-observed three times on 2026-07-14). `swarm inbox --recent` gives
+ * agents a way to re-read what the hook already consumed.
+ */
+export function getRecentMessages(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  limit: number = 10
+): Message[] {
+  const messages = db.prepare(`
+    SELECT * FROM messages
+    WHERE swarm_id = ?
+      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND from_agent != ? COLLATE NOCASE
+    ORDER BY id DESC
+    LIMIT ?
+  `).all(swarmId, agentName, agentName, limit) as Message[];
+  return messages.reverse();
+}

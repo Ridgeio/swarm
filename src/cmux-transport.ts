@@ -1,5 +1,5 @@
 import { Transport, TransportAgent, TransportDeliveryResult, DeliveryOptions } from './transport-interface.js';
-import { sendToSurface, notifySurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
+import { sendToSurface, notifySurface, readScreen, SurfaceGoneError, isSurfaceAlive } from './transport.js';
 
 // A keystroke push is reliable only for a single short send. Typing a long,
 // multi-chunk message into a live Claude Code TUI silently drops chunks (the
@@ -40,6 +40,19 @@ export function prefersNotifyDelivery(hostAgent: string | null | undefined, opti
   return hostAgent === 'codex';
 }
 
+/**
+ * A cmux notification alone does NOT wake an idle Codex agent — nothing starts
+ * a turn, so the message sits queued until a human prompts the TUI (field-
+ * observed 2026-07-14: assignments went undelivered until Tom manually nudged).
+ * Keystroke injection is only dangerous MID-turn (pickers, queued input); when
+ * the composer is idle, typing a one-line nudge + Enter is safe and starts a
+ * turn whose awareness hook reads the inbox. Discriminator: Codex renders
+ * "esc to interrupt" on its status line for the entire duration of a turn.
+ */
+export function isCodexScreenIdle(screen: string): boolean {
+  return !/esc to interrupt/i.test(screen);
+}
+
 export class CmuxTransport implements Transport {
   async deliverMessage(
     agent: TransportAgent,
@@ -62,6 +75,18 @@ export class CmuxTransport implements Transport {
           `${pushText} — run: swarm inbox`,
           agent.workspace_id
         );
+        // The notification alone can't wake an idle Codex agent (no turn starts).
+        // If the surface looks idle, follow with a one-line keystroke nudge to
+        // start a turn; if it's mid-turn (or the read fails), the notify + the
+        // agent's own task-boundary inbox checks cover it.
+        try {
+          const screen = readScreen(agent.surface_id, 30, agent.workspace_id);
+          if (isCodexScreenIdle(screen)) {
+            sendToSurface(agent.surface_id, pushText, agent.workspace_id, { enterCount: 1 });
+          }
+        } catch {
+          // Best-effort wake only — notify already succeeded, message is queued.
+        }
         return { delivered: true };
       }
 

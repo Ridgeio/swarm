@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { isTransientCmuxError } from '../src/transport.js';
-import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
+import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, isCodexScreenIdle, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
 
 // The transient/gone classification decides whether a failed cmux send is retried
 // (busy surface) or treated as a dead surface (which lets cleanupStale prune the
@@ -94,6 +94,20 @@ describe('buildPushText (single-chunk push, nudge for long messages)', () => {
     assert.strictEqual(prefersNotifyDelivery('grok'), false);
     assert.strictEqual(prefersNotifyDelivery('claude-code'), false);
     assert.strictEqual(prefersNotifyDelivery(null), false);
+  });
+
+  test('Codex idle detection keys off the "esc to interrupt" turn indicator', () => {
+    // Mid-turn: status line shows the interrupt hint for the whole turn.
+    assert.strictEqual(
+      isCodexScreenIdle('• Working (49s • esc to interrupt) · 1 background terminal\n\n› Implement {feature}'),
+      false
+    );
+    // Idle composer: no interrupt hint anywhere on screen.
+    assert.strictEqual(
+      isCodexScreenIdle('─ Worked for 53m 07s ─────\n\n› Implement {feature}\n\n  gpt-5.6-sol xhigh'),
+      true
+    );
+    assert.strictEqual(isCodexScreenIdle(''), true);
   });
 
   test('a long message with no parseable sender still nudges within one chunk', () => {

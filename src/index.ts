@@ -32,6 +32,7 @@ import {
   updateWorkspace,
 } from './registry.js';
 import { sendMessage, broadcastMessage, getInbox, getRecentMessages } from './mailbox.js';
+import { getFleetStats, formatFleetStats } from './stats.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
@@ -174,6 +175,9 @@ Status:
   swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
+  swarm stats [--hours <N>]                        Fleet messaging metrics (default 24h):
+                                                     direct/broadcast split, est. reads,
+                                                     ack ratio, per-agent traffic, top pairs
 
 Local Agents:
   swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
@@ -688,6 +692,17 @@ async function main() {
           const { self } = requireSelf();
           console.log(`${self.name}: ${self.description ?? '(no status set)'}`);
         }
+        break;
+      }
+
+      case 'stats': {
+        const db = getDb();
+        const swarm = resolveSelectedSwarm(db);
+        const hoursRaw = getFlag('--hours');
+        const hours = hoursRaw && /^\d+$/.test(hoursRaw) ? parseInt(hoursRaw, 10) : 24;
+        const activeAgents = listAgentsSync(db, swarm.id).length;
+        const stats = getFleetStats(db, swarm.id, hours, activeAgents);
+        console.log(formatFleetStats(stats));
         break;
       }
 

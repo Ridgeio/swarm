@@ -53,3 +53,43 @@ not one-off cleanups: a standing, instrumented practice.
 - **The loop applies to itself.** If the review cadence or this process
   wastes more than it saves, that is itself a finding — log it and change
   the process.
+
+## Self-pruning and self-tuning via Mixture-of-Agents (Tom, 2026-07-17)
+
+The swarm maintains itself: pruning (retiring idle/zombie agents, closing
+stale lanes, releasing unused reservations, deleting dead worktrees/branches)
+and tuning (stall thresholds, digest cadence, reviewer mappings, model
+routing, protocol rules). These decisions have LONG-TAIL effects on all
+future work, so no single agent — including the lead — decides them alone.
+They go through a Mixture-of-Agents (MoA) process.
+
+### The MoA panel
+
+- **Composition**: 3–5 members with deliberately mixed roles AND mixed model
+  types (per docs/model-routing.md — model diversity is where the mixture
+  earns its name): typically PM + one builder + one reviewer + one QA, lead
+  as chair. For PRUNING decisions, the affected agent's own vote is excluded
+  and at least one panelist must be a fresh (workflow-spawned) judge with no
+  social context — incumbents are structurally biased toward keeping lanes
+  alive.
+- **Process**: each panelist writes an INDEPENDENT position first (no
+  cross-reads before positions are filed), grounded in instrument data
+  (`swarm stats`, experiments.md, lane outcomes) — then synthesis by the
+  chair, then the lead ratifies. Disagreement between the synthesis and any
+  panelist's position is recorded, not smoothed over.
+- **Inputs are measurements, not vibes**: stall telemetry, message/ack
+  ratios, gate latency, lane throughput, model-routing field results,
+  reservation usage. A proposal without instrument evidence is returned.
+
+### Cadence — regular and intelligent
+
+- **Regular**: at every phase boundary (squeeze release, program completion)
+  and at least weekly during active sprints — same clock as the periodic
+  orchestration review and the Arena refresh.
+- **Intelligent**: never mid-squeeze (convergence phases freeze structure);
+  triggered EARLY by instrument signals (repeated stall flags on the same
+  agent, ack-ratio regression, a lane idle across two reviews) rather than
+  waiting for the calendar.
+- Every MoA decision gets an experiments.md entry: what changed, the
+  measured rationale, and the metric that will confirm or refute it by the
+  next review — so tuning itself stays inside the auto-research loop.

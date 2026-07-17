@@ -742,6 +742,11 @@ async function main() {
       }
 
       case 'spawn': {
+        // `swarm spawn --help` must not spawn a tab (it once did).
+        if (hasFlag('--help') || hasFlag('-h')) {
+          printHelp();
+          break;
+        }
         const db = getDb();
         const swarm = resolveSelectedSwarm(db, true);
         const name = getFlag('--name');

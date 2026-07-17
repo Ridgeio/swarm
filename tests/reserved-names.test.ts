@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { assertNameNotReserved, loadReservedNames } from '../src/reserved-names.js';
+import { assertNameNotReserved, assertValidAgentName, loadReservedNames } from '../src/reserved-names.js';
 
 const ORIGINAL_HOME = process.env.HOME;
 const ORIGINAL_ENV = process.env.SWARM_RESERVED_NAMES;
@@ -66,6 +66,24 @@ describe('model-name policy', () => {
 
     for (const ok of ['Scribe', 'Rivet', 'Yulan', 'Pixel2', 'Sol', 'Brillo']) {
       assert.doesNotThrow(() => assertNameNotReserved(ok), ok);
+    }
+  });
+});
+
+describe('flag-like agent names', () => {
+  test('rejects names that look like flags (the swarm join --help incident)', () => {
+    delete process.env.SWARM_RESERVED_NAMES;
+    delete process.env.SWARM_RESERVED_NAMES_FILE;
+    process.env.HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-reserved-'));
+
+    for (const bad of ['--help', '-h', '--force', '-x', '']) {
+      assert.throws(() => assertNameNotReserved(bad), /not a valid agent name|looks like a flag/i, JSON.stringify(bad));
+    }
+  });
+
+  test('assertValidAgentName passes ordinary names through', () => {
+    for (const ok of ['Pixel', 'a', 'name-with-dash-inside']) {
+      assert.doesNotThrow(() => assertValidAgentName(ok), ok);
     }
   });
 });

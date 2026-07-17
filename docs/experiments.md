@@ -59,3 +59,19 @@ Template:
   misfiled. (Needs CLI feature from the backlog first.)
 - Notification targeting removes phantom-alert hunts entirely → zero
   receipt-check round-trips; guard: no missed real notifications.
+
+## EXP-001 follow-up measurement (2026-07-16 late evening)
+- Window: 6h post-org-adoption (20:48–02:48Z), `swarm stats --hours 6`.
+- Ack-like ratio: **22% → 14%** vs the transition-spanning baseline; broadcasts
+  3/759 (<1%). Volume steady (~750/6h) — the fleet talks as much, but more of
+  it is information.
+- Topology fully inverted per design: busiest pairs are now builder→Atlas
+  (Foreman→Atlas 47, Ledger→Atlas 41, Usher→Atlas 36); the lead appears in no
+  top pair (was #1: Foreman→Yulan 43). Digest absorption is working.
+- NEW WATCH ITEM → next hypothesis: Atlas received 259 msgs/6h (2× the top
+  builder). PM saturation is now the system's most likely failure point.
+  Candidate EXP: deputy PM or per-lane sub-digests when Atlas receive-rate
+  exceeds ~50/h sustained. Deputy authorization already exists (Tom).
+- Also observed live: provenance challenge worked (Atlas refused to assign an
+  unannounced agent until the lead confirmed it) — codify "new agents are
+  announced by lead before first assignment" in the org doc next revision.

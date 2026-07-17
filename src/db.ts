@@ -89,6 +89,7 @@ function createCurrentTables(db: Database.Database): void {
       body TEXT NOT NULL,
       delivered INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
+      kind TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
     );
 
@@ -235,12 +236,28 @@ function migrateInboxCursors(db: Database.Database): void {
   })();
 }
 
+// messages.kind — nullable classification tag (status | digest | merge-req | ...).
+// Additive nullable column, so the lighter guard pattern applies (no table rebuild):
+// inspect PRAGMA table_info and ALTER TABLE ADD COLUMN only when absent. Idempotent,
+// and tolerant in both directions across the A2A bridge: older builds name their
+// INSERT columns explicitly (the new column defaults to NULL) and ignore the extra
+// field on SELECT *, while this build sees NULL kinds from rows older builds wrote.
+// Runs AFTER migrateMessages so a legacy table rebuilt there also gains the column.
+function ensureMessageKindColumn(db: Database.Database): void {
+  if (!tableExists(db, 'messages')) return;
+  const columns = tableColumns(db, 'messages');
+  if (!columns.has('kind')) {
+    db.exec('ALTER TABLE messages ADD COLUMN kind TEXT');
+  }
+}
+
 function migrate(db: Database.Database): void {
   createSwarmsTable(db);
   createCurrentTables(db);
   migrateAgents(db);
   migrateMessages(db);
   migrateInboxCursors(db);
+  ensureMessageKindColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);

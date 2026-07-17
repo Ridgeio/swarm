@@ -90,3 +90,20 @@ Template:
   from accidental to systematic. Watch false-positive rate over next days.
 - Decision: merged. Companion doctrine in orchestration.md (phase squeeze,
   zombie protocol, positive-evidence completion) from the MAP-CCS review.
+
+## EXP-005 — Messaging dividends: multi-send, kinds, cursor clarity   [status: merged]
+- Date opened / closed: 2026-07-17 / 2026-07-17
+- Hypothesis: at ~640 msgs/3h fleet volume, (a) multi-recipient send removes
+  the last legitimate broadcast temptation and PM repeat-sends, (b) kind
+  tagging lets gate traffic (--kind merge-req/gate) never drown in status,
+  (c) cursor-clarity output kills receipt-check round-trips entirely.
+- Guard metric: zero delivery-path regressions (adversarially verified:
+  push/notify byte-identical when flags unused).
+- Change: swarm send A,B,C; --kind on send/broadcast + inbox --kind filter
+  (cursor never advances on filtered reads — enforced in mailbox library);
+  empty-inbox output explains the cursor and points at --recent.
+- Built via build+adversarial-verify workflow (worktree isolation); SHIP
+  verdict, 127/127 tests (16 new), two disclosed LOW findings accepted
+  (flag-token stripping matches --interject convention; peek-zero hint line).
+- Measure by next review: broadcast count (expect ~0), receipt-check
+  round-trips (expect 0), Atlas repeat-send pairs, gate-message latency.

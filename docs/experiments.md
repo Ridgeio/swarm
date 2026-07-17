@@ -75,3 +75,18 @@ Template:
 - Also observed live: provenance challenge worked (Atlas refused to assign an
   unannounced agent until the lead confirmed it) — codify "new agents are
   announced by lead before first assignment" in the org doc next revision.
+
+## EXP-004 — Stall telemetry in `swarm stats`   [status: merged]
+- Date opened / closed: 2026-07-17 / 2026-07-17
+- Hypothesis: surfacing send-recency + unanswered-inbound per agent detects
+  zombie/ack-looped agents before they cost critical-path hours (the Foreman
+  ack-loop cost ~1h of 015 time and was noticed by accident).
+- Guard metric: false-positive rate low enough that flags stay meaningful
+  (threshold 45min; requires unanswered inbound, not mere silence).
+- Change: `swarm stats` gains POSSIBLE STALLS section (src/stats.ts;
+  all-time send recency + inbound-after-last-send).
+- Result: first live run flagged 2 candidates (Herald 58min/8 inbound,
+  Rivet 46min/5) — both routed to PM for surface checks. Detection went
+  from accidental to systematic. Watch false-positive rate over next days.
+- Decision: merged. Companion doctrine in orchestration.md (phase squeeze,
+  zombie protocol, positive-evidence completion) from the MAP-CCS review.

@@ -90,3 +90,50 @@ describe('fleet stats', () => {
     assert.strictEqual(stats.topPairs.length, 2);
   });
 });
+
+describe('stall telemetry', () => {
+  beforeEach(() => {
+    dbPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-stats-')), 'swarm.db');
+    db = getDbAt(dbPath);
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(path.dirname(dbPath), { recursive: true, force: true });
+  });
+
+  test('flags a silent agent with unanswered inbound; ignores active agents', () => {
+    const now = Date.now();
+    const old = new Date(now - 90 * 60_000).toISOString();   // bob last sent 90min ago
+    const fresh = new Date(now - 5 * 60_000).toISOString();
+    insertMessage('bob', 'alice', 'last thing bob ever said', old);
+    insertMessage('alice', 'bob', 'are you there?', fresh);
+    insertMessage('alice', 'bob', 'hello?', fresh);
+    insertMessage('alice', 'carol', 'carol is fine', fresh);
+    insertMessage('carol', 'alice', 'yes I am', fresh);
+
+    const stats = getFleetStats(db, SWARM_ID, 24, ['alice', 'bob', 'carol'], now);
+    assert.strictEqual(stats.possibleStalls.length, 1);
+    assert.strictEqual(stats.possibleStalls[0].agent, 'bob');
+    assert.strictEqual(stats.possibleStalls[0].inboundSinceLastSend, 2);
+    assert.ok(stats.possibleStalls[0].minutesSinceLastSend >= 89);
+    assert.match(formatFleetStats(stats), /POSSIBLE STALLS/);
+  });
+
+  test('flags a registered agent that never sent but has inbound', () => {
+    const now = Date.now();
+    insertMessage('alice', 'ghost', 'assignment for ghost', new Date(now - 60 * 60_000).toISOString());
+    const stats = getFleetStats(db, SWARM_ID, 24, ['alice', 'ghost'], now);
+    const ghost = stats.possibleStalls.find((s) => s.agent === 'ghost');
+    assert.ok(ghost);
+    assert.strictEqual(ghost.minutesSinceLastSend, Infinity);
+    assert.strictEqual(ghost.inboundSinceLastSend, 1);
+  });
+
+  test('numeric activeAgents arg keeps fanout math and skips stall telemetry', () => {
+    insertMessage('a', null, 'broadcast');
+    const stats = getFleetStats(db, SWARM_ID, 24, 4);
+    assert.strictEqual(stats.estimatedReads, 3);
+    assert.deepStrictEqual(stats.possibleStalls, []);
+  });
+});

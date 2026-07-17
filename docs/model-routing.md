@@ -10,7 +10,13 @@ production.
 1. **Field bench** — our own task outcomes (e.g. the fable-subagent bench;
    this sprint's per-lane performance). Outcome-based beats preference-based.
 2. **Arena.ai leaderboards** — refreshed periodically (see cadence below).
-   Preference-vote Elo; wide ±CI means unstable rank (young model).
+   Treat with calibrated skepticism (Tom, 2026-07-17: "not sure how much
+   they're to be trusted, but worth considering"): preference-vote Elo
+   measures what raters LIKE, not task success — it is style-biased,
+   gameable by labs tuning for votes, and blind to harness/duration effects
+   that dominate real agent work. A wide ±CI means unstable rank (young
+   model). Arena is a tiebreaker and a drift detector, never a decider
+   against field results.
 3. **Cost/harness fit** — a model's CLI harness matters as much as the model
    (repo tooling, session durability, rate-limit exposure).
 

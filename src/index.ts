@@ -700,7 +700,7 @@ async function main() {
         const swarm = resolveSelectedSwarm(db);
         const hoursRaw = getFlag('--hours');
         const hours = hoursRaw && /^\d+$/.test(hoursRaw) ? parseInt(hoursRaw, 10) : 24;
-        const activeAgents = listAgentsSync(db, swarm.id).length;
+        const activeAgents = listAgentsSync(db, swarm.id).map((a) => a.name);
         const stats = getFleetStats(db, swarm.id, hours, activeAgents);
         console.log(formatFleetStats(stats));
         break;

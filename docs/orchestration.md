@@ -151,3 +151,63 @@ lead audits: message counts per agent per day, broadcast/DM ratio,
 ack-to-information ratio, gate latency (condition-true → gate-acted), and
 blocked-time per lane. Fold findings back into this doc — patterns that
 survive two programs graduate from "discipline" to CLI features.
+
+## Phase discipline: exploration → merge-validation squeeze
+
+(Distilled 2026-07-17 from live GA-endgame operation, cross-checked against
+the MAP-CCS "CEO-Specialist" swarm design notes Tom shared. Most of that
+spec's GPU-cluster machinery doesn't apply to a CLI fleet, but four of its
+control ideas mapped cleanly onto problems we had already hit.)
+
+A fleet's rules must change with project phase. What is virtue early is
+vice late:
+
+| Parameter        | Early (exploration)                | Late (squeeze)                     |
+|------------------|-----------------------------------|------------------------------------|
+| New lanes/tickets| Encouraged (find the unknowns)    | Banned except completion-set defects |
+| Concurrency      | Maximize independent lanes        | Converge on the completion set     |
+| Reviewer focus   | Breadth across lanes              | Completion-set SHAs first          |
+| Lead's job       | Arbitrate scope                   | Gate throughput (merge/apply/promote) |
+| Success metric   | Defects found before customers    | The end-to-end outcome demo        |
+
+Declare the squeeze EXPLICITLY (broadcast) with a named, finite completion
+set — "these N things, then we release the squeeze." An undeclared endgame
+leaves agents optimizing exploration rewards (new tickets, new lanes) when
+the system needs convergence. This is MAP-CCS's "decay scheduling" made
+manual: we don't decay reward weights, we declare the phase and change the
+rules.
+
+## Zombie agents: detection and the captive-work hazard
+
+Field case (2026-07-17): a builder's harness entered an ack-only loop —
+every inbound message consumed an execution turn producing an ack, so
+NUDGING A STUCK AGENT MAKES IT WORSE. Meanwhile its critical-path commit
+existed only in its local worktree: invisible to the fleet, captive to a
+dead session.
+
+Protocol, in order:
+1. **Detect**: `swarm stats` flags possible stalls (silent >45min with
+   unanswered inbound). Positive evidence of progress (pushed refs, files
+   changing) beats liveness heuristics — an agent that acks is alive but
+   not necessarily working (MAP-CCS calls this reward hacking; an ack IS
+   the pseudo-task).
+2. **Quiet zone**: STOP messaging the agent fleet-wide; route its traffic
+   through the PM for post-recovery batching. One watcher only.
+3. **De-risk the work first, the agent second**: push its worktree branch
+   to origin from outside the session (worktrees are on disk; pushing
+   needs no session cooperation). Standing rule: **work exists when it's
+   pushed** — a commit only in a local worktree is a zombie artifact.
+4. **Time-boxed contingency**: pre-name the reassignment target (deepest
+   context first) and the window. When the window expires, EXECUTE —
+   don't extend silently. Recovered agents rejoin as reviewers, not owners.
+
+## Completion validation: positive evidence only
+
+Two field cases converged on one rule. The Codex idle-detector bug (phantom
+nudges) was fixed by requiring positive evidence of idleness instead of
+absence-of-busy-markers. The compliance-claim failure (a "rules applied"
+statement in a MERGE-REQ that the rendered page falsified) is the same bug
+in human form. Rule: a completion claim must carry the evidence that would
+falsify it — rendered-output scans for copy rules, pushed refs for commits,
+row counts for migrations, screenshots for UI. "I did X" without the
+artifact is an ack, not a fact.

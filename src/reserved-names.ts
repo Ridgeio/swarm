@@ -74,7 +74,21 @@ export function assertNotModelName(name: string): void {
   }
 }
 
+/**
+ * A name that starts with "-" is almost always a flag that fell through to
+ * the positional slot (`swarm join --help` once registered an agent literally
+ * named "--help", clobbering a real registration on the same surface).
+ */
+export function assertValidAgentName(name: string): void {
+  if (!name || name.startsWith('-')) {
+    throw new Error(
+      `"${name}" is not a valid agent name (looks like a flag). For usage, run: swarm help`
+    );
+  }
+}
+
 export function assertNameNotReserved(name: string): void {
+  assertValidAgentName(name);
   assertNotModelName(name);
   const reserved = loadReservedNames();
   if (reserved.has(name.toLowerCase())) {

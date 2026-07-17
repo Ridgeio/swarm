@@ -31,7 +31,7 @@ import {
   updateStatus,
   updateWorkspace,
 } from './registry.js';
-import { sendMessage, broadcastMessage, getInbox, getRecentMessages } from './mailbox.js';
+import { sendMessage, broadcastMessage, getInbox, getRecentMessages, countRecentMessages, MESSAGE_KINDS } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
 import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
@@ -57,6 +57,19 @@ function getFlag(flag: string): string | undefined {
 
 function hasFlag(flag: string): boolean {
   return args.includes(flag);
+}
+
+// Resolve and validate the optional --kind flag. Unknown kinds are a usage error:
+// a typo'd kind would store an unfilterable message and silently defeat --kind reads.
+function requireValidKind(usage: string): string | undefined {
+  if (!hasFlag('--kind')) return undefined;
+  const kind = getFlag('--kind');
+  if (!kind || !(MESSAGE_KINDS as readonly string[]).includes(kind)) {
+    console.error(`Invalid --kind${kind ? ` "${kind}"` : ''}. Allowed: ${MESSAGE_KINDS.join(', ')}.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return kind;
 }
 
 function shellQuote(value: string): string {
@@ -161,14 +174,17 @@ Agent Management:
                                                      advertise Tailscale IPv4 when present
 
 Communication:
-  swarm send <agent> <message>                     Send message within the current swarm
-    [--interject|--now]                              Grok: force send-now (double Enter);
+  swarm send <agent>[,<agent>...] <message>        Send message within the current swarm
+    [--interject|--now]                              (comma-separated list sends to each);
+    [--kind <kind>]                                  Grok: force send-now (double Enter);
                                                      default single Enter queues mid-turn
   swarm broadcast <message>                        Send to all agents in the current swarm
-    [--interject|--now]
+    [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
+                                                      escalation, ack, gate)
   swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
-                                                     (--unread is an alias; --peek does not advance cursor;
-                                                      --recent N replays last N regardless of cursor)
+    [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
+                                                      --recent N replays last N regardless of cursor;
+                                                      --kind filters and never advances the cursor)
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Status:
@@ -291,7 +307,7 @@ function printHookContext(): void {
     ? ''
     : `\nNEW MESSAGES (respond to these):\n${inbox.map(msg => {
       const time = new Date(msg.created_at).toLocaleTimeString();
-      return `[${time}] ${msg.from_agent}: ${msg.body}`;
+      return `[${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
     }).join('\n')}`;
 
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
@@ -568,36 +584,76 @@ async function main() {
 
       case 'send': {
         const { db, self } = requireSelf();
+        const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>]';
         // Flags may appear anywhere before/among free-text; strip them from the body.
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const tokens = args.slice(1).filter(a => a !== '--interject' && a !== '--now');
+        const kind = requireValidKind(usage);
+        const rest = args.slice(1);
+        const tokens: string[] = [];
+        for (let i = 0; i < rest.length; i++) {
+          if (rest[i] === '--interject' || rest[i] === '--now') continue;
+          if (rest[i] === '--kind') { i++; continue; } // skip the flag and its value
+          tokens.push(rest[i]);
+        }
         const targetName = tokens[0];
         const message = tokens.slice(1).join(' ');
         if (!targetName || !message) {
-          console.error('Usage: swarm send <agent> <message> [--interject|--now]');
+          console.error(usage);
           process.exit(1);
         }
-        if (targetName.toLowerCase() === self.name.toLowerCase()) {
-          console.error('Cannot send a message to yourself.');
+        // Comma-separated multi-recipient: trim, drop empties, dedupe case-insensitively
+        // (getAgent resolves names case-insensitively, so "bob" and "Bob" are one target).
+        const recipients: string[] = [];
+        const seen = new Set<string>();
+        for (const raw of targetName.split(',')) {
+          const name = raw.trim();
+          if (!name || seen.has(name.toLowerCase())) continue;
+          seen.add(name.toLowerCase());
+          recipients.push(name);
+        }
+        if (recipients.length === 0) {
+          console.error(usage);
           process.exit(1);
         }
-        const result = await sendMessage(db, self.swarm_id, self.name, targetName, message, { interject });
-        console.log(result.message);
+        // Attempt every recipient even after a failure; exit nonzero if ANY failed.
+        let anyFailed = false;
+        let anyQueued = false;
+        for (const recipient of recipients) {
+          if (recipient.toLowerCase() === self.name.toLowerCase()) {
+            console.error('Cannot send a message to yourself.');
+            anyFailed = true;
+            continue;
+          }
+          const result = await sendMessage(db, self.swarm_id, self.name, recipient, message, { interject }, kind);
+          console.log(result.message);
+          if (!result.delivered && !result.queued) anyFailed = true;
+          if (result.queued) anyQueued = true;
+        }
         // Push failed → the recipient may be idle with no upcoming turn to poll
         // the inbox. A detached worker retries the push on a backoff schedule.
-        if (result.queued) spawnRedeliverWorker();
+        if (anyQueued) spawnRedeliverWorker();
+        if (anyFailed) process.exit(1);
         break;
       }
 
       case 'broadcast': {
         const { db, self } = requireSelf();
+        const usage = 'Usage: swarm broadcast <message> [--interject|--now] [--kind <kind>]';
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const message = args.slice(1).filter(a => a !== '--interject' && a !== '--now').join(' ');
+        const kind = requireValidKind(usage);
+        const rest = args.slice(1);
+        const tokens: string[] = [];
+        for (let i = 0; i < rest.length; i++) {
+          if (rest[i] === '--interject' || rest[i] === '--now') continue;
+          if (rest[i] === '--kind') { i++; continue; } // skip the flag and its value
+          tokens.push(rest[i]);
+        }
+        const message = tokens.join(' ');
         if (!message) {
-          console.error('Usage: swarm broadcast <message> [--interject|--now]');
+          console.error(usage);
           process.exit(1);
         }
-        const result = await broadcastMessage(db, self.swarm_id, self.name, message, { interject });
+        const result = await broadcastMessage(db, self.swarm_id, self.name, message, { interject }, kind);
         const reached = result.sent + result.queued;
         let line = `Broadcast to ${reached} agent(s)`;
         if (result.queued > 0) line += ` (${result.queued} via inbox)`;
@@ -611,36 +667,57 @@ async function main() {
 
       case 'inbox': {
         const { db, self } = requireSelf();
+        const usage = 'Usage: swarm inbox [--peek|--unread|--recent [N]] [--kind <kind>]';
         // --unread: common agent habit; same as default (show unread, advance cursor).
         // --peek: show without advancing.
         // --recent [N]: replay last N messages (default 10) IGNORING the read
         // cursor, never advancing it — recovers messages the awareness hook
         // already consumed (agents otherwise stall on "empty inbox").
+        // --kind <k>: show only messages of that kind. Filtered reads NEVER advance
+        // the cursor (they'd skip past unfiltered messages that were never shown).
+        const kind = requireValidKind(usage);
+        const kindPrefix = (msgKind: string | null) => msgKind ? `[${msgKind}] ` : '';
         if (hasFlag('--recent')) {
           const limitRaw = getFlag('--recent');
           const limit = limitRaw && /^\d+$/.test(limitRaw) ? parseInt(limitRaw, 10) : 10;
-          const recent = getRecentMessages(db, self.swarm_id, self.name, limit);
+          const recent = getRecentMessages(db, self.swarm_id, self.name, limit, kind);
           if (recent.length === 0) {
             console.log('No messages on record.');
           } else {
             for (const msg of recent) {
               const time = new Date(msg.created_at).toLocaleTimeString();
-              console.log(`[${time}] ${msg.from_agent}: ${msg.body}`);
+              console.log(`[${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}`);
             }
             console.log(`\n${recent.length} recent message(s) (replay — cursor unchanged)`);
           }
           break;
         }
         const peek = hasFlag('--peek');
-        const messages = getInbox(db, self.swarm_id, self.name, peek);
+        const messages = getInbox(db, self.swarm_id, self.name, peek || !!kind, kind);
         if (messages.length === 0) {
-          console.log('No new messages.');
+          if (kind) {
+            console.log(`No new "${kind}" messages (kind filter — cursor unchanged).`);
+          } else {
+            // Zero unread + recent traffic means the cursor already consumed the
+            // messages (often via the awareness hook); point at the recovery path
+            // instead of the misleading bare "No new messages."
+            const recentCount = countRecentMessages(db, self.swarm_id, self.name);
+            if (recentCount > 0) {
+              const n = Math.min(recentCount, 50);
+              console.log(`No new messages (read cursor is current). ${n} message(s) in the last 24h — replay with: swarm inbox --recent ${n}`);
+            } else {
+              console.log('No new messages.');
+            }
+          }
         } else {
           for (const msg of messages) {
             const time = new Date(msg.created_at).toLocaleTimeString();
-            console.log(`[${time}] ${msg.from_agent}: ${msg.body}`);
+            console.log(`[${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}`);
           }
-          console.log(`\n${messages.length} message(s)${peek ? ' (peek mode, not marked as read)' : ''}`);
+          const suffix = kind
+            ? ` (kind filter — cursor not advanced)`
+            : peek ? ' (peek mode, not marked as read)' : '';
+          console.log(`\n${messages.length} message(s)${suffix}`);
         }
         if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
         break;

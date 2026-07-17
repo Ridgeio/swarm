@@ -11,7 +11,13 @@ export interface Message {
   body: string;
   delivered: number;
   created_at: string;
+  kind: string | null;
 }
+
+// Allowed values for the optional message classification tag. Validated at the CLI
+// boundary (a typo'd kind would otherwise store an unfilterable message); storage
+// itself is a plain nullable TEXT column so builds with a different set stay readable.
+export const MESSAGE_KINDS = ['status', 'digest', 'merge-req', 'escalation', 'ack', 'gate'] as const;
 
 export async function sendMessage(
   db: Database.Database,
@@ -19,7 +25,8 @@ export async function sendMessage(
   fromName: string,
   toName: string,
   body: string,
-  options?: DeliveryOptions
+  options?: DeliveryOptions,
+  kind?: string | null
 ): Promise<{ delivered: boolean; queued: boolean; message: string }> {
   const target = getAgent(db, swarmId, toName);
   if (!target) {
@@ -34,8 +41,8 @@ export async function sendMessage(
   // raw sender-typed casing would make a case-mismatched message invisible to the
   // recipient's inbox while still reporting success.
   const result = db.prepare(
-    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, ?, 0, ?)'
-  ).run(swarmId, fromName, target.name, body, now);
+    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, ?, ?, 0, ?, ?)'
+  ).run(swarmId, fromName, target.name, body, now, kind ?? null);
 
   const msgId = result.lastInsertRowid;
 
@@ -59,7 +66,8 @@ export async function broadcastMessage(
   swarmId: string,
   fromName: string,
   body: string,
-  options?: DeliveryOptions
+  options?: DeliveryOptions,
+  kind?: string | null
 ): Promise<{ sent: number; queued: number; failed: number }> {
   const agents = await listAgents(db, swarmId);
   const recipients = agents.filter(a => a.name !== fromName);
@@ -73,8 +81,8 @@ export async function broadcastMessage(
 
   // Insert message row first (one broadcast row, to_agent = NULL)
   const result = db.prepare(
-    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, NULL, ?, 0, ?)'
-  ).run(swarmId, fromName, body, now);
+    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, NULL, ?, 0, ?, ?)'
+  ).run(swarmId, fromName, body, now, kind ?? null);
 
   const msgId = result.lastInsertRowid;
 
@@ -109,7 +117,8 @@ export function getInbox(
   db: Database.Database,
   swarmId: string,
   agentName: string,
-  peek: boolean = false
+  peek: boolean = false,
+  kind?: string
 ): Message[] {
   // Get cursor
   const cursor = db.prepare('SELECT last_read_id FROM inbox_cursors WHERE swarm_id = ? AND agent_name = ?')
@@ -119,16 +128,23 @@ export function getInbox(
   // Fetch messages: direct messages to me + broadcasts, after cursor, not from me
   // Match names case-insensitively (agents register COLLATE NOCASE) so a message addressed
   // with non-canonical casing still lands, and an agent never sees its own messages.
+  const params: (string | number)[] = [swarmId, agentName, agentName, lastReadId];
+  if (kind) params.push(kind);
   const messages = db.prepare(`
     SELECT * FROM messages
     WHERE swarm_id = ?
       AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
       AND from_agent != ? COLLATE NOCASE
       AND id > ?
+      ${kind ? 'AND kind = ?' : ''}
     ORDER BY created_at ASC
-  `).all(swarmId, agentName, agentName, lastReadId) as Message[];
+  `).all(...params) as Message[];
 
-  if (!peek && messages.length > 0) {
+  // A kind-filtered read NEVER advances the cursor (regardless of peek): advancing past
+  // the highest shown id would silently mark the unfiltered messages it skipped over as
+  // read. Filtered reads are therefore peek-only by construction, enforced here so no
+  // caller can get it wrong.
+  if (!peek && !kind && messages.length > 0) {
     const maxId = messages[messages.length - 1].id;
     db.prepare(
       'INSERT OR REPLACE INTO inbox_cursors (swarm_id, agent_name, last_read_id) VALUES (?, ?, ?)'
@@ -150,15 +166,43 @@ export function getRecentMessages(
   db: Database.Database,
   swarmId: string,
   agentName: string,
-  limit: number = 10
+  limit: number = 10,
+  kind?: string
 ): Message[] {
+  const params: (string | number)[] = [swarmId, agentName, agentName];
+  if (kind) params.push(kind);
+  params.push(limit);
   const messages = db.prepare(`
     SELECT * FROM messages
     WHERE swarm_id = ?
       AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
       AND from_agent != ? COLLATE NOCASE
+      ${kind ? 'AND kind = ?' : ''}
     ORDER BY id DESC
     LIMIT ?
-  `).all(swarmId, agentName, agentName, limit) as Message[];
+  `).all(...params) as Message[];
   return messages.reverse();
+}
+
+/**
+ * How many messages addressed to this agent (directly or via broadcast) exist in the
+ * last `hours` hours, regardless of the read cursor. Powers the zero-unread inbox hint:
+ * "no new messages" plus recent traffic means the cursor already consumed them (often
+ * by the awareness hook), and `--recent` is the recovery path.
+ */
+export function countRecentMessages(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  hours: number = 24
+): number {
+  const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
+  const row = db.prepare(`
+    SELECT COUNT(*) AS n FROM messages
+    WHERE swarm_id = ?
+      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND from_agent != ? COLLATE NOCASE
+      AND created_at > ?
+  `).get(swarmId, agentName, agentName, cutoff) as { n: number };
+  return row.n;
 }

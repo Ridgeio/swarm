@@ -19,7 +19,13 @@ import {
   reapIfDead as reapIfDeadRaw,
   updateStatus as updateStatusRaw,
 } from '../src/registry.js';
-import { getInbox as getInboxRaw, sendMessage as sendMessageRaw } from '../src/mailbox.js';
+import {
+  broadcastMessage as broadcastMessageRaw,
+  countRecentMessages as countRecentMessagesRaw,
+  getInbox as getInboxRaw,
+  getRecentMessages as getRecentMessagesRaw,
+  sendMessage as sendMessageRaw,
+} from '../src/mailbox.js';
 import type Database from 'better-sqlite3';
 
 let db: Database.Database;
@@ -406,6 +412,92 @@ describe('mailbox', () => {
     assert.strictEqual(again.length, 1);
   });
 
+  test('sendMessage stores kind when given, NULL otherwise', async () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
+    joinAgent(db, 'Bob', 'surface-2', 'workspace-1', process.ppid);
+
+    await sendMessageRaw(db, SWARM_ID, 'Bob', 'Alice', 'merge ready', undefined, 'gate');
+    await sendMessageRaw(db, SWARM_ID, 'Bob', 'Alice', 'plain message');
+
+    const rows = db.prepare('SELECT body, kind FROM messages ORDER BY id ASC').all() as any[];
+    assert.strictEqual(rows.length, 2);
+    assert.strictEqual(rows[0].kind, 'gate');
+    assert.strictEqual(rows[1].kind, null);
+
+    const inbox = getInbox(db, 'Alice');
+    assert.strictEqual(inbox[0].kind, 'gate');
+    assert.strictEqual(inbox[1].kind, null);
+  });
+
+  test('broadcastMessage stores kind on the broadcast row', async () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
+
+    await broadcastMessageRaw(db, SWARM_ID, 'Lead', 'daily rollup', undefined, 'digest');
+
+    const row = db.prepare('SELECT kind FROM messages WHERE to_agent IS NULL').get() as any;
+    assert.strictEqual(row.kind, 'digest');
+    const inbox = getInbox(db, 'Alice');
+    assert.strictEqual(inbox.length, 1);
+    assert.strictEqual(inbox[0].kind, 'digest');
+  });
+
+  test('kind-filtered inbox returns only that kind and NEVER advances the cursor', () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
+    const now = new Date().toISOString();
+    const ins = db.prepare(
+      'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, ?, ?, 1, ?, ?)'
+    );
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'gate one', now, 'gate');
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'status one', now, 'status');
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'untagged', now, null);
+
+    // Filtered read with peek=false: the kind filter alone must prevent cursor advance,
+    // otherwise the two unshown messages would be silently marked read.
+    const gates = getInboxRaw(db, SWARM_ID, 'Alice', false, 'gate');
+    assert.strictEqual(gates.length, 1);
+    assert.strictEqual(gates[0].body, 'gate one');
+
+    const all = getInbox(db, 'Alice');
+    assert.strictEqual(all.length, 3, 'filtered read must not have advanced the cursor');
+
+    // The unfiltered read above DID advance the cursor as usual.
+    assert.strictEqual(getInbox(db, 'Alice').length, 0);
+  });
+
+  test('getRecentMessages honors the kind filter', () => {
+    joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
+    const now = new Date().toISOString();
+    const ins = db.prepare(
+      'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, ?, ?, 1, ?, ?)'
+    );
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'gate one', now, 'gate');
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'status one', now, 'status');
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'gate two', now, 'gate');
+
+    const gates = getRecentMessagesRaw(db, SWARM_ID, 'Alice', 10, 'gate');
+    assert.deepStrictEqual(gates.map(m => m.body), ['gate one', 'gate two']);
+    const unfiltered = getRecentMessagesRaw(db, SWARM_ID, 'Alice', 10);
+    assert.strictEqual(unfiltered.length, 3);
+  });
+
+  test('countRecentMessages counts only my addressed traffic inside the window', () => {
+    const now = new Date().toISOString();
+    const old = new Date(Date.now() - 25 * 3_600_000).toISOString();
+    const ins = db.prepare(
+      'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, ?, 1, ?)'
+    );
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'direct fresh', now);
+    ins.run(SWARM_ID, 'Bob', null, 'broadcast fresh', now);
+    ins.run(SWARM_ID, 'Bob', 'Carol', 'someone else', now);
+    ins.run(SWARM_ID, 'Alice', null, 'my own broadcast', now);
+    ins.run(SWARM_ID, 'Bob', 'Alice', 'too old', old);
+
+    // Alice: her direct + Bob's broadcast. Her own broadcast and Carol's direct don't count.
+    assert.strictEqual(countRecentMessagesRaw(db, SWARM_ID, 'Alice'), 2);
+    // Dave: both broadcasts (Bob's and Alice's) — he sent neither.
+    assert.strictEqual(countRecentMessagesRaw(db, SWARM_ID, 'Dave'), 2);
+  });
+
   test('inbox ignores messages from another swarm', () => {
     const other = getOrCreateSwarm(db, 'project-b');
     joinAgentRaw(db, SWARM_ID, 'Alice', 'surface-1', 'workspace-1', process.ppid);
@@ -518,6 +610,89 @@ describe('migration', () => {
       assert.strictEqual(agent.swarm_id, DEFAULT_SWARM_ID);
       const leftover = migrated.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='agents_new'").get();
       assert.strictEqual(leftover, undefined, 'scratch agents_new table is cleaned up');
+    } finally {
+      migrated.close();
+      try { fs.unlinkSync(legacyPath); } catch {}
+      try { fs.unlinkSync(legacyPath + '-wal'); } catch {}
+      try { fs.unlinkSync(legacyPath + '-shm'); } catch {}
+    }
+  });
+
+  test('a pre-kind messages table gains the kind column on open; old rows and new writes work', async () => {
+    const oldPath = path.join(os.tmpdir(), `swarm-prekind-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    // Simulate a DB written by the previous build: modern multi-swarm messages
+    // schema (has swarm_id) but no kind column.
+    const old = new SQLite(oldPath);
+    old.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL,
+        from_agent TEXT NOT NULL,
+        to_agent TEXT,
+        body TEXT NOT NULL,
+        delivered INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+      );
+    `);
+    old.prepare(
+      "INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, 'Bob', 'Alice', 'pre-kind row', 1, ?)"
+    ).run(DEFAULT_SWARM_ID, new Date().toISOString());
+    old.close();
+
+    let migrated = getDbAt(oldPath); // must not throw
+    try {
+      const cols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[]).map(c => c.name);
+      assert.ok(cols.includes('kind'), 'kind column added by the idempotent guard');
+
+      // Old row reads back with kind NULL.
+      const inbox = getInboxRaw(migrated, DEFAULT_SWARM_ID, 'Alice');
+      assert.strictEqual(inbox.length, 1);
+      assert.strictEqual(inbox[0].body, 'pre-kind row');
+      assert.strictEqual(inbox[0].kind, null);
+
+      // New kinded write + filtered read work on the migrated DB.
+      joinAgentRaw(migrated, DEFAULT_SWARM_ID, 'Alice', 'surface-mig', 'workspace-1', process.ppid);
+      await sendMessageRaw(migrated, DEFAULT_SWARM_ID, 'Bob', 'Alice', 'tagged', undefined, 'ack');
+      const acks = getInboxRaw(migrated, DEFAULT_SWARM_ID, 'Alice', true, 'ack');
+      assert.strictEqual(acks.length, 1);
+      assert.strictEqual(acks[0].kind, 'ack');
+
+      // Guard is idempotent: reopening (re-running migrate) must not throw or duplicate.
+      migrated.close();
+      migrated = getDbAt(oldPath);
+      const kindCols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[]).filter(c => c.name === 'kind');
+      assert.strictEqual(kindCols.length, 1);
+    } finally {
+      migrated.close();
+      try { fs.unlinkSync(oldPath); } catch {}
+      try { fs.unlinkSync(oldPath + '-wal'); } catch {}
+      try { fs.unlinkSync(oldPath + '-shm'); } catch {}
+    }
+  });
+
+  test('a fully-legacy DB (pre-swarm_id rebuild) also ends up with the kind column', () => {
+    const legacyPath = path.join(os.tmpdir(), `swarm-legacy-kind-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const legacy = new SQLite(legacyPath);
+    legacy.exec(`
+      CREATE TABLE messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, to_agent TEXT,
+        body TEXT NOT NULL, delivered INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL
+      );
+    `);
+    legacy.prepare("INSERT INTO messages (from_agent, to_agent, body, delivered, created_at) VALUES ('Bob', 'Alice', 'ancient', 1, ?)")
+      .run(new Date().toISOString());
+    legacy.close();
+
+    // migrateMessages rebuilds the table (adding swarm_id); the kind guard runs after
+    // the rebuild, so the rebuilt table must have the column too.
+    const migrated = getDbAt(legacyPath);
+    try {
+      const cols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[]).map(c => c.name);
+      assert.ok(cols.includes('swarm_id'));
+      assert.ok(cols.includes('kind'), 'kind column present after the legacy rebuild path');
+      const row = migrated.prepare('SELECT * FROM messages').get() as any;
+      assert.strictEqual(row.body, 'ancient');
+      assert.strictEqual(row.kind, null);
     } finally {
       migrated.close();
       try { fs.unlinkSync(legacyPath); } catch {}

@@ -134,6 +134,15 @@ export interface SendToSurfaceOptions {
    * on the first. Default 1.
    */
   enterCount?: number;
+  /**
+   * Optional fail-closed screen predicate evaluated while the per-surface lock
+   * is held. The predicate must pass twice, separated by confirmDelaySeconds,
+   * before any keystrokes are sent. This makes a readiness check atomic with
+   * the send and filters transient TUI frames.
+   */
+  screenGuard?: (screen: string) => boolean;
+  screenGuardLines?: number;
+  confirmDelaySeconds?: number;
 }
 
 /**
@@ -180,13 +189,31 @@ export function sendToSurface(
   text: string,
   workspaceId?: string | null,
   options?: SendToSurfaceOptions
-): void {
+): boolean {
   const cmux = resolveCmux();
   const safe = sanitize(text);
   const enterCount = Math.max(1, options?.enterCount ?? 1);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
   const lockPath = acquireSurfaceLock(surfaceId);
   try {
+    if (options?.screenGuard) {
+      // Unguarded sends may retain the historical timeout fallback, but a
+      // readiness-conditional send must never race another writer.
+      if (!lockPath) return false;
+      try {
+        const lines = options.screenGuardLines ?? 30;
+        const first = readScreen(surfaceId, lines, workspaceId);
+        if (!options.screenGuard(first)) return false;
+        sleep(options.confirmDelaySeconds ?? 0.25);
+        const second = readScreen(surfaceId, lines, workspaceId);
+        if (!options.screenGuard(second)) return false;
+      } catch {
+        // A guard is advisory wake-up logic. If the screen cannot be proven
+        // safe, leave the durable inbox row for the recipient's next check.
+        return false;
+      }
+    }
+
     for (let attempt = 0; attempt < MAX_SEND_ATTEMPTS; attempt++) {
       try {
         // Before a RETRY, clear the input line: a prior attempt may have typed
@@ -214,7 +241,7 @@ export function sendToSurface(
           execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
           if (e + 1 < enterCount) sleep(0.05);
         }
-        return; // success
+        return true; // success
       } catch (err: any) {
         // A "broken pipe"/socket-reset means the cmux server dropped the connection
         // under load — the surface is alive but momentarily busy (recipient mid-turn).
@@ -232,6 +259,7 @@ export function sendToSurface(
         throw new SurfaceGoneError(surfaceId);
       }
     }
+    return false;
   } finally {
     releaseSurfaceLock(lockPath);
   }

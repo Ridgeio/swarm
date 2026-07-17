@@ -1,5 +1,5 @@
 import { Transport, TransportAgent, TransportDeliveryResult, DeliveryOptions } from './transport-interface.js';
-import { sendToSurface, notifySurface, readScreen, SurfaceGoneError, isSurfaceAlive } from './transport.js';
+import { sendToSurface, notifySurface, SurfaceGoneError, isSurfaceAlive } from './transport.js';
 
 // A keystroke push is reliable only for a single short send. Typing a long,
 // multi-chunk message into a live Claude Code TUI silently drops chunks (the
@@ -46,11 +46,32 @@ export function prefersNotifyDelivery(hostAgent: string | null | undefined, opti
  * observed 2026-07-14: assignments went undelivered until Tom manually nudged).
  * Keystroke injection is only dangerous MID-turn (pickers, queued input); when
  * the composer is idle, typing a one-line nudge + Enter is safe and starts a
- * turn whose awareness hook reads the inbox. Discriminator: Codex renders
- * "esc to interrupt" on its status line for the entire duration of a turn.
+ * turn whose awareness hook reads the inbox. Absence of "esc to interrupt" is
+ * not sufficient proof of idleness: Codex can briefly omit that status between
+ * tool/status frames. Require the completed-turn boundary immediately above
+ * the composer plus the Codex model footer so ambiguous frames fail closed.
  */
 export function isCodexScreenIdle(screen: string): boolean {
-  return !/esc to interrupt/i.test(screen);
+  if (/esc to interrupt|^\s*•\s+Working\b/im.test(screen)) return false;
+
+  const lines = screen.replace(/\r/g, '').split('\n');
+  let promptIndex = -1;
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    if (/^\s*›(?:\s|$)/u.test(lines[i])) {
+      promptIndex = i;
+      break;
+    }
+  }
+  if (promptIndex < 0) return false;
+
+  const hasModelFooter = lines.slice(promptIndex + 1).some(line => /\bgpt-[\w.-]+\b/i.test(line));
+  if (!hasModelFooter) return false;
+
+  let previous = promptIndex - 1;
+  while (previous >= 0 && lines[previous].trim() === '') previous -= 1;
+  if (previous < 0) return false;
+
+  return /^\s*─(?:─+| Worked for\b.*─+)\s*$/u.test(lines[previous]);
 }
 
 export class CmuxTransport implements Transport {
@@ -80,10 +101,11 @@ export class CmuxTransport implements Transport {
         // start a turn; if it's mid-turn (or the read fails), the notify + the
         // agent's own task-boundary inbox checks cover it.
         try {
-          const screen = readScreen(agent.surface_id, 30, agent.workspace_id);
-          if (isCodexScreenIdle(screen)) {
-            sendToSurface(agent.surface_id, pushText, agent.workspace_id, { enterCount: 1 });
-          }
+          sendToSurface(agent.surface_id, pushText, agent.workspace_id, {
+            enterCount: 1,
+            screenGuard: isCodexScreenIdle,
+            screenGuardLines: 30,
+          });
         } catch {
           // Best-effort wake only — notify already succeeded, message is queued.
         }

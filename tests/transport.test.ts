@@ -1,6 +1,9 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import { isTransientCmuxError } from '../src/transport.js';
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { isTransientCmuxError, sendToSurface } from '../src/transport.js';
 import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, isCodexScreenIdle, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
 
 // The transient/gone classification decides whether a failed cmux send is retried
@@ -96,7 +99,7 @@ describe('buildPushText (single-chunk push, nudge for long messages)', () => {
     assert.strictEqual(prefersNotifyDelivery(null), false);
   });
 
-  test('Codex idle detection keys off the "esc to interrupt" turn indicator', () => {
+  test('Codex idle detection requires a completed-turn boundary at the composer', () => {
     // Mid-turn: status line shows the interrupt hint for the whole turn.
     assert.strictEqual(
       isCodexScreenIdle('• Working (49s • esc to interrupt) · 1 background terminal\n\n› Implement {feature}'),
@@ -107,12 +110,74 @@ describe('buildPushText (single-chunk push, nudge for long messages)', () => {
       isCodexScreenIdle('─ Worked for 53m 07s ─────\n\n› Implement {feature}\n\n  gpt-5.6-sol xhigh'),
       true
     );
-    assert.strictEqual(isCodexScreenIdle(''), true);
+    assert.strictEqual(
+      isCodexScreenIdle('• Final answer\n────────────────────────\n\n› Implement {feature}\n\n  gpt-5.6-luna low'),
+      true
+    );
+  });
+
+  test('Codex idle detection rejects ambiguous frames without a completed-turn boundary', () => {
+    // A screen read can briefly omit the working indicator between tool/status
+    // frames. Treating that absence as idle queues a nudge behind the active
+    // turn; it surfaces later after the matching inbox row has been consumed.
+    assert.strictEqual(
+      isCodexScreenIdle('• Ran npm test\n  └ 120 tests passed\n\n› Implement {feature}\n\n  gpt-5.6-sol xhigh'),
+      false
+    );
+    assert.strictEqual(isCodexScreenIdle(''), false);
   });
 
   test('a long message with no parseable sender still nudges within one chunk', () => {
     const push = buildPushText('x'.repeat(500));
     assert.ok(push.length <= PUSH_MAX_CHARS);
     assert.match(push, /inbox/);
+  });
+});
+
+describe('sendToSurface screen guard', () => {
+  test('fails closed on an ambiguous frame and sends only after a confirmed idle frame', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'swarm-screen-guard-'));
+    const fakeCmux = join(dir, 'cmux');
+    const log = join(dir, 'cmux.log');
+    const priorPath = process.env.PATH;
+    const priorScreen = process.env.SWARM_TEST_SCREEN;
+    const priorLog = process.env.SWARM_TEST_LOG;
+
+    writeFileSync(fakeCmux, `#!/bin/sh
+if [ "$1" = "read-screen" ]; then
+  printf "%s" "$SWARM_TEST_SCREEN"
+  exit 0
+fi
+printf "%s\\n" "$*" >> "$SWARM_TEST_LOG"
+`);
+    chmodSync(fakeCmux, 0o755);
+
+    try {
+      process.env.PATH = `${dir}:${priorPath ?? ''}`;
+      process.env.SWARM_TEST_LOG = log;
+      process.env.SWARM_TEST_SCREEN = '• Ran npm test\n  └ 120 tests passed\n\n› Implement {feature}\n\n  gpt-5.6-sol xhigh';
+
+      const skipped = sendToSurface('SCREEN-GUARD-TEST', 'nudge', null, {
+        screenGuard: isCodexScreenIdle,
+        confirmDelaySeconds: 0,
+      });
+      assert.strictEqual(skipped, false);
+
+      process.env.SWARM_TEST_SCREEN = '─ Worked for 1s ─────\n\n› Implement {feature}\n\n  gpt-5.6-sol xhigh';
+      const sent = sendToSurface('SCREEN-GUARD-TEST', 'nudge', null, {
+        screenGuard: isCodexScreenIdle,
+        confirmDelaySeconds: 0,
+      });
+      assert.strictEqual(sent, true);
+      assert.match(readFileSync(log, 'utf8'), /^send .*nudge[\s\S]*send-key .*Enter/m);
+    } finally {
+      if (priorPath === undefined) delete process.env.PATH;
+      else process.env.PATH = priorPath;
+      if (priorScreen === undefined) delete process.env.SWARM_TEST_SCREEN;
+      else process.env.SWARM_TEST_SCREEN = priorScreen;
+      if (priorLog === undefined) delete process.env.SWARM_TEST_LOG;
+      else process.env.SWARM_TEST_LOG = priorLog;
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

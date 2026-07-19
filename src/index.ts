@@ -86,6 +86,13 @@ import {
   watchBoardGraph,
   writeBoardGraphFile,
 } from './board.js';
+import {
+  boardServerUrl,
+  openBoardServerTab,
+  openBoardServerUrl,
+  startBoardServer,
+  waitForBoardServerStop,
+} from './board-server.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -289,6 +296,8 @@ Status:
   swarm board [--watch [N]] [--tab]               Render fleet state or open it in a cmux workspace
   swarm board --graph [--out <path>] [--open]     Write and print a Mermaid workflow graph
     [--watch [N]] [--tab]                           (--tab prefers a cmux browser, then system browser)
+  swarm board --serve [--port N]                  Serve the live graph on loopback (default 7787)
+    [--tab | --open | --print-url]                   (foreground; Ctrl-C stops)
   swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
@@ -1080,7 +1089,29 @@ async function main() {
 
       case 'board': {
         const graphMode = hasFlag('--graph');
+        const serveMode = hasFlag('--serve');
         const tabMode = hasFlag('--tab');
+        const serveOpenModes = ['--tab', '--open', '--print-url'].filter(flag => hasFlag(flag));
+        const boardServeUsage = 'Usage: swarm board --serve [--port N] [--tab | --open | --print-url]';
+        if (serveMode && (graphMode || hasFlag('--watch') || hasFlag('--out'))) {
+          console.error(boardServeUsage);
+          process.exit(1);
+        }
+        if (serveMode && serveOpenModes.length > 1) {
+          console.error(`${serveOpenModes.join(', ')} are mutually exclusive.`);
+          console.error(boardServeUsage);
+          process.exit(1);
+        }
+        const rawServePort = getFlag('--port');
+        const servePort = rawServePort === undefined ? undefined : Number(rawServePort);
+        if (serveMode && hasFlag('--port') && (
+          !rawServePort || !/^\d+$/.test(rawServePort) ||
+          !Number.isInteger(servePort) || servePort! < 1 || servePort! > 65_535
+        )) {
+          console.error('Board port must be an integer from 1 through 65535.');
+          console.error(boardServeUsage);
+          process.exit(1);
+        }
         const watchIndex = args.indexOf('--watch');
         const rawInterval = watchIndex === -1 ? undefined : args[watchIndex + 1];
         const intervalSeconds = rawInterval === undefined || rawInterval.startsWith('--')
@@ -1097,7 +1128,7 @@ async function main() {
           process.exit(1);
         }
 
-        if (tabMode && !graphMode) {
+        if (tabMode && !graphMode && !serveMode) {
           spawnBoardTab({ cwd: process.cwd(), watchSeconds: intervalSeconds });
           break;
         }
@@ -1129,7 +1160,18 @@ async function main() {
 
         const snapshot = () => renderBoard(db, swarmId);
         try {
-          if (graphMode) {
+          if (serveMode) {
+            const running = await startBoardServer({ db, swarmId, port: servePort });
+            const url = boardServerUrl(running);
+            console.log(url);
+            if (tabMode) {
+              const result = openBoardServerTab(url, { cwd: process.cwd() });
+              if (result) console.error(`Opened served board: ${result.workspaceRef} ${result.surfaceRef}`);
+            } else if (hasFlag('--open') && !openBoardServerUrl(url)) {
+              console.error(`Could not open the served board automatically; open ${url} in a browser.`);
+            }
+            await waitForBoardServerStop(running);
+          } else if (graphMode) {
             const outputPath = rawOutputPath ?? path.join(os.homedir(), '.swarm', 'board.html');
             let opened = false;
             const regenerate = () => {

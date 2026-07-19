@@ -169,6 +169,8 @@ Recovery and hygiene:
 Operator visibility:
   swarm board [--watch [N]] [--tab]            Render fleet state or open a live cmux workspace
   swarm board --graph [--out <path>] [--open]  Write and print a Mermaid workflow graph
+  swarm board --serve [--port N] [--tab|--open|--print-url]
+                                                Serve the live graph on 127.0.0.1
         [--watch [N]] [--tab]                    (--tab prefers cmux browser, then system browser)
   swarm stats [--hours <N>]                    Show messaging and debris metrics
 
@@ -234,7 +236,15 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Generate the workflow graph | `swarm board --graph --out ~/.swarm/board.html --open` |
 | Keep the graph live in cmux | `swarm board --graph --tab --watch 5` |
 
-Graph mode writes HTML to `~/.swarm/board.html` by default, prints raw Mermaid to stdout, and prints the file path to stderr. `--graph --tab` prefers a cmux browser workspace pointed at the generated `file://` URL; if cmux/browser creation is unavailable it falls back to the macOS system browser. The pinned Mermaid CDN is optional at viewing time: if it cannot load, the raw diagram source remains visible in the page.
+Graph mode writes HTML to `~/.swarm/board.html` by default, prints raw Mermaid to stdout, and prints the file path to stderr. `--graph --tab` prefers a cmux browser workspace pointed at the generated `file://` URL; if cmux/browser creation is unavailable it falls back to the macOS system browser. Mermaid is vendored for offline use, and the raw diagram source remains as a fallback.
+
+```bash
+swarm board --serve
+swarm board --serve --tab
+swarm board --serve --port 7790 --print-url
+```
+
+Served mode prints a token-bearing loopback URL and stays in the foreground until Ctrl-C. `--tab` prefers a cmux browser workspace and falls back to the system browser; `--open` uses the system browser directly.
 
 ## Example workflows
 

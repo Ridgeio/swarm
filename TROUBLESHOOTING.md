@@ -197,6 +197,20 @@ If the manual tick succeeds but the heartbeat later goes stale again, inspect th
 
 ---
 
+## Served board port is already in use
+
+`swarm board --serve` binds only to `127.0.0.1:7787`. If startup reports that port 7787 is already in use, either stop the older board process or choose another loopback port:
+
+```bash
+swarm board --serve --port 7790 --tab
+```
+
+## Served board API returns 401
+
+The served board uses a fresh per-process token. Open the exact URL printed by the current `swarm board --serve` process; stale tabs and URLs from an earlier process have an expired token. For direct API diagnostics, copy the current token into `X-Swarm-Token` or the `?token=` query parameter.
+
+---
+
 ## Task close refuses
 
 `task close` has an exact-count preservation gate. The error reports all three blocking counts: `unpushed commits: N, dirty tracked files: N, untracked files: N`. For `pr` or `merged`, the recorded branch tip must also be reachable from a remote ref.

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="swarm-token" content="__SWARM_BOARD_TOKEN__">
+  <title>Swarm board</title>
+  <link rel="stylesheet" href="./assets/board.css">
+</head>
+<body>
+  <div class="board-shell">
+    <header class="masthead">
+      <div class="identity">
+        <span class="eyebrow">OPERATIONS / LIVE MAP</span>
+        <h1 id="swarm-name">Swarm board</h1>
+      </div>
+      <dl class="fleet-stats" aria-label="Fleet summary">
+        <div><dt>Agents</dt><dd id="agent-count">—</dd></div>
+        <div><dt>Tasks</dt><dd id="task-count">—</dd></div>
+        <div><dt>Updated</dt><dd id="updated-at">waiting</dd></div>
+      </dl>
+      <div class="freshness" role="status" aria-live="polite">
+        <span id="freshness-dot" class="freshness-dot is-stale" aria-hidden="true"></span>
+        <span id="freshness-text">connecting</span>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="graph-panel" aria-label="Ownership and handoff graph">
+        <div class="panel-label">Ownership / handoffs</div>
+        <div id="graph" class="graph-canvas"></div>
+        <div class="graph-key" aria-label="Graph edge legend">
+          <span><i class="key-line solid"></i>owns</span>
+          <span><i class="key-line dashed"></i>handoff</span>
+          <span><i class="key-line dotted"></i>claimed</span>
+        </div>
+      </section>
+
+      <aside class="right-rail" aria-label="Triage and inspector">
+        <section class="needs-panel">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">TRIAGE</span>
+              <h2>Needs you</h2>
+            </div>
+            <span id="needs-count" class="count-chip">0</span>
+          </div>
+          <ul id="needs-list" class="needs-list" aria-live="polite"></ul>
+        </section>
+
+        <section id="inspector" class="inspector" aria-live="polite">
+          <div class="section-heading">
+            <div>
+              <span class="eyebrow">INSPECTOR</span>
+              <h2 id="inspector-title">Select a node</h2>
+            </div>
+          </div>
+          <div id="inspector-body" class="inspector-body">
+            <p class="quiet-copy">Choose an agent, task, or debris node without leaving the fleet map.</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="timeline-reserved" aria-label="Reserved event timeline">
+      <span class="timeline-mark" aria-hidden="true"></span>
+      <div>
+        <span class="eyebrow">EVENT TIMELINE</span>
+        <p>Reserved for V1-C</p>
+      </div>
+    </footer>
+  </div>
+
+  <script src="./assets/cytoscape.min.js"></script>
+  <script src="./assets/cytoscape-dagre.min.js"></script>
+  <script src="./assets/board-elements.js"></script>
+  <script src="./assets/board.js"></script>
+</body>
+</html>

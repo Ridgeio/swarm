@@ -192,6 +192,22 @@ Codex scope (technical docs, same PR as the code they describe): update README.m
 
 Fable scope (judgment docs, this session): `docs/philosophy.md` (the P1–P5 essay with sources — the durable "why"); replace `docs/model-routing.md` with the merged role×model×fallback table + quota-band protocol; move the org doc into the repo as `docs/org-template.md` (role templates + messaging rules, roster-free — the live roster is runtime state, not doctrine); orchestration.md addendum: bus-shrinking doctrine, journal/checkpoint rules, "a completion claim without its artifact is an ack, not a fact" cross-reference to `task close` evidence gates; experiments.md entries EXP-006..EXP-010 (one per WI, each with hypothesis, guard metric, due-date for the measurement — the loop governs its own rollout).
 
+### WI-7 — `swarm board`: live operator visibility  (M, builds after WI-3/WI-5 land — it renders their tables)
+
+**Motivation (Tom, 2026-07-19, recorded as a standing constraint).** The move to task-based durability must never cost the operator visibility. Tom runs agents as cmux tabs precisely to SEE what each is doing and to adjust their CLIs in-session (model, effort, fast/priority modes). Policy: **builders stay interactive cmux sessions by default; headless is for mechanical sweeps only.** The board complements the tabs — it answers "what is the fleet doing and who needs me," while the tabs remain the drill-down and control surface. Research grounding: fleet dashboards should be one-row-per-TASK, not per-terminal, organized around urgency triage ("which agent needs a human right now") — the converged pattern across solo-operator fleet tooling.
+
+**Spec (v1 — a refreshing TUI, zero new infrastructure).**
+1. **`swarm board [--watch [N]]`** — renders the fleet state to the terminal; `--watch` clears and re-renders every N seconds (default 5). Read-only; every section is a straight query over existing tables. Designed to live in a dedicated cmux tab.
+2. Sections, in urgency order:
+   a. **NEEDS YOU** — pending gate/escalation/merge-req-kind messages unacked, tasks in `awaiting_review`, stalled tasks (no checkpoint/commit evidence > threshold), janitor heartbeat stale. Empty section renders as one quiet line.
+   b. **TASKS** — one row per non-done task: `slug | state | owner(epoch) | model/host | checkpoint age | branch (pushed?/dirty) | next-action (first line)`.
+   c. **FLEET** — one row per registered agent: name, host_agent, current task, last progress evidence age (last checkpoint/commit/ack, NOT last message — progress-based per P3), unacked count.
+   d. **DEBRIS + QUOTA** — janitor counters (worktrees/unpushed/strays/junk, tick age) and the current capacity bands (read from the program task's checkpoint when present).
+3. Rendering: plain box-drawing text, no TUI framework (repo thin-CLI constraint); color via the existing chalk-free ANSI conventions if any, else none. Must degrade cleanly when tables are missing (pre-WI-3 DBs) — print the section header + "not available (WI-N not landed)".
+4. **v2 sketch (not in v1):** `swarm board --graph` emitting a mermaid org/flow diagram (hierarchy from org template roles + live task assignments) to an HTML file for richer visualization; `--tab` auto-opening a dedicated cmux surface via the existing cmux CLI integration. Both deliberately deferred until the text board proves its render is the right content.
+
+**Acceptance.** Board renders all four sections against a fixture DB; --watch refreshes; graceful degradation on missing tables; needs-you section correctly surfaces an unacked gate message, an awaiting_review task, and a stale janitor heartbeat; runs read-only (no writes to any table).
+
 ### Tech-debt items (fold into the phase touching each file)
 
 - getInbox `ORDER BY id` + max-id watermark (WI-2, stated there).

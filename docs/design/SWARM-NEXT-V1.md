@@ -208,6 +208,48 @@ Fable scope (judgment docs, this session): `docs/philosophy.md` (the P1–P5 ess
 
 **Acceptance.** Board renders all four sections against a fixture DB; --watch refreshes; graceful degradation on missing tables; needs-you section correctly surfaces an unacked gate message, an awaiting_review task, and a stale janitor heartbeat; runs read-only (no writes to any table).
 
+### WI-7b — `swarm board --tab`: one-command cmux tab  (S, landed increment)
+
+**Motivation.** The v1 board prints to stdout; putting it in a dedicated cmux tab is a manual `cmux new-workspace … --command` step. `--tab` makes it one command so the operator never has to remember the cmux incantation (Tom's visibility constraint — the board should be trivially summonable).
+
+**Spec.**
+1. `swarm board --tab [--watch [N]]` — spawns a new cmux workspace whose command is `swarm board --watch <N>` (default N = BOARD_DEFAULT_WATCH_SECONDS), reusing `spawnWorkspace(cwd, command)` from transport.ts. Workspace title `swarm board`. Prints the created workspace/surface ref, then exits (the spawned tab owns the live loop; the invoking process does not block).
+2. `--tab` without cmux available (resolveCmux throws / not found): exit 1 with `cmux not found — run 'swarm board --watch' directly in a terminal you want to watch.` Never crash.
+3. `--tab` is incompatible with `--graph` in a *text* sense only — see WI-7c for `--graph --tab` (browser pane). If both are passed, WI-7c's graph-tab path wins.
+
+**Acceptance.** `--tab` invokes spawnWorkspace with the expected command string (unit-tested via an injectable spawner); cmux-absent path exits 1 with the guidance message; the spawned command string round-trips the interval.
+
+### WI-7c — `swarm board --graph`: mermaid workflow diagram  (M, landed increment)
+
+**Motivation.** The operator's original wish: a *visual* depiction of the swarm's shape — hierarchy/workflow, not a text table. Now buildable because WI-2/3/5 populate the tables it renders. This is the honest, data-grounded view: not a fictional org chart (roles aren't stored — they're declared in kickoff messages) but the LIVE work graph — who owns what, where work has been handed off, and what debris hangs off the fleet.
+
+**Spec — the diagram (this is the design; render it faithfully).**
+A mermaid `flowchart LR` (left-to-right) with three node families and a legend:
+
+- **Agent nodes** — one per row in `agents`. Rounded (`(name)`). Label two lines: agent name, then host/type (`host_agent` if set, else `agent_type`). `classDef` by host: `hostClaude`, `hostCodex`, `hostGrok`, `hostGemini`, `hostA2A`, `hostHeadless`, `hostUnknown` — visually distinct fills. This encodes the multi-model composition of the fleet at a glance (the whole point of cross-family diversity).
+- **Task nodes** — one per non-`done` task (plus tasks closed within the last 24h, dimmed). Rectangle (`[slug]`). Label two lines: slug, then `[state] · ckpt <age>` (checkpoint age via the same evidence path the text board uses; "no ckpt" if none). `classDef` by state: `stActive` (green), `stAwaiting` (amber), `stStale` (red — active but checkpoint older than CHECKPOINT_STALE_MINUTES), `stOpen` (grey), `stDone` (dim/struck).
+- **Debris node** — one summary node from `janitor_status` counters: `debris\n<W> worktrees (<D> detached)\n<U> unpushed`. `classDef debrisWarn` (orange) when any count > 0, else `debrisOk` (muted). Include janitor tick age; if the heartbeat is stale, a `debrisStale` class (red border).
+
+Edges:
+- Agent `-->|owns|` Task for each task's `owner_agent` (solid).
+- Agent `-.->|handoff|` Agent for each `task_events` row kind=`claimed` with a `previous_owner` in `data` (dashed, previous_owner → new owner), deduped.
+- All task nodes `-.->` Debris is NOT drawn (debris is fleet-global, shown standalone with its own heading).
+
+Also: a title line (swarm name + ISO timestamp + agent/task/debris counts), and a `subgraph legend` documenting the color classes. Empty swarm (no agents, no tasks) still renders a valid diagram with a single "idle swarm" note node + the debris node — never emits broken mermaid.
+
+**Spec — output & delivery.**
+1. `swarm board --graph [--out <path>] [--open] [--watch [N]]`:
+   - Generates a self-contained HTML file (default `~/.swarm/board.html`; `--out` overrides) containing the mermaid diagram inside `<pre class="mermaid">`, mermaid loaded from a **pinned** CDN (`mermaid@11`) with `startOnLoad`, `theme` chosen from `prefers-color-scheme`, and a graceful fallback: if the script fails to load, the raw mermaid source stays visible in the `<pre>` (so the file is never blank offline). Page is theme-aware (dark/light via media query). Include a small header (title/counts) and, under `--watch`, an HTML `<meta http-equiv="refresh" content="N">` so the browser reloads as the file is regenerated.
+   - Always prints the raw mermaid source to stdout too (pipeable, inspectable, greppable) and prints the written file path to stderr.
+   - `--watch [N]`: regenerate the file every N seconds (default 5) until interrupted (mirrors the text `watchBoard` loop; injectable clock/exit for tests).
+   - `--open`: after writing, open the file — macOS `open <path>` via execFileSync (best-effort; never fatal if it fails). 
+2. `swarm board --graph --tab`: generate the HTML, then open it in a cmux **browser pane/workspace** pointed at the `file://` URL (`cmux new-workspace --name "swarm graph" ...` with a browser surface, or fall back to `--open`). Best-effort; document the fallback.
+3. All generation is read-only over the DB (getDbReadOnly, no migrations, no writes). The only writes are the HTML file at `--out` and (under --tab) cmux spawning.
+
+**Acceptance.** `--graph` emits valid mermaid for: a populated fixture (agents of ≥2 hosts, tasks in ≥3 states incl. a stale one, a handoff/claimed edge, non-zero debris) — asserting the presence of each node class, the owns/handoff edges, and the debris node; an empty swarm (valid diagram, idle note); missing tables (graceful — a minimal diagram or a clear "not available" note, never a crash). HTML file is written and contains the mermaid source verbatim (fallback-safe). Raw mermaid goes to stdout. `--watch` regenerates ≥2 times under an injected clock. No DB writes.
+
+**Deferred to a later increment (still v2):** live handoff *volume* weighting on edges, message-flow edges (kept off by design — P4 says the bus should be small, so visualizing chatter would celebrate the wrong thing), and an in-CLI SVG render (keep the browser as the renderer — no headless-chrome dependency in a thin CLI).
+
 ### Tech-debt items (fold into the phase touching each file)
 
 - getInbox `ORDER BY id` + max-id watermark (WI-2, stated there).

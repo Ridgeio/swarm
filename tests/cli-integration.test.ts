@@ -233,3 +233,218 @@ describe('cli messaging (multi-send, kinds, cursor clarity)', () => {
     assert.doesNotMatch(recent.stdout, /org update/);
   });
 });
+
+describe('cli supersession and pull/ack delivery', () => {
+  function dropSessionMarkers(home: string) {
+    const swarmDir = join(home, '.swarm');
+    if (!existsSync(swarmDir)) return;
+    for (const file of readdirSync(swarmDir)) {
+      if (file.startsWith('headless-')) rmSync(join(swarmDir, file), { force: true });
+    }
+  }
+
+  function joinHeadless(home: string, name: string) {
+    const result = runCli(home, ['join', name, '--headless'], { SWARM_AGENT_NAME: name });
+    assert.strictEqual(result.status, 0, result.stderr || result.stdout);
+    dropSessionMarkers(home);
+  }
+
+  function openDb(home: string): SQLite.Database {
+    return new SQLite(join(home, '.swarm', 'swarm.db'));
+  }
+
+  test('first join fences hook history while --recent deliberately replays it', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-fence-'));
+    try {
+      joinHeadless(home, 'Lead');
+      const sqlite = openDb(home);
+      sqlite.prepare(`
+        INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at)
+        VALUES ('default', 'Lead', NULL, 'historical doctrine', 1, ?)
+      `).run(new Date().toISOString());
+      sqlite.close();
+
+      joinHeadless(home, 'Bob');
+      const hook = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(hook.status, 0, hook.stderr || hook.stdout);
+      assert.doesNotMatch(hook.stdout, /historical doctrine/);
+      assert.doesNotMatch(hook.stdout, /NEW MESSAGES/);
+
+      const recent = runCli(home, ['inbox', '--recent', '10'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(recent.status, 0, recent.stderr || recent.stdout);
+      assert.match(recent.stdout, /\[#1 .+\] Lead: historical doctrine/);
+
+      const verify = openDb(home);
+      const deliveries = verify.prepare('SELECT COUNT(*) AS n FROM message_deliveries').get() as { n: number };
+      assert.strictEqual(deliveries.n, 0, 'hook/recent must not activate fenced history');
+      verify.close();
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('CLI owner validation and hook/recent supersession rendering', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-supersede-'));
+    try {
+      for (const name of ['Alice', 'Bob', 'Carol']) joinHeadless(home, name);
+      const oldSend = runCli(home, ['send', 'Bob', 'old order'], { SWARM_AGENT_NAME: 'Alice' });
+      assert.strictEqual(oldSend.status, 0, oldSend.stderr || oldSend.stdout);
+
+      const sqlite = openDb(home);
+      const old = sqlite.prepare("SELECT id FROM messages WHERE body = 'old order'").get() as { id: number };
+      sqlite.close();
+
+      const denied = runCli(
+        home,
+        ['send', 'Bob', 'not mine', '--supersedes', String(old.id)],
+        { SWARM_AGENT_NAME: 'Carol' }
+      );
+      assert.notStrictEqual(denied.status, 0);
+      assert.match(denied.stderr, /you can only supersede your own messages/);
+
+      const replace = runCli(
+        home,
+        ['send', 'Bob', 'new order', '--supersedes', String(old.id)],
+        { SWARM_AGENT_NAME: 'Alice' }
+      );
+      assert.strictEqual(replace.status, 0, replace.stderr || replace.stdout);
+
+      const hook = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(hook.stdout, /new order/);
+      assert.doesNotMatch(hook.stdout, /old order/);
+
+      const verify = openDb(home);
+      const replacement = verify.prepare("SELECT id FROM messages WHERE body = 'new order'").get() as { id: number };
+      verify.close();
+      const recent = runCli(home, ['inbox', '--recent', '10'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(recent.stdout, /old order \[superseded by #\d+\]/);
+      assert.match(recent.stdout, /new order/);
+      assert.match(recent.stdout, new RegExp(`superseded by #${replacement.id}`));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('broadcast --supersedes creates the forward tombstone used by every recipient', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-broadcast-supersede-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      const oldBroadcast = runCli(home, ['broadcast', 'old broadcast'], { SWARM_AGENT_NAME: 'Alice' });
+      assert.strictEqual(oldBroadcast.status, 0, oldBroadcast.stderr || oldBroadcast.stdout);
+      const sqlite = openDb(home);
+      const old = sqlite.prepare("SELECT id FROM messages WHERE body = 'old broadcast'").get() as { id: number };
+      sqlite.close();
+
+      const replacement = runCli(
+        home,
+        ['broadcast', 'new broadcast', '--supersedes', String(old.id)],
+        { SWARM_AGENT_NAME: 'Alice' }
+      );
+      assert.strictEqual(replacement.status, 0, replacement.stderr || replacement.stdout);
+      const hook = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(hook.stdout, /new broadcast/);
+      assert.doesNotMatch(hook.stdout, /old broadcast/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('hook turn loss keeps a message pending, third injection collapses, and ack clears it', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-hook-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      const send = runCli(home, ['send', 'Bob', 'survive compaction', '--kind', 'gate'], { SWARM_AGENT_NAME: 'Alice' });
+      assert.strictEqual(send.status, 0, send.stderr || send.stdout);
+
+      const sqlite = openDb(home);
+      const message = sqlite.prepare("SELECT id FROM messages WHERE body = 'survive compaction'").get() as { id: number };
+      sqlite.close();
+
+      const first = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      const second = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      const third = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(first.stdout, new RegExp(`\\[#${message.id} .+\\] \\[gate\\] Alice: survive compaction`));
+      assert.match(second.stdout, /survive compaction/);
+      assert.match(third.stdout, new RegExp(`\\(#${message.id} from Alice, unacked for \\d+m`));
+      assert.doesNotMatch(third.stdout, /survive compaction/);
+
+      const pendingDb = openDb(home);
+      const delivery = pendingDb.prepare('SELECT status, inject_count FROM message_deliveries WHERE message_id = ?')
+        .get(message.id) as { status: string; inject_count: number };
+      const watermark = pendingDb.prepare("SELECT last_read_id FROM inbox_cursors WHERE agent_name = 'Bob'").get() as { last_read_id: number };
+      assert.deepStrictEqual(delivery, { status: 'injected', inject_count: 3 });
+      assert.strictEqual(watermark.last_read_id, 0);
+      pendingDb.close();
+
+      const ack = runCli(home, ['ack', String(message.id)], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(ack.status, 0, ack.stderr || ack.stdout);
+      const ackAgain = runCli(home, ['ack', String(message.id)], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(ackAgain.status, 0, ackAgain.stderr || ackAgain.stdout);
+      const after = runCli(home, ['hook-context'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.doesNotMatch(after.stdout, /survive compaction/);
+      assert.doesNotMatch(after.stdout, new RegExp(`#${message.id} from Alice`));
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('peek/recent/kind reads do not ack, while plain inbox acks every printed row', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-read-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      for (const [body, kind] of [['plain', undefined], ['gate item', 'gate'], ['status item', 'status']] as const) {
+        const args = ['send', 'Bob', body];
+        if (kind) args.push('--kind', kind);
+        const sent = runCli(home, args, { SWARM_AGENT_NAME: 'Alice' });
+        assert.strictEqual(sent.status, 0, sent.stderr || sent.stdout);
+      }
+
+      const filtered = runCli(home, ['inbox', '--kind', 'gate'], { SWARM_AGENT_NAME: 'Bob' });
+      const peek = runCli(home, ['inbox', '--peek'], { SWARM_AGENT_NAME: 'Bob' });
+      const recent = runCli(home, ['inbox', '--recent', '10'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(filtered.stdout, /gate item/);
+      assert.match(peek.stdout, /plain/);
+      assert.match(recent.stdout, /status item/);
+
+      const before = openDb(home);
+      const beforeAck = before.prepare("SELECT COUNT(*) AS n FROM message_deliveries WHERE status = 'acked'").get() as { n: number };
+      const beforeCursor = before.prepare("SELECT last_read_id FROM inbox_cursors WHERE agent_name = 'Bob'").get() as { last_read_id: number };
+      assert.strictEqual(beforeAck.n, 0);
+      assert.strictEqual(beforeCursor.last_read_id, 0);
+      before.close();
+
+      const plain = runCli(home, ['inbox'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.match(plain.stdout, /3 message\(s\)/);
+      const after = openDb(home);
+      const afterAck = after.prepare("SELECT COUNT(*) AS n FROM message_deliveries WHERE status = 'acked'").get() as { n: number };
+      const maxMessage = after.prepare('SELECT MAX(id) AS id FROM messages').get() as { id: number };
+      const afterCursor = after.prepare("SELECT last_read_id FROM inbox_cursors WHERE agent_name = 'Bob'").get() as { last_read_id: number };
+      assert.strictEqual(afterAck.n, 3);
+      assert.strictEqual(afterCursor.last_read_id, maxMessage.id);
+      after.close();
+
+      for (const body of ['ack one', 'ack two']) {
+        const sent = runCli(home, ['send', 'Bob', body], { SWARM_AGENT_NAME: 'Alice' });
+        assert.strictEqual(sent.status, 0, sent.stderr || sent.stdout);
+      }
+      const idsDb = openDb(home);
+      const ids = idsDb.prepare("SELECT id FROM messages WHERE body IN ('ack one', 'ack two') ORDER BY id")
+        .all() as Array<{ id: number }>;
+      idsDb.close();
+      const ackMany = runCli(home, ['ack', ...ids.map(row => String(row.id))], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(ackMany.status, 0, ackMany.stderr || ackMany.stdout);
+      assert.match(ackMany.stdout, /Acknowledged 2 message\(s\)/);
+
+      const finalSend = runCli(home, ['send', 'Bob', 'ack all'], { SWARM_AGENT_NAME: 'Alice' });
+      assert.strictEqual(finalSend.status, 0, finalSend.stderr || finalSend.stdout);
+      const ackAll = runCli(home, ['ack', '--all'], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(ackAll.status, 0, ackAll.stderr || ackAll.stdout);
+      assert.match(ackAll.stdout, /Acknowledged 1 message\(s\)/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

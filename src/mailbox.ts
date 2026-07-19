@@ -12,12 +12,70 @@ export interface Message {
   delivered: number;
   created_at: string;
   kind: string | null;
+  superseded_by: number | null;
+}
+
+export interface MessageDelivery {
+  message_id: number;
+  swarm_id: string;
+  recipient: string;
+  status: 'pending' | 'injected' | 'acked';
+  first_injected_at: string | null;
+  inject_count: number;
+  acked_at: string | null;
+}
+
+export interface HookInboxEntry {
+  message: Message;
+  delivery: MessageDelivery;
+  collapsed: boolean;
+  unackedMinutes: number;
 }
 
 // Allowed values for the optional message classification tag. Validated at the CLI
 // boundary (a typo'd kind would otherwise store an unfilterable message); storage
 // itself is a plain nullable TEXT column so builds with a different set stay readable.
 export const MESSAGE_KINDS = ['status', 'digest', 'merge-req', 'escalation', 'ack', 'gate'] as const;
+export const HOOK_INJECT_COLLAPSE_COUNT = 3;
+export const HOOK_INJECT_BACKOFF_MINUTES = 45;
+export const HOOK_INJECT_BACKOFF_MS = HOOK_INJECT_BACKOFF_MINUTES * 60_000;
+
+function insertMessage(
+  db: Database.Database,
+  swarmId: string,
+  fromName: string,
+  toName: string | null,
+  body: string,
+  createdAt: string,
+  kind: string | null,
+  supersedes?: number
+): number {
+  const tx = db.transaction(() => {
+    if (supersedes !== undefined) {
+      const owned = db.prepare(`
+        SELECT id FROM messages
+        WHERE id = ? AND swarm_id = ? AND from_agent = ? COLLATE NOCASE
+      `).get(supersedes, swarmId, fromName);
+      if (!owned) {
+        throw new Error(`Cannot supersede message #${supersedes}: you can only supersede your own messages in this swarm.`);
+      }
+    }
+
+    const result = db.prepare(`
+      INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind)
+      VALUES (?, ?, ?, ?, 0, ?, ?)
+    `).run(swarmId, fromName, toName, body, createdAt, kind);
+    const messageId = Number(result.lastInsertRowid);
+
+    if (supersedes !== undefined) {
+      db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ? AND swarm_id = ?')
+        .run(messageId, supersedes, swarmId);
+    }
+    return messageId;
+  });
+
+  return tx.immediate();
+}
 
 export async function sendMessage(
   db: Database.Database,
@@ -26,8 +84,9 @@ export async function sendMessage(
   toName: string,
   body: string,
   options?: DeliveryOptions,
-  kind?: string | null
-): Promise<{ delivered: boolean; queued: boolean; message: string }> {
+  kind?: string | null,
+  supersedes?: number
+): Promise<{ delivered: boolean; queued: boolean; message: string; messageId?: number }> {
   const target = getAgent(db, swarmId, toName);
   if (!target) {
     return { delivered: false, queued: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
@@ -40,16 +99,12 @@ export async function sendMessage(
   // messages.to_agent is compared case-sensitively in getInbox, so persisting the
   // raw sender-typed casing would make a case-mismatched message invisible to the
   // recipient's inbox while still reporting success.
-  const result = db.prepare(
-    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, ?, ?, 0, ?, ?)'
-  ).run(swarmId, fromName, target.name, body, now, kind ?? null);
-
-  const msgId = result.lastInsertRowid;
+  const msgId = insertMessage(db, swarmId, fromName, target.name, body, now, kind ?? null, supersedes);
 
   const deliveryResult = await deliverToAgent(target, formatted, options);
   if (deliveryResult.delivered) {
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
-    return { delivered: true, queued: false, message: `Message sent to ${toName}` };
+    return { delivered: true, queued: false, message: `Message sent to ${toName}`, messageId: msgId };
   } else {
     // Push failed but the message is in the DB. Cmux/headless recipients pick it
     // up via `swarm inbox`; a2a recipients get retried by the redeliver worker
@@ -57,7 +112,7 @@ export async function sendMessage(
     // read their inbox remotely (getSelf resolves SWARM_AGENT_NAME for a2a).
     // The caller should spawn a redeliver worker so an idle recipient isn't
     // stuck waiting for a turn that never comes (see redeliver.ts).
-    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for retry/inbox)` };
+    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for retry/inbox)`, messageId: msgId };
   }
 }
 
@@ -67,8 +122,9 @@ export async function broadcastMessage(
   fromName: string,
   body: string,
   options?: DeliveryOptions,
-  kind?: string | null
-): Promise<{ sent: number; queued: number; failed: number }> {
+  kind?: string | null,
+  supersedes?: number
+): Promise<{ sent: number; queued: number; failed: number; messageId?: number }> {
   const agents = await listAgents(db, swarmId);
   const recipients = agents.filter(a => a.name !== fromName);
 
@@ -80,11 +136,7 @@ export async function broadcastMessage(
   const formatted = `[SWARM from ${fromName}]: ${body}`;
 
   // Insert message row first (one broadcast row, to_agent = NULL)
-  const result = db.prepare(
-    'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind) VALUES (?, ?, NULL, ?, 0, ?, ?)'
-  ).run(swarmId, fromName, body, now, kind ?? null);
-
-  const msgId = result.lastInsertRowid;
+  const msgId = insertMessage(db, swarmId, fromName, null, body, now, kind ?? null, supersedes);
 
   // Deliver to all recipients in parallel
   const results = await Promise.all(
@@ -110,7 +162,89 @@ export async function broadcastMessage(
     db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
   }
 
-  return { sent, queued, failed };
+  return { sent, queued, failed, messageId: msgId };
+}
+
+function getCursor(db: Database.Database, swarmId: string, agentName: string): number {
+  const cursor = db.prepare(`
+    SELECT last_read_id FROM inbox_cursors
+    WHERE swarm_id = ? AND agent_name = ? COLLATE NOCASE
+  `).get(swarmId, agentName) as { last_read_id: number } | undefined;
+  return cursor?.last_read_id ?? 0;
+}
+
+function ensureDeliveryRows(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  messageIds: number[]
+): void {
+  if (messageIds.length === 0) return;
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO message_deliveries (message_id, swarm_id, recipient)
+    VALUES (?, ?, ?)
+  `);
+  db.transaction(() => {
+    for (const id of messageIds) insert.run(id, swarmId, agentName);
+  })();
+}
+
+function advanceCursor(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  messageIds: number[]
+): void {
+  if (messageIds.length === 0) return;
+  const maxId = Math.max(...messageIds);
+  db.prepare(`
+    INSERT INTO inbox_cursors (swarm_id, agent_name, last_read_id)
+    VALUES (?, ?, ?)
+    ON CONFLICT(swarm_id, agent_name) DO UPDATE SET
+      last_read_id = MAX(inbox_cursors.last_read_id, excluded.last_read_id)
+  `).run(swarmId, agentName, maxId);
+}
+
+export function acknowledgeMessages(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  messageIds: number[],
+  now: number = Date.now()
+): number[] {
+  const ids = [...new Set(messageIds)];
+  if (ids.length === 0) return [];
+  if (ids.some(id => !Number.isSafeInteger(id) || id <= 0)) {
+    throw new Error('Message IDs must be positive integers.');
+  }
+
+  const visible = db.prepare(`
+    SELECT id FROM messages
+    WHERE id = ? AND swarm_id = ?
+      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND from_agent != ? COLLATE NOCASE
+  `);
+  const ackedAt = new Date(now).toISOString();
+  const upsert = db.prepare(`
+    INSERT INTO message_deliveries (
+      message_id, swarm_id, recipient, status, acked_at
+    ) VALUES (?, ?, ?, 'acked', ?)
+    ON CONFLICT(message_id, recipient) DO UPDATE SET
+      status = 'acked',
+      acked_at = COALESCE(message_deliveries.acked_at, excluded.acked_at)
+  `);
+
+  const tx = db.transaction(() => {
+    for (const id of ids) {
+      if (!visible.get(id, swarmId, agentName, agentName)) {
+        throw new Error(`Message #${id} was not found in this swarm or is not addressed to you.`);
+      }
+    }
+    for (const id of ids) upsert.run(id, swarmId, agentName, ackedAt);
+    advanceCursor(db, swarmId, agentName, ids);
+  });
+  tx.immediate();
+  return ids;
 }
 
 export function getInbox(
@@ -120,47 +254,99 @@ export function getInbox(
   peek: boolean = false,
   kind?: string
 ): Message[] {
-  // Get cursor
-  const cursor = db.prepare('SELECT last_read_id FROM inbox_cursors WHERE swarm_id = ? AND agent_name = ?')
-    .get(swarmId, agentName) as { last_read_id: number } | undefined;
-  const lastReadId = cursor?.last_read_id ?? 0;
+  const lastReadId = getCursor(db, swarmId, agentName);
 
-  // Fetch messages: direct messages to me + broadcasts, after cursor, not from me
-  // Match names case-insensitively (agents register COLLATE NOCASE) so a message addressed
-  // with non-canonical casing still lands, and an agent never sees its own messages.
-  const params: (string | number)[] = [swarmId, agentName, agentName, lastReadId];
+  // A delivery row is authoritative once one exists. The legacy cursor remains the
+  // fallback for messages written/read by older builds and for the first-join fence.
+  const params: (string | number)[] = [agentName, swarmId, agentName, agentName, lastReadId];
   if (kind) params.push(kind);
   const messages = db.prepare(`
-    SELECT * FROM messages
-    WHERE swarm_id = ?
-      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
-      AND from_agent != ? COLLATE NOCASE
-      AND id > ?
-      ${kind ? 'AND kind = ?' : ''}
-    ORDER BY created_at ASC
+    SELECT m.* FROM messages m
+    LEFT JOIN message_deliveries d
+      ON d.message_id = m.id
+      AND d.swarm_id = m.swarm_id
+      AND d.recipient = ? COLLATE NOCASE
+    WHERE m.swarm_id = ?
+      AND (m.to_agent = ? COLLATE NOCASE OR m.to_agent IS NULL)
+      AND m.from_agent != ? COLLATE NOCASE
+      AND m.superseded_by IS NULL
+      AND ((d.message_id IS NULL AND m.id > ?) OR d.status != 'acked')
+      ${kind ? 'AND m.kind = ?' : ''}
+    ORDER BY m.id ASC
   `).all(...params) as Message[];
 
-  // A kind-filtered read NEVER advances the cursor (regardless of peek): advancing past
-  // the highest shown id would silently mark the unfiltered messages it skipped over as
-  // read. Filtered reads are therefore peek-only by construction, enforced here so no
-  // caller can get it wrong.
+  ensureDeliveryRows(db, swarmId, agentName, messages.map(message => message.id));
+
+  // Kind-filtered reads are peek-only by construction. A plain explicit inbox read
+  // acknowledges exactly the rows it returned and advances the compatibility cursor.
   if (!peek && !kind && messages.length > 0) {
-    const maxId = messages[messages.length - 1].id;
-    db.prepare(
-      'INSERT OR REPLACE INTO inbox_cursors (swarm_id, agent_name, last_read_id) VALUES (?, ?, ?)'
-    ).run(swarmId, agentName, maxId);
+    acknowledgeMessages(db, swarmId, agentName, messages.map(message => message.id));
   }
 
   return messages;
 }
 
+export function acknowledgeAllMessages(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  now: number = Date.now()
+): number[] {
+  const pending = getInbox(db, swarmId, agentName, true);
+  return acknowledgeMessages(db, swarmId, agentName, pending.map(message => message.id), now);
+}
+
+export function recordHookInjections(
+  db: Database.Database,
+  swarmId: string,
+  agentName: string,
+  messages: Message[],
+  now: number = Date.now()
+): HookInboxEntry[] {
+  if (messages.length === 0) return [];
+  const injectedAt = new Date(now).toISOString();
+  const upsert = db.prepare(`
+    INSERT INTO message_deliveries (
+      message_id, swarm_id, recipient, status, first_injected_at, inject_count
+    ) VALUES (?, ?, ?, 'injected', ?, 1)
+    ON CONFLICT(message_id, recipient) DO UPDATE SET
+      status = CASE WHEN message_deliveries.status = 'acked' THEN 'acked' ELSE 'injected' END,
+      first_injected_at = COALESCE(message_deliveries.first_injected_at, excluded.first_injected_at),
+      inject_count = CASE
+        WHEN message_deliveries.status = 'acked' THEN message_deliveries.inject_count
+        ELSE message_deliveries.inject_count + 1
+      END
+  `);
+  const select = db.prepare(`
+    SELECT * FROM message_deliveries
+    WHERE message_id = ? AND swarm_id = ? AND recipient = ? COLLATE NOCASE
+  `);
+
+  return db.transaction(() => {
+    const entries: HookInboxEntry[] = [];
+    for (const message of messages) {
+      upsert.run(message.id, swarmId, agentName, injectedAt);
+      const delivery = select.get(message.id, swarmId, agentName) as MessageDelivery;
+      if (delivery.status === 'acked') continue;
+      const firstInjectedAt = new Date(delivery.first_injected_at ?? injectedAt).getTime();
+      const elapsedMs = Math.max(0, now - firstInjectedAt);
+      entries.push({
+        message,
+        delivery,
+        collapsed:
+          delivery.inject_count >= HOOK_INJECT_COLLAPSE_COUNT ||
+          elapsedMs > HOOK_INJECT_BACKOFF_MS,
+        unackedMinutes: Math.floor(elapsedMs / 60_000),
+      });
+    }
+    return entries;
+  })();
+}
+
 /**
  * Replay the last N messages addressed to this agent REGARDLESS of the read
- * cursor, never advancing it. Exists because the awareness hook consumes
- * messages into a turn's context (advancing the cursor) — an agent that missed
- * the hook output then sees an empty `swarm inbox` and stalls on stale state
- * (field-observed three times on 2026-07-14). `swarm inbox --recent` gives
- * agents a way to re-read what the hook already consumed.
+ * cursor, never advancing it or creating live delivery state. This is the
+ * deliberate archaeology path for acknowledged and pre-join history.
  */
 export function getRecentMessages(
   db: Database.Database,
@@ -187,8 +373,8 @@ export function getRecentMessages(
 /**
  * How many messages addressed to this agent (directly or via broadcast) exist in the
  * last `hours` hours, regardless of the read cursor. Powers the zero-unread inbox hint:
- * "no new messages" plus recent traffic means the cursor already consumed them (often
- * by the awareness hook), and `--recent` is the recovery path.
+ * "no new messages" plus recent traffic means delivery state or the legacy cursor has
+ * already consumed them, and `--recent` is the recovery path.
  */
 export function countRecentMessages(
   db: Database.Database,

@@ -17,9 +17,10 @@ function insertMessage(
   body: string,
   createdAt: string = new Date().toISOString()
 ) {
-  db.prepare(
+  const result = db.prepare(
     'INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at) VALUES (?, ?, ?, ?, 1, ?)'
   ).run(SWARM_ID, from, to, body, createdAt);
+  return Number(result.lastInsertRowid);
 }
 
 describe('fleet stats', () => {
@@ -88,6 +89,35 @@ describe('fleet stats', () => {
     assert.strictEqual(stats.topPairs[0].to, 'bob');
     assert.strictEqual(stats.topPairs[0].count, 3);
     assert.strictEqual(stats.topPairs.length, 2);
+  });
+
+  test('pair aggregation uses a printable separator instead of splitting NULs in names', () => {
+    insertMessage('nul\0sender', 'bob', 'one');
+    const stats = getFleetStats(db, SWARM_ID, 24, 2);
+    assert.deepStrictEqual(stats.topPairs[0], { from: 'nul\0sender', to: 'bob', count: 1 });
+  });
+
+  test('reports per-recipient unacked count and maximum age from delivery state', () => {
+    const now = Date.now();
+    const oldId = insertMessage('alice', 'bob', 'old pending', new Date(now - 70 * 60_000).toISOString());
+    const newId = insertMessage('alice', 'bob', 'new injected', new Date(now - 5 * 60_000).toISOString());
+    const ackedId = insertMessage('alice', 'bob', 'already acked', new Date(now - 90 * 60_000).toISOString());
+    const supersededId = insertMessage('alice', 'bob', 'superseded', new Date(now - 120 * 60_000).toISOString());
+    db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ?').run(newId, supersededId);
+    const insertDelivery = db.prepare(`
+      INSERT INTO message_deliveries (
+        message_id, swarm_id, recipient, status, first_injected_at, inject_count, acked_at
+      ) VALUES (?, ?, 'Bob', ?, ?, ?, ?)
+    `);
+    insertDelivery.run(oldId, SWARM_ID, 'pending', null, 0, null);
+    insertDelivery.run(newId, SWARM_ID, 'injected', new Date(now - 5 * 60_000).toISOString(), 1, null);
+    insertDelivery.run(ackedId, SWARM_ID, 'acked', null, 0, new Date(now).toISOString());
+    insertDelivery.run(supersededId, SWARM_ID, 'pending', null, 0, null);
+
+    const stats = getFleetStats(db, SWARM_ID, 24, ['Bob'], now);
+    assert.deepStrictEqual(stats.unackedDeliveries, [{ agent: 'Bob', count: 2, maxAgeMinutes: 70 }]);
+    assert.match(formatFleetStats(stats), /Unacked deliveries \(count \/ max age\):/);
+    assert.match(formatFleetStats(stats), /Bob\s+2 unacked \| max age 70min/);
   });
 });
 

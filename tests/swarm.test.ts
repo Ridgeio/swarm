@@ -643,6 +643,11 @@ describe('migration', () => {
     try {
       const cols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[]).map(c => c.name);
       assert.ok(cols.includes('kind'), 'kind column added by the idempotent guard');
+      assert.ok(cols.includes('superseded_by'), 'supersession column added by the idempotent guard');
+      const deliveryTable = migrated.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_deliveries'"
+      ).get() as { name: string } | undefined;
+      assert.strictEqual(deliveryTable?.name, 'message_deliveries');
 
       // Old row reads back with kind NULL.
       const inbox = getInboxRaw(migrated, DEFAULT_SWARM_ID, 'Alice');
@@ -662,6 +667,9 @@ describe('migration', () => {
       migrated = getDbAt(oldPath);
       const kindCols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[]).filter(c => c.name === 'kind');
       assert.strictEqual(kindCols.length, 1);
+      const supersessionCols = (migrated.prepare('PRAGMA table_info(messages)').all() as any[])
+        .filter(c => c.name === 'superseded_by');
+      assert.strictEqual(supersessionCols.length, 1);
     } finally {
       migrated.close();
       try { fs.unlinkSync(oldPath); } catch {}

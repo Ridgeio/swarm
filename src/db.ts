@@ -90,6 +90,7 @@ function createCurrentTables(db: Database.Database): void {
       delivered INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
       kind TEXT,
+      superseded_by INTEGER,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
     );
 
@@ -99,6 +100,17 @@ function createCurrentTables(db: Database.Database): void {
       last_read_id INTEGER NOT NULL DEFAULT 0,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       PRIMARY KEY (swarm_id, agent_name)
+    );
+
+    CREATE TABLE IF NOT EXISTS message_deliveries (
+      message_id INTEGER NOT NULL,
+      swarm_id TEXT NOT NULL,
+      recipient TEXT NOT NULL COLLATE NOCASE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      first_injected_at TEXT,
+      inject_count INTEGER NOT NULL DEFAULT 0,
+      acked_at TEXT,
+      PRIMARY KEY (message_id, recipient)
     );
   `);
 }
@@ -251,6 +263,14 @@ function ensureMessageKindColumn(db: Database.Database): void {
   }
 }
 
+function ensureMessageSupersededByColumn(db: Database.Database): void {
+  if (!tableExists(db, 'messages')) return;
+  const columns = tableColumns(db, 'messages');
+  if (!columns.has('superseded_by')) {
+    db.exec('ALTER TABLE messages ADD COLUMN superseded_by INTEGER');
+  }
+}
+
 function migrate(db: Database.Database): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -258,12 +278,14 @@ function migrate(db: Database.Database): void {
   migrateMessages(db);
   migrateInboxCursors(db);
   ensureMessageKindColumn(db);
+  ensureMessageSupersededByColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);
     CREATE INDEX IF NOT EXISTS idx_agents_surface ON agents(surface_id);
     CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(swarm_id, to_agent, id);
     CREATE INDEX IF NOT EXISTS idx_messages_broadcast ON messages(swarm_id, id);
+    CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient ON message_deliveries(swarm_id, recipient, status, message_id);
   `);
 }
 

@@ -188,7 +188,10 @@ export function deleteSwarm(db: Database.Database, name: string): Swarm | null {
   if (swarm.id === DEFAULT_SWARM_ID) {
     throw new Error('The default swarm cannot be deleted. Use "swarm reset --swarm default" to clear it.');
   }
-  db.prepare('DELETE FROM swarms WHERE id = ?').run(swarm.id);
+  db.transaction(() => {
+    db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
+    db.prepare('DELETE FROM swarms WHERE id = ?').run(swarm.id);
+  }).immediate();
   return swarm;
 }
 
@@ -226,6 +229,13 @@ export function joinAgent(
       )
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null, host);
+
+    db.prepare(`
+      INSERT OR IGNORE INTO inbox_cursors (swarm_id, agent_name, last_read_id)
+      SELECT ?, ?, COALESCE(MAX(id), 0)
+      FROM messages
+      WHERE swarm_id = ?
+    `).run(swarmId, name, swarmId);
 
     db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
   });

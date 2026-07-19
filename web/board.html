@@ -26,10 +26,55 @@
     </header>
 
     <main class="workspace">
-      <section class="graph-panel" aria-label="Ownership and handoff graph">
-        <div class="panel-label">Ownership / handoffs</div>
-        <div id="graph" class="graph-canvas"></div>
-        <div class="graph-key" aria-label="Graph edge legend">
+      <section class="graph-panel" aria-label="Ownership graph and task table">
+        <header class="map-panel-header">
+          <span class="panel-label">Ownership / handoffs</span>
+          <div class="view-tabs" role="tablist" aria-label="Map panel view">
+            <button id="graph-tab" class="view-tab is-active" type="button" role="tab"
+              aria-selected="true" aria-controls="graph">Graph</button>
+            <button id="tasks-tab" class="view-tab" type="button" role="tab"
+              aria-selected="false" aria-controls="tasks-view">Tasks</button>
+          </div>
+        </header>
+        <div id="graph" class="graph-canvas" role="tabpanel" aria-labelledby="graph-tab"></div>
+        <section id="tasks-view" class="tasks-view" role="tabpanel"
+          aria-labelledby="tasks-tab" hidden>
+          <div class="task-toolbar">
+            <label class="task-filter" for="task-filter-input">
+              <span>Filter tasks</span>
+              <input id="task-filter-input" type="search" autocomplete="off"
+                placeholder="Slug or owner">
+            </label>
+            <span id="filtered-task-count" class="task-result-count" aria-live="polite">0 tasks</span>
+          </div>
+          <div class="task-table-wrap">
+            <table class="task-table">
+              <caption>Swarm tasks</caption>
+              <thead>
+                <tr>
+                  <th scope="col" data-sort-key="slug" aria-sort="none">
+                    <button class="sort-button" type="button">Task<span class="sort-indicator" aria-hidden="true">↕</span></button>
+                  </th>
+                  <th scope="col" data-sort-key="state" aria-sort="none">
+                    <button class="sort-button" type="button">State<span class="sort-indicator" aria-hidden="true">↕</span></button>
+                  </th>
+                  <th scope="col" data-sort-key="owner" aria-sort="none">
+                    <button class="sort-button" type="button">Owner<span class="sort-indicator" aria-hidden="true">↕</span></button>
+                  </th>
+                  <th scope="col" data-sort-key="checkpoint-age" aria-sort="none">
+                    <button class="sort-button" type="button">Checkpoint<span class="sort-indicator" aria-hidden="true">↕</span></button>
+                  </th>
+                  <th scope="col" data-sort-key="unpushed-count" aria-sort="none">
+                    <button class="sort-button" type="button">Branch<span class="sort-indicator" aria-hidden="true">↕</span></button>
+                  </th>
+                  <th scope="col">Next action</th>
+                </tr>
+              </thead>
+              <tbody id="tasks-body"></tbody>
+            </table>
+          </div>
+        </section>
+        <div id="graph-key" class="graph-key" aria-label="Graph edge legend">
           <span><i class="key-line solid"></i>owns</span>
           <span><i class="key-line dashed"></i>handoff</span>
           <span><i class="key-line dotted"></i>claimed</span>

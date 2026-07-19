@@ -7,6 +7,7 @@
   if (root) {
     root.boardElements = build;
     root.needsYouNodeIds = build.needsYouNodeIds;
+    root.taskRows = build.taskRows;
     root.timelineRecords = build.timelineRecords;
   }
 }(typeof window !== 'undefined' ? window :
@@ -80,6 +81,118 @@
     });
 
     return Object.keys(found).sort();
+  }
+
+  var TASK_URGENCY = {
+    awaiting_review: 0,
+    active: 1,
+    open: 2,
+    done: 3
+  };
+
+  function compareText(left, right) {
+    var a = String(left || '').toLowerCase();
+    var b = String(right || '').toLowerCase();
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  }
+
+  function shortAction(value) {
+    if (value.length <= 60) return value;
+    return value.slice(0, 59) + '\u2026';
+  }
+
+  function gitLabel(git) {
+    if (!git) return 'git n/a';
+    var labels = [];
+    if (git.dirty) labels.push('dirty');
+    var unpushed = Number(git.unpushed || 0);
+    if (unpushed > 0) labels.push('\u2191' + unpushed);
+    return labels.length > 0 ? labels.join(' \u00b7 ') : 'clean';
+  }
+
+  function taskRows(boardData, opts) {
+    var board = boardData || {};
+    var options = opts || {};
+    var tasks = Array.isArray(board.tasks) ? board.tasks : [];
+    var filter = String(options.filter || '').trim().toLowerCase();
+    var onlyNeeds = Boolean(options.onlyNeeds);
+    var sortKey = String(options.sortKey || 'urgency');
+    var direction = options.sortDir === 'desc' ? -1 : 1;
+    var needed = Object.create(null);
+
+    if (onlyNeeds) {
+      needsYouNodeIds(board).forEach(function (id) { needed[id] = true; });
+    }
+
+    var entries = tasks.map(function (task, index) {
+      var state = String(task.state || 'unknown');
+      var owner = task.owner ? String(task.owner) : 'unowned';
+      var checkpointAge = task.checkpoint && Number.isFinite(Number(task.checkpoint.ageMin))
+        ? Number(task.checkpoint.ageMin)
+        : null;
+      var nextAction = task.checkpoint && task.checkpoint.nextAction
+        ? String(task.checkpoint.nextAction)
+        : 'not recorded';
+      var row = {
+        id: nodeId('task', task.id),
+        slug: String(task.id),
+        stateLabel: state,
+        stateClass: 'st-' + fragment(state),
+        stale: Boolean(task.stale),
+        owner: owner,
+        checkpointLabel: checkpointAge === null ? 'no ckpt' : checkpointAge + 'm ago',
+        branch: task.branch ? String(task.branch) : 'no branch',
+        gitLabel: gitLabel(task.git),
+        nextActionFull: nextAction,
+        nextActionShort: shortAction(nextAction)
+      };
+      return {
+        index: index,
+        row: row,
+        checkpointAge: checkpointAge,
+        unpushed: task.git ? Number(task.git.unpushed || 0) : 0
+      };
+    }).filter(function (entry) {
+      if (onlyNeeds && !needed[entry.row.id]) return false;
+      if (!filter) return true;
+      return entry.row.slug.toLowerCase().indexOf(filter) !== -1 ||
+        entry.row.owner.toLowerCase().indexOf(filter) !== -1;
+    });
+
+    entries.sort(function (left, right) {
+      var comparison = 0;
+      if (sortKey === 'urgency') {
+        if (left.row.stale !== right.row.stale) return left.row.stale ? -1 : 1;
+        var leftRank = Object.prototype.hasOwnProperty.call(TASK_URGENCY, left.row.stateLabel)
+          ? TASK_URGENCY[left.row.stateLabel]
+          : 4;
+        var rightRank = Object.prototype.hasOwnProperty.call(TASK_URGENCY, right.row.stateLabel)
+          ? TASK_URGENCY[right.row.stateLabel]
+          : 4;
+        comparison = leftRank - rightRank;
+      } else if (sortKey === 'slug') {
+        comparison = compareText(left.row.slug, right.row.slug) * direction;
+      } else if (sortKey === 'state') {
+        comparison = compareText(left.row.stateLabel, right.row.stateLabel) * direction;
+      } else if (sortKey === 'owner') {
+        comparison = compareText(left.row.owner, right.row.owner) * direction;
+      } else if (sortKey === 'checkpoint-age') {
+        if (left.checkpointAge === null || right.checkpointAge === null) {
+          if (left.checkpointAge !== right.checkpointAge) {
+            return left.checkpointAge === null ? 1 : -1;
+          }
+        } else {
+          comparison = (left.checkpointAge - right.checkpointAge) * direction;
+        }
+      } else if (sortKey === 'unpushed-count') {
+        comparison = (left.unpushed - right.unpushed) * direction;
+      }
+      return comparison || left.index - right.index;
+    });
+
+    return entries.map(function (entry) { return entry.row; });
   }
 
   var TIMELINE_COLORS = {
@@ -257,6 +370,7 @@
   }
 
   boardElements.needsYouNodeIds = needsYouNodeIds;
+  boardElements.taskRows = taskRows;
   boardElements.timelineRecords = timelineRecords;
 
   return boardElements;

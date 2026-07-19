@@ -246,6 +246,7 @@ swarm board --serve --port 7790 --print-url
 
 Served mode prints a token-bearing loopback URL and stays in the foreground until Ctrl-C. `--tab` prefers a cmux browser workspace and falls back to the system browser; `--open` uses the system browser directly.
 The served board includes a theme-aware fleet dashboard, a task-event timeline coordinated with graph selection, and an “Only what needs me” view. Agent inspectors can focus the agent's registered cmux terminal without accepting browser-provided surface IDs or commands.
+Use the Graph | Tasks toggle to switch between the live ownership map and a sortable, filterable task table without losing the current selection.
 
 ## Example workflows
 

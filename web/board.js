@@ -16,6 +16,10 @@
     inspectedEvent: null,
     lastPollAt: 0,
     onlyNeeds: true,
+    view: 'graph',
+    taskSortKey: 'urgency',
+    taskSortDir: 'asc',
+    taskFilter: '',
     charts: { debris: null, tasks: null, timeline: null }
   };
 
@@ -377,6 +381,148 @@
     });
   }
 
+  function taskCell(row, text, className) {
+    var cell = document.createElement('td');
+    if (className) cell.className = className;
+    cell.textContent = text;
+    row.appendChild(cell);
+    return cell;
+  }
+
+  function updateTaskSortHeaders() {
+    var headers = document.querySelectorAll('.task-table th[data-sort-key]');
+    Array.prototype.forEach.call(headers, function (header) {
+      var key = header.getAttribute('data-sort-key');
+      var selected = state.taskSortKey === key;
+      var indicator = header.querySelector('.sort-indicator');
+      header.setAttribute('aria-sort', selected
+        ? (state.taskSortDir === 'asc' ? 'ascending' : 'descending')
+        : 'none');
+      setText(indicator, selected ? (state.taskSortDir === 'asc' ? '↑' : '↓') : '↕');
+    });
+  }
+
+  function emptyTaskRow(body, message) {
+    var row = document.createElement('tr');
+    var cell = document.createElement('td');
+    cell.className = 'task-empty-cell';
+    cell.colSpan = 6;
+    cell.textContent = message;
+    row.appendChild(cell);
+    body.appendChild(row);
+  }
+
+  function renderTasks(board) {
+    var body = element('tasks-body');
+    if (!body) return;
+    clear(body);
+    updateTaskSortHeaders();
+    if (!window.taskRows) {
+      setText(element('filtered-task-count'), '0 tasks');
+      emptyTaskRow(body, 'Task table assets are unavailable.');
+      return;
+    }
+    // The table is a full task list — it always shows every task (narrowed only
+    // by its own text filter). The "only what needs me" toggle is a graph/triage
+    // affordance and must NOT silently hide most of the list.
+    var rows = window.taskRows(board, {
+      sortKey: state.taskSortKey,
+      sortDir: state.taskSortDir,
+      filter: state.taskFilter,
+      onlyNeeds: false
+    });
+    setText(element('filtered-task-count'), rows.length + (rows.length === 1 ? ' task' : ' tasks'));
+    if (rows.length === 0) {
+      emptyTaskRow(body, board.tasks.length === 0
+        ? 'No tasks recorded.'
+        : 'No tasks match the current filters.');
+      return;
+    }
+    rows.forEach(function (task) {
+      var row = document.createElement('tr');
+      var stateCell;
+      var statePill;
+      var branchCell;
+      var branchWrap;
+      var branchName;
+      var gitIndicator;
+      var nextAction;
+      row.className = 'task-row';
+      row.tabIndex = 0;
+      row.classList.toggle('is-selected', state.selectedId === task.id);
+      row.setAttribute('aria-selected', state.selectedId === task.id ? 'true' : 'false');
+      taskCell(row, task.slug, 'task-slug');
+
+      stateCell = document.createElement('td');
+      statePill = document.createElement('span');
+      statePill.className = 'state-pill ' + task.stateClass + (task.stale ? ' is-stale' : '');
+      statePill.textContent = task.stateLabel;
+      if (task.stale) {
+        var stale = document.createElement('span');
+        stale.className = 'stale-marker';
+        stale.textContent = 'STALE';
+        statePill.appendChild(stale);
+      }
+      stateCell.appendChild(statePill);
+      row.appendChild(stateCell);
+
+      taskCell(row, task.owner, 'task-owner');
+      taskCell(row, task.checkpointLabel, 'numeric-cell');
+
+      branchCell = document.createElement('td');
+      branchWrap = document.createElement('div');
+      branchName = document.createElement('span');
+      gitIndicator = document.createElement('span');
+      branchWrap.className = 'branch-cell';
+      branchName.className = 'branch-name';
+      gitIndicator.className = 'git-indicator';
+      branchName.textContent = task.branch;
+      gitIndicator.textContent = task.gitLabel;
+      branchWrap.appendChild(branchName);
+      branchWrap.appendChild(gitIndicator);
+      branchCell.appendChild(branchWrap);
+      row.appendChild(branchCell);
+
+      nextAction = taskCell(row, task.nextActionShort, 'next-action');
+      nextAction.setAttribute('title', task.nextActionFull);
+      function chooseTask() {
+        selectNode(task.id);
+      }
+      row.addEventListener('click', chooseTask);
+      row.addEventListener('keydown', function (event) {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          chooseTask();
+        }
+      });
+      body.appendChild(row);
+    });
+  }
+
+  function setView(view) {
+    var nextView = view === 'tasks' ? 'tasks' : 'graph';
+    var graphTab = element('graph-tab');
+    var tasksTab = element('tasks-tab');
+    var tasksView = element('tasks-view');
+    var graphKey = element('graph-key');
+    state.view = nextView;
+    graph.hidden = nextView !== 'graph';
+    if (tasksView) tasksView.hidden = nextView !== 'tasks';
+    if (graphKey) graphKey.hidden = nextView !== 'graph';
+    if (graphTab) {
+      graphTab.classList.toggle('is-active', nextView === 'graph');
+      graphTab.setAttribute('aria-selected', nextView === 'graph' ? 'true' : 'false');
+    }
+    if (tasksTab) {
+      tasksTab.classList.toggle('is-active', nextView === 'tasks');
+      tasksTab.setAttribute('aria-selected', nextView === 'tasks' ? 'true' : 'false');
+    }
+    if (nextView === 'tasks' && state.board) renderTasks(state.board);
+    if (nextView === 'graph' && state.cy) {
+      window.requestAnimationFrame(function () { state.cy.resize(); });
+    }
+  }
+
   function detailRow(list, key, value) {
     var row = document.createElement('li');
     var term = document.createElement('span');
@@ -663,6 +809,7 @@
     applyNeedsFilter();
     inspectSelection(state.selectedId);
     renderTimeline();
+    if (state.board) renderTasks(state.board);
   }
 
   function updateGraph(board) {
@@ -764,6 +911,7 @@
       renderNeeds(board);
       renderDashboard(board);
       updateGraph(board);
+      renderTasks(board);
       renderTimeline();
       refreshFreshness();
     }).catch(function () {
@@ -776,6 +924,48 @@
   }
 
   state.cy = createGraph();
+  var graphTab = element('graph-tab');
+  var tasksTab = element('tasks-tab');
+  if (graphTab && tasksTab) {
+    graphTab.addEventListener('click', function () { setView('graph'); });
+    tasksTab.addEventListener('click', function () { setView('tasks'); });
+    [graphTab, tasksTab].forEach(function (tab, index) {
+      tab.addEventListener('keydown', function (event) {
+        if (event.key !== 'ArrowLeft' && event.key !== 'ArrowRight' &&
+            event.key !== 'Home' && event.key !== 'End') return;
+        event.preventDefault();
+        var target = event.key === 'Home' ||
+          (event.key === 'ArrowLeft' && index === 1) ||
+          (event.key === 'ArrowRight' && index === 1)
+          ? graphTab
+          : tasksTab;
+        target.focus();
+        setView(target === graphTab ? 'graph' : 'tasks');
+      });
+    });
+  }
+  var sortableHeaders = document.querySelectorAll('.task-table th[data-sort-key]');
+  Array.prototype.forEach.call(sortableHeaders, function (header) {
+    var button = header.querySelector('.sort-button');
+    if (!button) return;
+    button.addEventListener('click', function () {
+      var key = header.getAttribute('data-sort-key');
+      if (state.taskSortKey === key) {
+        state.taskSortDir = state.taskSortDir === 'asc' ? 'desc' : 'asc';
+      } else {
+        state.taskSortKey = key;
+        state.taskSortDir = 'asc';
+      }
+      if (state.board) renderTasks(state.board);
+    });
+  });
+  var taskFilter = element('task-filter-input');
+  if (taskFilter) {
+    taskFilter.addEventListener('input', function () {
+      state.taskFilter = taskFilter.value;
+      if (state.board) renderTasks(state.board);
+    });
+  }
   var toggle = element('needs-only-toggle');
   if (toggle) {
     toggle.checked = state.onlyNeeds;
@@ -783,8 +973,11 @@
       state.onlyNeeds = toggle.checked;
       if (state.board) renderNeeds(state.board);
       applyNeedsFilter();
+      if (state.board) renderTasks(state.board);
     });
   }
+  updateTaskSortHeaders();
+  setView('graph');
   var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   if (media && media.addEventListener) {
     media.addEventListener('change', function () {
@@ -797,7 +990,7 @@
     });
   }
   window.addEventListener('resize', function () {
-    if (state.cy) state.cy.resize();
+    if (state.cy && state.view === 'graph') state.cy.resize();
     Object.keys(state.charts).forEach(function (key) {
       if (state.charts[key]) state.charts[key].resize();
     });

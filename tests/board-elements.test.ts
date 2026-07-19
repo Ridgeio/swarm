@@ -27,8 +27,31 @@ interface TimelineRecord {
   event: BoardData['timeline'][number];
 }
 
+interface TaskRow {
+  id: string;
+  slug: string;
+  stateLabel: string;
+  stateClass: string;
+  stale: boolean;
+  owner: string;
+  checkpointLabel: string;
+  branch: string;
+  gitLabel: string;
+  nextActionFull: string;
+  nextActionShort: string;
+}
+
 type BoardElementsModule = BuildElements & {
   needsYouNodeIds: (data: BoardData) => string[];
+  taskRows: (
+    data: BoardData,
+    opts: {
+      sortKey: string;
+      sortDir: 'asc' | 'desc';
+      filter: string;
+      onlyNeeds: boolean;
+    }
+  ) => TaskRow[];
   timelineRecords: (
     data: BoardData,
     selectedTaskId?: string | null
@@ -158,6 +181,44 @@ function byId(elements: GraphElement[], id: string): GraphElement {
   return found;
 }
 
+function tasksFixture(): BoardData {
+  const data = fixture();
+  const template = data.tasks[0];
+  const task = (
+    id: string,
+    state: BoardData['tasks'][number]['state'],
+    owner: string | null,
+    checkpointAge: number | null,
+    unpushed: number | null,
+    stale = false,
+    nextAction = `Continue ${id}`
+  ): BoardData['tasks'][number] => ({
+    ...template,
+    id,
+    title: `${id} title`,
+    state,
+    owner,
+    branch: `feat/${id}`,
+    stale,
+    checkpoint: checkpointAge === null
+      ? null
+      : { seq: checkpointAge, ageMin: checkpointAge, nextAction, path: `/ckpt/${id}` },
+    git: unpushed === null ? null : { dirty: id === 'delta', untracked: 0, unpushed },
+  });
+  data.tasks = [
+    task('delta', 'active', 'Zoe', 50, 1, true),
+    task('bravo', 'awaiting_review', 'Amy', 10, 3),
+    task('echo', 'awaiting_review', 'Mira', null, 0),
+    task('alpha', 'active', 'Bob', 2, 0),
+    task('charlie', 'open', null, 25, null),
+    task('foxtrot', 'done', 'Nia', 5, 2),
+    task('golf', 'done', 'Nia', 5, 2),
+  ];
+  data.edges.ownership = [];
+  data.needsYou = [];
+  return data;
+}
+
 describe('V1-B boardElements', () => {
   test('maps agents, task states, debris, and all three edge semantics', () => {
     const build = loadBuilder();
@@ -265,5 +326,109 @@ describe('V1-C coordinated board helpers', () => {
     assert.strictEqual(filtered.records.length, 1);
     assert.strictEqual(filtered.records[0].eventKind, 'note');
     assert.strictEqual(JSON.stringify(data), before, 'pure mapping must not mutate BoardData');
+  });
+});
+
+describe('V1-D taskRows', () => {
+  const rowOptions = (sortKey: string, sortDir: 'asc' | 'desc') => ({
+    sortKey,
+    sortDir,
+    filter: '',
+    onlyNeeds: false,
+  });
+
+  test('defaults to stable urgency order with stale tasks first', () => {
+    const build = loadBuilder();
+    const data = tasksFixture();
+    const before = JSON.stringify(data);
+    const rows = build.taskRows(data, rowOptions('urgency', 'asc'));
+
+    assert.deepStrictEqual(Array.from(rows, row => row.slug), [
+      'delta', 'bravo', 'echo', 'alpha', 'charlie', 'foxtrot', 'golf',
+    ]);
+    assert.strictEqual(JSON.stringify(data), before, 'pure mapping must not mutate BoardData');
+  });
+
+  const sortCases: Record<string, { asc: string[]; desc: string[] }> = {
+    slug: {
+      asc: ['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot', 'golf'],
+      desc: ['golf', 'foxtrot', 'echo', 'delta', 'charlie', 'bravo', 'alpha'],
+    },
+    state: {
+      asc: ['delta', 'alpha', 'bravo', 'echo', 'foxtrot', 'golf', 'charlie'],
+      desc: ['charlie', 'foxtrot', 'golf', 'bravo', 'echo', 'delta', 'alpha'],
+    },
+    owner: {
+      asc: ['bravo', 'alpha', 'echo', 'foxtrot', 'golf', 'charlie', 'delta'],
+      desc: ['delta', 'charlie', 'foxtrot', 'golf', 'echo', 'alpha', 'bravo'],
+    },
+    'checkpoint-age': {
+      asc: ['alpha', 'foxtrot', 'golf', 'bravo', 'charlie', 'delta', 'echo'],
+      desc: ['delta', 'charlie', 'bravo', 'foxtrot', 'golf', 'alpha', 'echo'],
+    },
+    'unpushed-count': {
+      asc: ['echo', 'alpha', 'charlie', 'delta', 'foxtrot', 'golf', 'bravo'],
+      desc: ['bravo', 'foxtrot', 'golf', 'delta', 'echo', 'alpha', 'charlie'],
+    },
+  };
+
+  Object.entries(sortCases).forEach(([sortKey, expected]) => {
+    test(`sorts ${sortKey} ascending and descending, stably`, () => {
+      const build = loadBuilder();
+      const data = tasksFixture();
+      assert.deepStrictEqual(
+        Array.from(build.taskRows(data, rowOptions(sortKey, 'asc')), row => row.slug),
+        expected.asc
+      );
+      assert.deepStrictEqual(
+        Array.from(build.taskRows(data, rowOptions(sortKey, 'desc')), row => row.slug),
+        expected.desc
+      );
+    });
+  });
+
+  test('filters case-insensitively by slug or owner', () => {
+    const build = loadBuilder();
+    const data = tasksFixture();
+    const slugRows = build.taskRows(data, { ...rowOptions('urgency', 'asc'), filter: 'ALP' });
+    const ownerRows = build.taskRows(data, { ...rowOptions('urgency', 'asc'), filter: 'nIa' });
+
+    assert.deepStrictEqual(Array.from(slugRows, row => row.slug), ['alpha']);
+    assert.deepStrictEqual(Array.from(ownerRows, row => row.slug), ['foxtrot', 'golf']);
+  });
+
+  test('onlyNeeds uses task ids from needsYouNodeIds', () => {
+    const build = loadBuilder();
+    const data = tasksFixture();
+    data.needsYou = [
+      { kind: 'awaiting_review', label: 'Review Echo', refId: 'echo' },
+      { kind: 'agent', label: 'Check Alice', refId: 'Alice' },
+      { kind: 'janitor_stale', label: 'Run janitor', refId: 'janitor' },
+    ];
+
+    const rows = build.taskRows(data, { ...rowOptions('urgency', 'asc'), onlyNeeds: true });
+    assert.deepStrictEqual(Array.from(rows, row => row.slug), ['echo']);
+  });
+
+  test('maps graph state classes, stale state, git labels, and truncated next actions', () => {
+    const build = loadBuilder();
+    const data = tasksFixture();
+    const full = 'Inspect the projection, reconcile every outstanding branch, and report the exact evidence.';
+    data.tasks[3].checkpoint!.nextAction = full;
+    const rows = build.taskRows(data, rowOptions('urgency', 'asc'));
+    const stale = rows.find(row => row.slug === 'delta');
+    const review = rows.find(row => row.slug === 'bravo');
+    const alpha = rows.find(row => row.slug === 'alpha');
+
+    assert.ok(stale);
+    assert.strictEqual(stale.id, 'task:delta');
+    assert.strictEqual(stale.stateLabel, 'active');
+    assert.strictEqual(stale.stateClass, 'st-active');
+    assert.strictEqual(stale.stale, true);
+    assert.strictEqual(stale.gitLabel, 'dirty · ↑1');
+    assert.strictEqual(review?.stateClass, 'st-awaiting_review');
+    assert.strictEqual(alpha?.nextActionFull, full);
+    assert.strictEqual(alpha?.nextActionShort, `${full.slice(0, 59)}…`);
+    assert.strictEqual(alpha?.nextActionShort.length, 60);
   });
 });

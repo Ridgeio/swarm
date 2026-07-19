@@ -1,48 +1,31 @@
 import type Database from 'better-sqlite3';
 import { execFileSync } from 'child_process';
+import { createHash } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
-import { pathToFileURL } from 'url';
-import { CHECKPOINT_STALE_MINUTES } from './tasks.js';
 import {
-  JANITOR_HEARTBEAT_STALE_MS,
-  type JanitorCounters,
-} from './janitor.js';
+  boardAgeLabel,
+  boardHasTable,
+  collectBoardData,
+  type BoardAgentData,
+  type BoardData,
+  type BoardTaskData,
+} from './board-data.js';
+import { JANITOR_HEARTBEAT_STALE_MS } from './janitor.js';
 import { spawnBrowserWorkspace, spawnWorkspace } from './transport.js';
+import { fileURLToPath, pathToFileURL } from 'url';
 
-const URGENT_MESSAGE_KINDS = ['gate', 'escalation', 'merge-req'] as const;
 export const BOARD_DEFAULT_WATCH_SECONDS = 5;
 export const BOARD_CMUX_GUIDANCE = "cmux not found — run 'swarm board --watch' directly in a terminal you want to watch.";
-export const BOARD_MERMAID_CDN_URL = 'https://cdn.jsdelivr.net/npm/mermaid@11.12.0/dist/mermaid.esm.min.mjs';
+const MERMAID_VENDOR_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'vendor',
+  'mermaid.min.js'
+);
 
-interface BoardTask {
-  id: string;
-  state: string;
-  owner_agent: string | null;
-  lease_epoch: number;
-  repo_path: string | null;
-  branch: string | null;
-  worktree_path: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-interface CheckpointEvent {
-  id: number;
-  created_at: string;
-  data: string | null;
-}
-
-interface AgentRow {
-  name: string;
-  agent_type: string;
-  host_agent: string | null;
-}
-
-interface JanitorRow {
-  last_tick_at: string;
-  counters: string;
-}
+export { boardHasTable } from './board-data.js';
 
 export interface BoardRenderOptions {
   now?: number;
@@ -74,6 +57,8 @@ export interface BoardHtmlOptions {
   watchSeconds?: number;
 }
 
+export type BoardGraphFileOptions = BoardHtmlOptions;
+
 export interface BoardGraphWatchOptions {
   regenerate: () => void;
   intervalMs?: number;
@@ -88,60 +73,6 @@ export interface BoardGraphTabOptions {
   writeError?: (value: string) => void;
 }
 
-const REQUIRED_COLUMNS: Record<string, string[]> = {
-  swarms: ['id', 'name', 'root_path'],
-  agents: ['swarm_id', 'name', 'surface_id', 'joined_at', 'agent_type', 'host_agent'],
-  messages: ['id', 'swarm_id', 'from_agent', 'body', 'kind', 'superseded_by'],
-  message_deliveries: ['message_id', 'swarm_id', 'recipient', 'status', 'acked_at'],
-  tasks: [
-    'id', 'swarm_id', 'state', 'owner_agent', 'lease_epoch', 'repo_path',
-    'branch', 'worktree_path', 'created_at', 'updated_at',
-  ],
-  task_events: ['id', 'swarm_id', 'task_id', 'kind', 'actor', 'data', 'created_at'],
-  janitor_status: ['last_tick_at', 'counters'],
-};
-
-function tableColumns(db: Database.Database, table: string): Set<string> | null {
-  const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
-    .get(table);
-  if (!exists) return null;
-  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
-  return new Set(rows.map(row => row.name));
-}
-
-function hasSchema(db: Database.Database | null, tables: string[]): db is Database.Database {
-  if (!db) return false;
-  return tables.every(table => {
-    const columns = tableColumns(db, table);
-    return columns !== null && REQUIRED_COLUMNS[table].every(column => columns.has(column));
-  });
-}
-
-export function boardHasTable(db: Database.Database | null, table: string): boolean {
-  if (!db) return false;
-  const columns = tableColumns(db, table);
-  const required = REQUIRED_COLUMNS[table] ?? [];
-  return columns !== null && required.every(column => columns.has(column));
-}
-
-function oneLine(value: string, limit: number = 100): string {
-  const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
-  if (flattened.length <= limit) return flattened;
-  return `${flattened.slice(0, Math.max(0, limit - 1))}\u2026`;
-}
-
-function ageMinutes(iso: string | null | undefined, now: number): number | null {
-  if (!iso) return null;
-  const timestamp = new Date(iso).getTime();
-  if (!Number.isFinite(timestamp)) return null;
-  return Math.max(0, Math.floor((now - timestamp) / 60_000));
-}
-
-function ageLabel(iso: string | null | undefined, now: number): string {
-  const age = ageMinutes(iso, now);
-  return age === null ? 'none' : `${age}m`;
-}
-
 function section(title: string, lines: string[]): string {
   const rows = lines.length > 0 ? lines : ['not available'];
   const innerWidth = Math.max(title.length + 3, 20, ...rows.map(row => row.length + 2));
@@ -151,295 +82,63 @@ function section(title: string, lines: string[]): string {
   return `${top}\n${body}\n${bottom}`;
 }
 
-function latestCheckpoint(
-  db: Database.Database,
-  swarmId: string,
-  taskId: string
-): CheckpointEvent | null {
-  return db.prepare(`
-    SELECT id, created_at, data
-    FROM task_events
-    WHERE swarm_id = ? AND task_id = ? AND kind = 'checkpoint'
-    ORDER BY created_at DESC, id DESC
-    LIMIT 1
-  `).get(swarmId, taskId) as CheckpointEvent | undefined ?? null;
+function isUnavailable(data: BoardData, tables: string[]): boolean {
+  return tables.some(table => data.unavailable.includes(table));
 }
 
-function checkpointPath(event: CheckpointEvent | null): string | null {
-  if (!event?.data) return null;
-  try {
-    const parsed = JSON.parse(event.data) as { path?: unknown };
-    return typeof parsed.path === 'string' ? parsed.path : null;
-  } catch {
-    return null;
-  }
-}
-
-function readCheckpoint(event: CheckpointEvent | null): string | null {
-  const filePath = checkpointPath(event);
-  if (!filePath) return null;
-  try {
-    return fs.readFileSync(filePath, 'utf-8');
-  } catch {
-    return null;
-  }
-}
-
-function sectionContents(contents: string, heading: string): string[] {
-  const lines = contents.split(/\r?\n/);
-  const index = lines.findIndex(line => line.trim().toLowerCase() === `## ${heading.toLowerCase()}`);
-  if (index === -1) return [];
-  const found: string[] = [];
-  for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
-    const line = lines[cursor].trim();
-    if (line.startsWith('## ')) break;
-    if (line) found.push(line);
-  }
-  return found;
-}
-
-function nextAction(event: CheckpointEvent | null): string {
-  const contents = readCheckpoint(event);
-  if (!contents) return '(not recorded)';
-  const lines = sectionContents(contents, 'next action');
-  return lines.length > 0 ? oneLine(lines[0]) : '(not recorded)';
-}
-
-function readGit(cwd: string, args: string[]): string | null {
-  try {
-    return execFileSync('git', ['--no-optional-locks', '-C', cwd, ...args], {
-      encoding: 'utf-8',
-      env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2_000,
-    }).trimEnd();
-  } catch {
-    return null;
-  }
-}
-
-function branchFacts(task: BoardTask): string {
+function branchFacts(task: BoardTaskData): string {
   if (!task.branch) return '-';
-  if (!task.repo_path) return `${task.branch} (push?/dirty?)`;
-  const cwd = task.worktree_path && fs.existsSync(task.worktree_path)
-    ? task.worktree_path
-    : task.repo_path;
-  const status = readGit(cwd, ['status', '--porcelain=v1', '--untracked-files=all']);
-  const unpushed = readGit(task.repo_path, ['log', task.branch, '--not', '--remotes', '--oneline']);
-  const dirty = status === null ? 'dirty?' : status.length > 0 ? 'dirty' : 'clean';
-  const pushed = unpushed === null
-    ? 'push?'
-    : unpushed.length > 0 ? `unpushed:${unpushed.split('\n').filter(Boolean).length}` : 'pushed';
+  if (!task.repoPath || !task.git) return `${task.branch} (push?/dirty?)`;
+  const pushed = task.git.unpushed > 0 ? `unpushed:${task.git.unpushed}` : 'pushed';
+  const dirty = task.git.dirty || task.git.untracked > 0 ? 'dirty' : 'clean';
   return `${task.branch} (${pushed}/${dirty})`;
 }
 
-function renderNeedsYou(db: Database.Database | null, swarmId: string, now: number): string[] | null {
-  if (!hasSchema(db, ['messages', 'message_deliveries', 'tasks', 'task_events', 'janitor_status'])) {
-    return null;
-  }
-
-  const lines: string[] = [];
-  const deliveries = db.prepare(`
-    SELECT m.id, m.kind, m.from_agent, m.body, d.recipient
-    FROM message_deliveries d
-    JOIN messages m ON m.id = d.message_id AND m.swarm_id = d.swarm_id
-    WHERE d.swarm_id = ?
-      AND d.acked_at IS NULL
-      AND d.status <> 'acked'
-      AND m.superseded_by IS NULL
-      AND m.kind IN (${URGENT_MESSAGE_KINDS.map(() => '?').join(', ')})
-    ORDER BY m.id ASC, d.recipient COLLATE NOCASE ASC
-  `).all(swarmId, ...URGENT_MESSAGE_KINDS) as Array<{
-    id: number;
-    kind: string;
-    from_agent: string;
-    body: string;
-    recipient: string;
-  }>;
-  for (const delivery of deliveries) {
-    lines.push(
-      `message #${delivery.id} [${delivery.kind}] for ${delivery.recipient} from ${delivery.from_agent} \u2014 ` +
-      oneLine(delivery.body, 70)
-    );
-  }
-
-  const awaitingReview = db.prepare(`
-    SELECT id, owner_agent, lease_epoch
-    FROM tasks
-    WHERE swarm_id = ? AND state = 'awaiting_review'
-    ORDER BY updated_at ASC, id ASC
-  `).all(swarmId) as Array<{ id: string; owner_agent: string | null; lease_epoch: number }>;
-  for (const task of awaitingReview) {
-    lines.push(`task ${task.id} awaits review \u2014 ${task.owner_agent ?? 'unowned'}(${task.lease_epoch})`);
-  }
-
-  const active = db.prepare(`
-    SELECT id, state, owner_agent, lease_epoch, repo_path, branch, worktree_path, created_at, updated_at
-    FROM tasks
-    WHERE swarm_id = ? AND state = 'active'
-    ORDER BY created_at ASC, id ASC
-  `).all(swarmId) as BoardTask[];
-  for (const task of active) {
-    const checkpoint = latestCheckpoint(db, swarmId, task.id);
-    const evidenceAt = checkpoint?.created_at ?? task.created_at;
-    const age = ageMinutes(evidenceAt, now);
-    if (age !== null && age > CHECKPOINT_STALE_MINUTES) {
-      const evidence = checkpoint ? `checkpoint ${age}m ago` : `no checkpoint for ${age}m`;
-      lines.push(`task ${task.id} stalled \u2014 ${evidence}`);
-    }
-  }
-
-  const janitor = db.prepare('SELECT last_tick_at, counters FROM janitor_status WHERE id = 1')
-    .get() as JanitorRow | undefined;
-  if (janitor) {
-    const tick = new Date(janitor.last_tick_at).getTime();
-    if (Number.isFinite(tick) && now - tick > JANITOR_HEARTBEAT_STALE_MS) {
-      lines.push(`janitor heartbeat stale \u2014 tick ${ageLabel(janitor.last_tick_at, now)} ago`);
-    }
-  }
-
-  return lines.length > 0 ? lines : ['nothing needs you'];
+function renderNeedsYou(data: BoardData): string[] | null {
+  if (isUnavailable(data, [
+    'messages', 'message_deliveries', 'tasks', 'task_events', 'janitor_status',
+  ])) return null;
+  return data.needsYou.length > 0
+    ? data.needsYou.map(item => item.label)
+    : ['nothing needs you'];
 }
 
-function renderTasks(db: Database.Database | null, swarmId: string, now: number): string[] | null {
-  if (!hasSchema(db, ['tasks', 'task_events', 'agents'])) return null;
-  const tasks = db.prepare(`
-    SELECT id, state, owner_agent, lease_epoch, repo_path, branch, worktree_path, created_at, updated_at
-    FROM tasks
-    WHERE swarm_id = ? AND state <> 'done'
-    ORDER BY
-      CASE state WHEN 'awaiting_review' THEN 0 WHEN 'active' THEN 1 WHEN 'open' THEN 2 ELSE 3 END,
-      updated_at ASC,
-      id ASC
-  `).all(swarmId) as BoardTask[];
+function renderTasks(data: BoardData): string[] | null {
+  if (isUnavailable(data, ['tasks', 'task_events', 'agents'])) return null;
+  const tasks = data.tasks.filter(task => task.state !== 'done');
   if (tasks.length === 0) return ['no non-done tasks'];
-
+  const agents = new Map(data.agents.map(agent => [agent.name.toLowerCase(), agent]));
   return tasks.map(task => {
-    const checkpoint = latestCheckpoint(db, swarmId, task.id);
-    const owner = task.owner_agent ?? 'unowned';
-    const agent = task.owner_agent
-      ? db.prepare(`
-          SELECT name, agent_type, host_agent FROM agents
-          WHERE swarm_id = ? AND name = ? COLLATE NOCASE
-        `).get(swarmId, task.owner_agent) as AgentRow | undefined
-      : undefined;
-    const host = agent?.host_agent ?? agent?.agent_type ?? 'unknown';
-    return `${task.id} | ${task.state} | ${owner}(${task.lease_epoch}) | -/${host} | ` +
-      `${checkpoint ? ageLabel(checkpoint.created_at, now) : 'none'} | ${branchFacts(task)} | ${nextAction(checkpoint)}`;
+    const owner = task.owner ?? 'unowned';
+    const host = task.owner
+      ? agents.get(task.owner.toLowerCase())?.host ?? 'unknown'
+      : 'unknown';
+    return `${task.id} | ${task.state} | ${owner}(${task.leaseEpoch}) | -/${host} | ` +
+      `${task.checkpoint ? `${task.checkpoint.ageMin}m` : 'none'} | ${branchFacts(task)} | ` +
+      `${task.checkpoint?.nextAction ?? '(not recorded)'}`;
   });
 }
 
-function latestProgressAt(db: Database.Database, swarmId: string, agent: string): string | null {
-  const taskEvidence = db.prepare(`
-    SELECT
-      MAX(CASE WHEN kind = 'checkpoint' THEN created_at END) AS checkpoint_at,
-      MAX(created_at) AS event_at
-    FROM task_events
-    WHERE swarm_id = ? AND actor = ? COLLATE NOCASE
-  `).get(swarmId, agent) as { checkpoint_at: string | null; event_at: string | null };
-  const deliveryEvidence = db.prepare(`
-    SELECT MAX(acked_at) AS acked_at
-    FROM message_deliveries
-    WHERE swarm_id = ? AND recipient = ? COLLATE NOCASE AND acked_at IS NOT NULL
-  `).get(swarmId, agent) as { acked_at: string | null };
-  const candidates = [taskEvidence.checkpoint_at, taskEvidence.event_at, deliveryEvidence.acked_at]
-    .filter((value): value is string => value !== null)
-    .map(value => ({ value, timestamp: new Date(value).getTime() }))
-    .filter(entry => Number.isFinite(entry.timestamp));
-  candidates.sort((left, right) => right.timestamp - left.timestamp);
-  return candidates[0]?.value ?? null;
+function renderFleet(data: BoardData, now: number): string[] | null {
+  if (isUnavailable(data, [
+    'agents', 'tasks', 'task_events', 'messages', 'message_deliveries',
+  ])) return null;
+  if (data.agents.length === 0) return ['no registered agents'];
+  return data.agents.map(agent =>
+    `${agent.name} | ${agent.host} | ${agent.currentTaskId ?? '-'} | ` +
+    `progress ${boardAgeLabel(agent.progressEvidenceAt, now)} | ${agent.unackedCount} unacked`
+  );
 }
 
-function renderFleet(db: Database.Database | null, swarmId: string, now: number): string[] | null {
-  if (!hasSchema(db, ['agents', 'tasks', 'task_events', 'messages', 'message_deliveries'])) return null;
-  const agents = db.prepare(`
-    SELECT name, agent_type, host_agent
-    FROM agents
-    WHERE swarm_id = ?
-    ORDER BY name COLLATE NOCASE ASC
-  `).all(swarmId) as AgentRow[];
-  if (agents.length === 0) return ['no registered agents'];
-
-  return agents.map(agent => {
-    const task = db.prepare(`
-      SELECT id FROM tasks
-      WHERE swarm_id = ? AND owner_agent = ? COLLATE NOCASE AND state <> 'done'
-      ORDER BY CASE state WHEN 'active' THEN 0 WHEN 'awaiting_review' THEN 1 ELSE 2 END,
-               updated_at DESC, id ASC
-      LIMIT 1
-    `).get(swarmId, agent.name) as { id: string } | undefined;
-    const unacked = db.prepare(`
-      SELECT COUNT(*) AS count
-      FROM message_deliveries d
-      JOIN messages m ON m.id = d.message_id AND m.swarm_id = d.swarm_id
-      WHERE d.swarm_id = ? AND d.recipient = ? COLLATE NOCASE
-        AND d.acked_at IS NULL AND d.status <> 'acked' AND m.superseded_by IS NULL
-    `).get(swarmId, agent.name) as { count: number };
-    const host = agent.host_agent ?? agent.agent_type;
-    return `${agent.name} | ${host} | ${task?.id ?? '-'} | progress ${ageLabel(latestProgressAt(db, swarmId, agent.name), now)} | ` +
-      `${unacked.count} unacked`;
-  });
-}
-
-function emptyCounters(): JanitorCounters {
-  return {
-    worktrees: 0,
-    detachedHeads: 0,
-    orphanedWorktrees: 0,
-    unpushedCommits: 0,
-    goneUpstreamBranches: 0,
-    tempStrays: 0,
-    junkDirs: 0,
-    reposScanned: 0,
-    tickMs: 0,
-  };
-}
-
-function parseCounters(raw: string): JanitorCounters {
-  const counters = emptyCounters();
-  try {
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    for (const key of Object.keys(counters) as Array<keyof JanitorCounters>) {
-      if (typeof parsed[key] === 'number' && Number.isFinite(parsed[key])) {
-        counters[key] = parsed[key];
-      }
-    }
-  } catch {
-    // Malformed historical counters degrade to zeroes; the heartbeat still renders.
-  }
-  return counters;
-}
-
-function quotaLine(db: Database.Database, swarmId: string): string {
-  const event = db.prepare(`
-    SELECT e.id, e.created_at, e.data
-    FROM task_events e
-    JOIN tasks t ON t.swarm_id = e.swarm_id AND t.id = e.task_id
-    WHERE e.swarm_id = ? AND substr(t.id, 1, 8) = 'program-' AND e.kind = 'checkpoint'
-    ORDER BY e.created_at DESC, e.id DESC
-    LIMIT 1
-  `).get(swarmId) as CheckpointEvent | undefined;
-  const contents = readCheckpoint(event ?? null);
-  if (!contents) return 'quota: not recorded';
-  const quota = sectionContents(contents, 'quota')
-    .map(line => line.replace(/^[-*]\s*/, ''))
-    .filter(Boolean);
-  return quota.length > 0 ? `quota: ${oneLine(quota.join(' | '), 140)}` : 'quota: not recorded';
-}
-
-function renderDebrisAndQuota(db: Database.Database | null, swarmId: string, now: number): string[] | null {
-  if (!hasSchema(db, ['janitor_status', 'tasks', 'task_events'])) return null;
-  const row = db.prepare('SELECT last_tick_at, counters FROM janitor_status WHERE id = 1')
-    .get() as JanitorRow | undefined;
-  const debris = row
-    ? (() => {
-        const counters = parseCounters(row.counters);
-        return `debris: worktrees ${counters.worktrees} (${counters.detachedHeads} detached) | ` +
-          `unpushed ${counters.unpushedCommits} | strays ${counters.tempStrays} | junk ${counters.junkDirs} | ` +
-          `tick ${ageLabel(row.last_tick_at, now)} ago`;
-      })()
-    : 'debris: not recorded';
-  return [debris, quotaLine(db, swarmId)];
+function renderDebrisAndQuota(data: BoardData): string[] | null {
+  if (isUnavailable(data, ['janitor_status', 'tasks', 'task_events'])) return null;
+  const counters = data.debris.counters;
+  const debris = data.debris.tickAgeMin === null
+    ? 'debris: not recorded'
+    : `debris: worktrees ${counters.worktrees} (${counters.detachedHeads} detached) | ` +
+      `unpushed ${counters.unpushedCommits} | strays ${counters.tempStrays} | junk ${counters.junkDirs} | ` +
+      `tick ${data.debris.tickAgeMin}m ago`;
+  return [debris, `quota: ${data.quota ?? 'not recorded'}`];
 }
 
 /** Render one read-only snapshot. This function performs no database or file writes. */
@@ -448,16 +147,14 @@ export function renderBoard(
   swarmId: string,
   options: BoardRenderOptions = {}
 ): string {
-  const now = options.now ?? Date.now();
-  const needsYou = renderNeedsYou(db, swarmId, now);
-  const tasks = renderTasks(db, swarmId, now);
-  const fleet = renderFleet(db, swarmId, now);
-  const debris = renderDebrisAndQuota(db, swarmId, now);
+  const requestedNow = options.now ?? Date.now();
+  const now = Number.isFinite(requestedNow) ? requestedNow : Date.now();
+  const data = collectBoardData(db, swarmId, { now });
   return [
-    section('NEEDS YOU', needsYou ?? ['not available']),
-    section('TASKS', tasks ?? ['not available']),
-    section('FLEET', fleet ?? ['not available']),
-    section('DEBRIS + QUOTA', debris ?? ['not available']),
+    section('NEEDS YOU', renderNeedsYou(data) ?? ['not available']),
+    section('TASKS', renderTasks(data) ?? ['not available']),
+    section('FLEET', renderFleet(data, now) ?? ['not available']),
+    section('DEBRIS + QUOTA', renderDebrisAndQuota(data) ?? ['not available']),
   ].join('\n');
 }
 
@@ -519,8 +216,8 @@ function mermaidLabel(value: string): string {
     .replace(/\t/g, ' ');
 }
 
-function hostClass(agent: AgentRow): string {
-  const host = (agent.host_agent ?? agent.agent_type).toLowerCase();
+function hostClass(agent: BoardAgentData): string {
+  const host = agent.host.toLowerCase();
   if (host.includes('claude')) return 'hostClaude';
   if (host.includes('codex')) return 'hostCodex';
   if (host.includes('grok')) return 'hostGrok';
@@ -530,15 +227,10 @@ function hostClass(agent: AgentRow): string {
   return 'hostUnknown';
 }
 
-function taskClass(task: BoardTask, checkpoint: CheckpointEvent | null, now: number): string {
+function taskClass(task: BoardTaskData): string {
   if (task.state === 'done') return 'stDone';
   if (task.state === 'awaiting_review') return 'stAwaiting';
-  if (task.state === 'active') {
-    const checkpointAge = ageMinutes(checkpoint?.created_at, now);
-    return checkpointAge !== null && checkpointAge > CHECKPOINT_STALE_MINUTES
-      ? 'stStale'
-      : 'stActive';
-  }
+  if (task.state === 'active') return task.checkpoint && task.stale ? 'stStale' : 'stActive';
   return 'stOpen';
 }
 
@@ -582,6 +274,7 @@ function graphLegend(): string[] {
     '  legendDebrisWarn["debris present"]:::debrisWarn',
     '  legendDebrisOk["debris clear"]:::debrisOk',
     '  legendDebrisStale["janitor stale"]:::debrisStale',
+    '  legendEdges["solid owns · dashed handoff · dotted claimed"]:::note',
     'end',
   ];
 }
@@ -605,117 +298,99 @@ export function buildBoardMermaid(
 ): string {
   const requestedNow = options.now ?? Date.now();
   const now = Number.isFinite(requestedNow) ? requestedNow : Date.now();
+  const data = collectBoardData(db, swarmId, { now });
   const required = ['agents', 'tasks', 'task_events', 'janitor_status'];
-  const missing = required.filter(table => !boardHasTable(db, table));
+  const missing = required.filter(table => data.unavailable.includes(table));
   if (!db || missing.length > 0) return minimalBoardMermaid(swarmId, missing, now);
 
-  try {
-    const swarm = boardHasTable(db, 'swarms')
-      ? db.prepare('SELECT name FROM swarms WHERE id = ?').get(swarmId) as { name: string } | undefined
-      : undefined;
-    const swarmName = swarm?.name ?? swarmId;
-    const agents = db.prepare(`
-      SELECT name, agent_type, host_agent
-      FROM agents
-      WHERE swarm_id = ?
-      ORDER BY name COLLATE NOCASE ASC
-    `).all(swarmId) as AgentRow[];
-    const cutoff = new Date(now - 24 * 60 * 60 * 1_000).toISOString();
-    const tasks = db.prepare(`
-      SELECT id, state, owner_agent, lease_epoch, repo_path, branch, worktree_path,
-             created_at, updated_at
-      FROM tasks
-      WHERE swarm_id = ? AND (state <> 'done' OR updated_at >= ?)
-      ORDER BY id ASC
-    `).all(swarmId, cutoff) as BoardTask[];
-    const janitor = db.prepare('SELECT last_tick_at, counters FROM janitor_status WHERE id = 1')
-      .get() as JanitorRow | undefined;
-    const counters = janitor ? parseCounters(janitor.counters) : emptyCounters();
-    const title = `Swarm ${swarmName} · ${new Date(now).toISOString()} · ` +
-      `${agents.length} agents · ${tasks.length} tasks · debris ` +
-      `${counters.worktrees} worktrees/${counters.detachedHeads} detached/${counters.unpushedCommits} unpushed`;
-    const lines = ['flowchart LR', `accTitle: ${mermaidLabel(title)}`];
+  const counters = data.debris.counters;
+  const title = `Swarm ${data.swarm.name} · ${data.generatedAt} · ` +
+    `${data.agents.length} agents · ${data.tasks.length} tasks · debris ` +
+    `${counters.worktrees} worktrees/${counters.detachedHeads} detached/${counters.unpushedCommits} unpushed`;
+  const lines = ['flowchart LR', `accTitle: ${mermaidLabel(title)}`];
+  const agentIds = new Map<string, string>();
+  const taskIds = new Map<string, string>();
 
-    const agentIds = new Map<string, string>();
-    agents.forEach((agent, index) => {
-      const id = `agent${index}`;
-      agentIds.set(agent.name.toLowerCase(), id);
-      const host = agent.host_agent ?? agent.agent_type;
-      lines.push(`${id}("${mermaidLabel(agent.name)}<br/>${mermaidLabel(host)}"):::${hostClass(agent)}`);
-    });
+  data.agents.forEach((agent, index) => {
+    const id = `agent${index}`;
+    agentIds.set(agent.name.toLowerCase(), id);
+    lines.push(`${id}("${mermaidLabel(agent.name)}<br/>${mermaidLabel(agent.host)}"):::${hostClass(agent)}`);
+  });
 
-    const taskOwners = new Map<string, string | null>();
-    tasks.forEach((task, index) => {
-      const id = `task${index}`;
-      const checkpoint = latestCheckpoint(db, swarmId, task.id);
-      const checkpointText = checkpoint ? `ckpt ${ageLabel(checkpoint.created_at, now)}` : 'no ckpt';
-      lines.push(
-        `${id}["${mermaidLabel(task.id)}<br/>[${mermaidLabel(task.state)}] · ${checkpointText}"]:::` +
-        taskClass(task, checkpoint, now)
-      );
-      taskOwners.set(task.id, task.owner_agent);
-      if (task.owner_agent) {
-        const ownerId = agentIds.get(task.owner_agent.toLowerCase());
-        if (ownerId) lines.push(`${ownerId} -->|owns| ${id}`);
-      }
-    });
-
-    const handoffs = db.prepare(`
-      SELECT task_id, actor, data
-      FROM task_events
-      WHERE swarm_id = ? AND kind = 'claimed'
-      ORDER BY id ASC
-    `).all(swarmId) as Array<{ task_id: string; actor: string | null; data: string | null }>;
-    const seenHandoffs = new Set<string>();
-    for (const handoff of handoffs) {
-      if (!handoff.data) continue;
-      let previousOwner: string | null = null;
-      try {
-        const data = JSON.parse(handoff.data) as { previous_owner?: unknown };
-        if (typeof data.previous_owner === 'string') previousOwner = data.previous_owner;
-      } catch {
-        continue;
-      }
-      const newOwner = handoff.actor ?? taskOwners.get(handoff.task_id) ?? null;
-      if (!previousOwner || !newOwner) continue;
-      const previousId = agentIds.get(previousOwner.toLowerCase());
-      const newId = agentIds.get(newOwner.toLowerCase());
-      if (!previousId || !newId || previousId === newId) continue;
-      const edgeKey = `${previousId}\u0000${newId}`;
-      if (seenHandoffs.has(edgeKey)) continue;
-      seenHandoffs.add(edgeKey);
-      lines.push(`${previousId} -.->|handoff| ${newId}`);
-    }
-
-    const tickTimestamp = janitor ? new Date(janitor.last_tick_at).getTime() : Number.NaN;
-    const heartbeatStale = !Number.isFinite(tickTimestamp) || now - tickTimestamp > JANITOR_HEARTBEAT_STALE_MS;
-    const hasDebris = [
-      counters.worktrees,
-      counters.detachedHeads,
-      counters.orphanedWorktrees,
-      counters.unpushedCommits,
-      counters.goneUpstreamBranches,
-      counters.tempStrays,
-      counters.junkDirs,
-    ].some(count => count > 0);
-    const tickAge = janitor ? `${ageLabel(janitor.last_tick_at, now)} ago` : 'never';
+  data.tasks.forEach((task, index) => {
+    const id = `task${index}`;
+    taskIds.set(task.id, id);
+    const checkpointText = task.checkpoint ? `ckpt ${task.checkpoint.ageMin}m` : 'no ckpt';
     lines.push(
-      `debris0["debris<br/>${counters.worktrees} worktrees (${counters.detachedHeads} detached)` +
-      `<br/>${counters.unpushedCommits} unpushed<br/>tick ${tickAge}"]`
+      `${id}["${mermaidLabel(task.id)}<br/>[${mermaidLabel(task.state)}] · ${checkpointText}"]:::` +
+      taskClass(task)
     );
-    const debrisClasses = [hasDebris ? 'debrisWarn' : 'debrisOk'];
-    if (heartbeatStale) debrisClasses.push('debrisStale');
-    lines.push(`class debris0 ${debrisClasses.join(',')}`);
+  });
 
-    if (agents.length === 0 && tasks.length === 0) {
-      lines.push('idle["idle swarm"]:::note');
-    }
-
-    lines.push(...graphLegend(), ...graphClassDefinitions());
-    return lines.join('\n');
-  } catch {
-    return minimalBoardMermaid(swarmId, ['incompatible schema'], now);
+  let linkIndex = 0;
+  for (const ownership of data.edges.ownership) {
+    const agentId = agentIds.get(ownership.agent.toLowerCase());
+    const taskId = taskIds.get(ownership.taskId);
+    if (!agentId || !taskId) continue;
+    lines.push(`${agentId} -->|owns| ${taskId}`);
+    linkIndex += 1;
   }
+
+  const appendAgentEdges = (
+    edges: BoardData['edges']['handoffs'],
+    label: string,
+    styleIndexes: number[]
+  ): void => {
+    const seen = new Set<string>();
+    for (const edge of edges) {
+      const fromId = agentIds.get(edge.from.toLowerCase());
+      const toId = agentIds.get(edge.to.toLowerCase());
+      if (!fromId || !toId || fromId === toId) continue;
+      const edgeKey = `${fromId}\u0000${toId}`;
+      if (seen.has(edgeKey)) continue;
+      seen.add(edgeKey);
+      lines.push(`${fromId} -.->|${label}| ${toId}`);
+      styleIndexes.push(linkIndex);
+      linkIndex += 1;
+    }
+  };
+  const handoffStyleIndexes: number[] = [];
+  const claimStyleIndexes: number[] = [];
+  appendAgentEdges(data.edges.handoffs, 'handoff', handoffStyleIndexes);
+  appendAgentEdges(data.edges.claims, 'claimed', claimStyleIndexes);
+  if (handoffStyleIndexes.length > 0) {
+    lines.push(`linkStyle ${handoffStyleIndexes.join(',')} stroke-dasharray:8 4;`);
+  }
+  if (claimStyleIndexes.length > 0) {
+    lines.push(`linkStyle ${claimStyleIndexes.join(',')} stroke-dasharray:2 3;`);
+  }
+
+  const heartbeatStale = data.debris.tickAgeMin === null ||
+    data.debris.tickAgeMin * 60_000 > JANITOR_HEARTBEAT_STALE_MS;
+  const hasDebris = [
+    counters.worktrees,
+    counters.detachedHeads,
+    counters.orphanedWorktrees,
+    counters.unpushedCommits,
+    counters.goneUpstreamBranches,
+    counters.tempStrays,
+    counters.junkDirs,
+  ].some(count => count > 0);
+  const tickAge = data.debris.tickAgeMin === null ? 'never' : `${data.debris.tickAgeMin}m ago`;
+  lines.push(
+    `debris0["debris<br/>${counters.worktrees} worktrees (${counters.detachedHeads} detached)` +
+    `<br/>${counters.unpushedCommits} unpushed<br/>tick ${tickAge}"]`
+  );
+  const debrisClasses = [hasDebris ? 'debrisWarn' : 'debrisOk'];
+  if (heartbeatStale) debrisClasses.push('debrisStale');
+  lines.push(`class debris0 ${debrisClasses.join(',')}`);
+
+  if (data.agents.length === 0 && data.tasks.length === 0) {
+    lines.push('idle["idle swarm"]:::note');
+  }
+
+  lines.push(...graphLegend(), ...graphClassDefinitions());
+  return lines.join('\n');
 }
 
 function decodeMermaidEntities(value: string): string {
@@ -766,9 +441,9 @@ ${refresh}  <title>${htmlEscape(header)}</title>
 <body>
   <header><h1>${htmlEscape(header)}</h1><p>Live ownership, handoffs, task state, and fleet debris</p></header>
   <pre class="mermaid">${mermaid}</pre>
-  <script type="module">
+  <script src="./board-assets/mermaid.min.js"></script>
+  <script>
     try {
-      const { default: mermaid } = await import('${BOARD_MERMAID_CDN_URL}');
       const dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
       mermaid.initialize({ startOnLoad: true, theme: dark ? 'dark' : 'default' });
     } catch (error) {
@@ -780,13 +455,38 @@ ${refresh}  <title>${htmlEscape(header)}</title>
 `;
 }
 
+function fileSha256(filePath: string): string {
+  return createHash('sha256').update(fs.readFileSync(filePath)).digest('hex');
+}
+
+function copyBoardMermaidAsset(htmlDir: string): string {
+  // Beside the HTML file, not a fixed ~/.swarm location: the generated page
+  // references ./board-assets/ relative to itself, so a custom --out path must
+  // get its own copy or the offline render silently loses mermaid.
+  const assetsDir = path.join(htmlDir, 'board-assets');
+  const destination = path.join(assetsDir, 'mermaid.min.js');
+  fs.mkdirSync(assetsDir, { recursive: true });
+  let unchanged = false;
+  try {
+    const sourceStat = fs.statSync(MERMAID_VENDOR_PATH);
+    const destinationStat = fs.statSync(destination);
+    unchanged = sourceStat.size === destinationStat.size &&
+      fileSha256(MERMAID_VENDOR_PATH) === fileSha256(destination);
+  } catch {
+    unchanged = false;
+  }
+  if (!unchanged) fs.copyFileSync(MERMAID_VENDOR_PATH, destination);
+  return destination;
+}
+
 export function writeBoardGraphFile(
   outputPath: string,
   mermaid: string,
-  options: BoardHtmlOptions = {}
+  options: BoardGraphFileOptions = {}
 ): string {
   const resolved = path.resolve(outputPath);
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
+  copyBoardMermaidAsset(path.dirname(resolved));
   fs.writeFileSync(resolved, buildBoardHtml(mermaid, options), 'utf-8');
   return resolved;
 }

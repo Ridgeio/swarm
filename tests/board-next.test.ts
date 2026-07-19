@@ -8,7 +8,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import {
   BOARD_CMUX_GUIDANCE,
-  BOARD_MERMAID_CDN_URL,
   buildBoardHtml,
   buildBoardMermaid,
   openBoardGraphTab,
@@ -22,6 +21,7 @@ import { getDbAt } from '../src/db.js';
 
 const NOW = Date.parse('2026-07-18T18:00:00.000Z');
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+const VENDORED_MERMAID = path.resolve(fileURLToPath(new URL('../vendor/mermaid.min.js', import.meta.url)));
 
 function iso(minutesAgo: number): string {
   return new Date(NOW - minutesAgo * 60_000).toISOString();
@@ -352,10 +352,11 @@ describe('WI-7b board cmux tab', () => {
 });
 
 describe('WI-7c board Mermaid graph', () => {
-  test('populated graph renders host/state classes, ownership, handoff, and debris counts', () => {
+  test('populated graph renders host/state classes, ownership, distinct handoff/claim edges, and debris counts', () => {
     const fixture = createFixture(true);
     try {
       insertTask(fixture.db, 'open-task', 'open', 'Alice', 1, 10);
+      insertEvent(fixture.db, 'stale-task', 'Alice', 'handoff', 85, { to: 'Bob' });
       insertEvent(fixture.db, 'stale-task', 'Bob', 'claimed', 80, { previous_owner: 'Alice' });
       insertEvent(fixture.db, 'stale-task', 'Bob', 'claimed', 70, { previous_owner: 'Alice' });
       const mermaid = buildBoardMermaid(fixture.db, 'default', { now: NOW });
@@ -375,10 +376,14 @@ describe('WI-7c board Mermaid graph', () => {
       assert.match(mermaid, /task\d+\["stale-task<br\/>\[active\] · ckpt 91m"\]:::stStale/);
       assert.match(mermaid, /agent1 -->\|owns\| task\d+/);
       assert.strictEqual((mermaid.match(/agent0 -\.->\|handoff\| agent1/g) ?? []).length, 1);
+      assert.strictEqual((mermaid.match(/agent0 -\.->\|claimed\| agent1/g) ?? []).length, 1);
+      assert.match(mermaid, /linkStyle \d+ stroke-dasharray:8 4;/);
+      assert.match(mermaid, /linkStyle \d+ stroke-dasharray:2 3;/);
       assert.match(mermaid, /debris0\["debris<br\/>4 worktrees \(1 detached\)<br\/>7 unpushed<br\/>tick 31m ago"\]/);
       assert.match(mermaid, /class debris0 debrisWarn,debrisStale/);
       assert.doesNotMatch(mermaid, /task\d+ -\.-> debris0/);
       assert.match(mermaid, /subgraph legend\["Legend"\]/);
+      assert.match(mermaid, /solid owns · dashed handoff · dotted claimed/);
       assert.match(mermaid, /2 agents/);
       assert.match(mermaid, /4 tasks/);
     } finally {
@@ -447,14 +452,39 @@ describe('WI-7c board Mermaid graph', () => {
     }
   });
 
-  test('HTML preserves raw Mermaid, pins Mermaid 11, and adds watch refresh metadata', () => {
+  test('HTML preserves raw Mermaid, uses the offline classic asset, and has no external URLs', () => {
     const mermaid = 'flowchart LR\nagent0("Alice<br/>codex"):::hostCodex';
     const html = buildBoardHtml(mermaid, { watchSeconds: 9 });
     assert.ok(html.includes(`<pre class="mermaid">${mermaid}</pre>`));
-    assert.ok(html.includes(BOARD_MERMAID_CDN_URL));
+    assert.match(html, /<script src="\.\/board-assets\/mermaid\.min\.js"><\/script>/);
+    assert.doesNotMatch(html, /https?:\/\//);
+    assert.doesNotMatch(html, /type="module"/);
     assert.match(html, /mermaid\.initialize\(\{ startOnLoad: true, theme:/);
+    assert.match(html, /Mermaid unavailable; leaving raw diagram source visible\./);
     assert.match(html, /<meta http-equiv="refresh" content="9">/);
     assert.match(html, /prefers-color-scheme: dark/);
+  });
+
+  test('graph writer copies the vendored Mermaid asset and skips an unchanged re-copy', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-assets-'));
+    const outputPath = path.join(root, 'output', 'board.html');
+    // The page references ./board-assets/ relative to itself, so the asset must
+    // land beside the HTML — including under a custom --out directory.
+    const assetPath = path.join(root, 'output', 'board-assets', 'mermaid.min.js');
+    try {
+      writeBoardGraphFile(outputPath, 'flowchart LR\na --> b');
+      assert.deepStrictEqual(fs.readFileSync(assetPath), fs.readFileSync(VENDORED_MERMAID));
+      const fixedTime = new Date('2020-01-02T03:04:05.000Z');
+      fs.utimesSync(assetPath, fixedTime, fixedTime);
+      const before = fs.statSync(assetPath).mtimeMs;
+      writeBoardGraphFile(outputPath, 'flowchart LR\na --> c');
+      assert.strictEqual(fs.statSync(assetPath).mtimeMs, before);
+      const html = fs.readFileSync(outputPath, 'utf-8');
+      assert.match(html, /\.\/board-assets\/mermaid\.min\.js/);
+      assert.doesNotMatch(html, /https?:\/\//);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('graph watch regenerates twice without mutating the database', async () => {
@@ -554,6 +584,8 @@ describe('WI-7c board Mermaid graph', () => {
       const html = fs.readFileSync(outputPath, 'utf-8');
       assert.match(mermaid, /^flowchart LR$/m);
       assert.ok(html.includes(`<pre class="mermaid">${mermaid}</pre>`));
+      assert.ok(fs.existsSync(path.join(path.dirname(outputPath), 'board-assets', 'mermaid.min.js')));
+      assert.doesNotMatch(html, /https?:\/\//);
       assert.strictEqual(fs.readFileSync(stderrPath, 'utf-8').trim(), path.resolve(outputPath));
       assert.strictEqual(fs.readFileSync(dbPath).toString('base64'), beforeDb);
     } finally {

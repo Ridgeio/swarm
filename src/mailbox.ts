@@ -35,7 +35,7 @@ export interface HookInboxEntry {
 // Allowed values for the optional message classification tag. Validated at the CLI
 // boundary (a typo'd kind would otherwise store an unfilterable message); storage
 // itself is a plain nullable TEXT column so builds with a different set stay readable.
-export const MESSAGE_KINDS = ['status', 'digest', 'merge-req', 'escalation', 'ack', 'gate'] as const;
+export const MESSAGE_KINDS = ['status', 'digest', 'merge-req', 'escalation', 'ack', 'gate', 'handoff'] as const;
 export const HOOK_INJECT_COLLAPSE_COUNT = 3;
 export const HOOK_INJECT_BACKOFF_MINUTES = 45;
 export const HOOK_INJECT_BACKOFF_MS = HOOK_INJECT_BACKOFF_MINUTES * 60_000;

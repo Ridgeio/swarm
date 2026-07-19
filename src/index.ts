@@ -51,6 +51,16 @@ import { ensureCodexTrust } from './codex-trust.js';
 import { parseGlobalFlags } from './args.js';
 import { assertNameNotReserved, assertNotModelName } from './reserved-names.js';
 import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
+import {
+  checkpointTask,
+  closeTask,
+  getActiveTaskHookLines,
+  handoffTask,
+  recordDecision,
+  startTask,
+  type TaskDisposition,
+} from './tasks.js';
+import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './rescue.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -87,6 +97,17 @@ function requireSupersedes(usage: string): number | undefined {
   const raw = getFlag('--supersedes');
   if (!raw || !/^\d+$/.test(raw) || Number(raw) <= 0 || !Number.isSafeInteger(Number(raw))) {
     console.error('Invalid --supersedes value. Message ID must be a positive integer.');
+    console.error(usage);
+    process.exit(1);
+  }
+  return Number(raw);
+}
+
+function requirePositiveIdFlag(flag: string, label: string, usage: string): number | undefined {
+  if (!hasFlag(flag)) return undefined;
+  const raw = getFlag(flag);
+  if (!raw || !/^\d+$/.test(raw) || Number(raw) <= 0 || !Number.isSafeInteger(Number(raw))) {
+    console.error(`Invalid ${flag} value. ${label} must be a positive integer.`);
     console.error(usage);
     process.exit(1);
   }
@@ -201,13 +222,30 @@ Communication:
                                                      default single Enter queues mid-turn
   swarm broadcast <message>                        Send to all agents in the current swarm
     [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
-    [--supersedes <msg-id>]                           escalation, ack, gate)
+    [--supersedes <msg-id>]                           escalation, ack, gate, handoff)
   swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
     [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
                                                       --recent N replays last N regardless of cursor;
                                                       --kind filters and never advances the cursor)
   swarm ack <msg-id...> | --all                    Acknowledge messages explicitly
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
+
+Task Ledger:
+  swarm task start <slug> --title <text>           Create or claim a fenced task lease
+    [--repo <path>] [--no-worktree] [--takeover]
+  swarm task checkpoint <slug> [--notes <text>]    Record a numbered checkpoint; --notes puts
+                                                     text under decisions and fills other
+                                                     narrative sections with "- none noted"
+  swarm task close <slug> --disposition <kind>     Close with pr|merged|archive|discard evidence
+    [--force-discard]
+  swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
+  swarm decision <text> [--task <slug>]            Record a durable decision
+    [--supersedes <decision-id>]
+  swarm rescue --worktree <path> | --task <slug>   Create and verify preservation artifacts
+    | --agent <name>
+  swarm rescue --list                              List rescue manifests and verification state
+                                                     (plain files under ~/.swarm/archive/rescue/;
+                                                     existing rsync may copy them off-host)
 
 Status:
   swarm members                                    List agents in the current swarm
@@ -336,11 +374,13 @@ function printHookContext(): void {
       const time = new Date(msg.created_at).toLocaleTimeString();
       return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
     }).join('\n')}`;
+  const taskLines = getActiveTaskHookLines(db, self.swarm_id, self.name);
+  const taskSection = taskLines.length ? `\n${taskLines.join('\n')}` : '';
 
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"${readCommand}
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
@@ -720,6 +760,132 @@ async function main() {
           console.log('No messages to acknowledge.');
         } else {
           console.log(`Acknowledged ${acknowledged.length} message(s): ${acknowledged.map(id => `#${id}`).join(', ')}`);
+        }
+        break;
+      }
+
+      case 'task': {
+        const subcommand = args[1];
+        const slug = args[2];
+        if (!subcommand || !slug) {
+          console.error('Usage: swarm task start|checkpoint|close <slug> [options]');
+          process.exit(1);
+        }
+        const { db, self } = requireSelf();
+        if (subcommand === 'start') {
+          const result = await startTask(db, self.swarm_id, self.name, slug, {
+            title: getFlag('--title'),
+            repoPath: getFlag('--repo'),
+            noWorktree: hasFlag('--no-worktree'),
+            takeover: hasFlag('--takeover'),
+          });
+          const verb = result.eventKind === 'claimed' ? 'claimed' : 'started';
+          console.log(`Task "${slug}" ${verb} by ${self.name} at lease epoch ${result.task.lease_epoch}.`);
+          if (result.task.branch) console.log(`Branch: ${result.task.branch}`);
+          if (result.task.worktree_path) console.log(`Worktree: ${result.task.worktree_path}`);
+          break;
+        }
+        if (subcommand === 'checkpoint') {
+          const result = checkpointTask(db, self.swarm_id, self.name, slug, getFlag('--notes'));
+          if (!result.recorded) {
+            console.log(`Checkpoint skeleton: ${result.path}`);
+            console.error(`Checkpoint is incomplete. Edit every <FILL> marker, then re-run "swarm task checkpoint ${slug}".`);
+            process.exitCode = 2;
+          } else {
+            console.log(`Checkpoint #${String(result.sequence).padStart(3, '0')} recorded: ${result.path}`);
+          }
+          break;
+        }
+        if (subcommand === 'close') {
+          const disposition = getFlag('--disposition') as TaskDisposition | undefined;
+          if (!disposition) {
+            console.error('Usage: swarm task close <slug> --disposition pr|merged|archive|discard [--force-discard]');
+            process.exit(1);
+          }
+          const task = closeTask(db, self.swarm_id, self.name, slug, {
+            disposition,
+            forceDiscard: hasFlag('--force-discard'),
+          });
+          console.log(`Task "${slug}" closed as ${task.disposition}. Branch ref kept; task worktree removed.`);
+          break;
+        }
+        console.error(`Unknown task command: ${subcommand}`);
+        console.error('Usage: swarm task start|checkpoint|close <slug> [options]');
+        process.exit(1);
+        break;
+      }
+
+      case 'handoff': {
+        const slug = args[1];
+        const target = getFlag('--to');
+        if (!slug || !target) {
+          console.error('Usage: swarm handoff <slug> --to <agent> [--stale-ok]');
+          process.exit(1);
+        }
+        const { db, self } = requireSelf();
+        const result = await handoffTask(db, self.swarm_id, self.name, slug, target, hasFlag('--stale-ok'));
+        console.log(`Task "${slug}" handed off to ${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`);
+        console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
+        break;
+      }
+
+      case 'decision': {
+        const usage = 'Usage: swarm decision <text> [--task <slug>] [--supersedes <decision-id>]';
+        const supersedes = requirePositiveIdFlag('--supersedes', 'Decision ID', usage);
+        const tokens: string[] = [];
+        for (let index = 1; index < args.length; index += 1) {
+          if (args[index] === '--task' || args[index] === '--supersedes') { index += 1; continue; }
+          tokens.push(args[index]);
+        }
+        const body = tokens.join(' ');
+        if (!body) {
+          console.error(usage);
+          process.exit(1);
+        }
+        const { db, self } = requireSelf();
+        const result = recordDecision(db, self.swarm_id, self.name, body, getFlag('--task'), supersedes);
+        console.log(`Decision #${result.id} recorded.`);
+        break;
+      }
+
+      case 'rescue': {
+        if (hasFlag('--list')) {
+          const rows = listRescueArtifacts();
+          if (rows.length === 0) {
+            console.log('No rescue artifacts found.');
+          } else {
+            for (const row of rows) {
+              if (!row.manifest) {
+                console.log(`${row.artifactDir} — INVALID MANIFEST: ${row.error}`);
+                continue;
+              }
+              const attribution = row.manifest.attribution.task_id
+                ? `task ${row.manifest.attribution.task_id}`
+                : `agent ${row.manifest.attribution.agent}`;
+              console.log(`${row.artifactDir} — ${row.manifest.verified ? 'verified' : 'UNVERIFIED'} — ${attribution} — ${row.manifest.head_sha}`);
+            }
+          }
+          break;
+        }
+        if (hasFlag('--verify')) {
+          const artifactDir = getFlag('--verify');
+          if (!artifactDir) {
+            console.error('Usage: swarm rescue --verify <artifact-dir>');
+            process.exit(1);
+          }
+          const manifest = verifyRescueArtifact(path.resolve(artifactDir));
+          console.log(`Rescue verified: ${artifactDir} (${manifest.head_sha})`);
+          break;
+        }
+        const { db, self } = requireSelf();
+        const results = rescueTargets(db, self.swarm_id, {
+          worktree: getFlag('--worktree'),
+          taskId: getFlag('--task'),
+          agent: getFlag('--agent'),
+        });
+        for (const result of results) {
+          console.log(`Rescue verified: ${result.artifactDir}`);
+          console.log(`Manifest: ${path.join(result.artifactDir, 'manifest.json')}`);
         }
         break;
       }

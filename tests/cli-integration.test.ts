@@ -211,7 +211,7 @@ describe('cli messaging (multi-send, kinds, cursor clarity)', () => {
     const s = runCli(home, ['send', 'Bob', 'oops', '--kind', 'bogus'], { SWARM_AGENT_NAME: 'Alice' });
     assert.notStrictEqual(s.status, 0);
     assert.match(s.stderr, /Invalid --kind "bogus"/);
-    assert.match(s.stderr, /Allowed: status, digest, merge-req, escalation, ack, gate/);
+    assert.match(s.stderr, /Allowed: status, digest, merge-req, escalation, ack, gate, handoff\./);
     assert.doesNotMatch(s.stdout, /Message sent/);
 
     const i = runCli(home, ['inbox', '--kind', 'nope'], { SWARM_AGENT_NAME: 'Alice' });

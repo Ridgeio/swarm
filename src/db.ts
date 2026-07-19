@@ -112,6 +112,46 @@ function createCurrentTables(db: Database.Database): void {
       acked_at TEXT,
       PRIMARY KEY (message_id, recipient)
     );
+
+    CREATE TABLE IF NOT EXISTS tasks (
+      id TEXT NOT NULL,
+      swarm_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'open',
+      owner_agent TEXT COLLATE NOCASE,
+      lease_epoch INTEGER NOT NULL DEFAULT 0,
+      lease_expires_at TEXT,
+      repo_path TEXT,
+      branch TEXT,
+      worktree_path TEXT,
+      transcript_hint TEXT,
+      disposition TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (swarm_id, id)
+    );
+
+    CREATE TABLE IF NOT EXISTS task_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      epoch INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      actor TEXT,
+      data TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS decisions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT,
+      body TEXT NOT NULL,
+      made_by TEXT NOT NULL,
+      supersedes INTEGER,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at TEXT NOT NULL
+    );
   `);
 }
 
@@ -286,6 +326,9 @@ function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_messages_inbox ON messages(swarm_id, to_agent, id);
     CREATE INDEX IF NOT EXISTS idx_messages_broadcast ON messages(swarm_id, id);
     CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient ON message_deliveries(swarm_id, recipient, status, message_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
+    CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
   `);
 }
 

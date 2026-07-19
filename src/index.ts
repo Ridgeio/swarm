@@ -77,8 +77,14 @@ import {
 import {
   BOARD_DEFAULT_WATCH_SECONDS,
   boardHasTable,
+  buildBoardMermaid,
+  openBoardGraphFile,
+  openBoardGraphTab,
   renderBoard,
+  spawnBoardTab,
   watchBoard,
+  watchBoardGraph,
+  writeBoardGraphFile,
 } from './board.js';
 
 const rawArgs = process.argv.slice(2);
@@ -280,7 +286,9 @@ Janitor (observe-only in v1):
   swarm janitor install|uninstall                 Manage the 15-minute launchd schedule
 
 Status:
-  swarm board [--watch [N]]                       Render fleet tasks, agents, debris, and quota
+  swarm board [--watch [N]] [--tab]               Render fleet state or open it in a cmux workspace
+  swarm board --graph [--out <path>] [--open]     Write and print a Mermaid workflow graph
+    [--watch [N]] [--tab]                           (--tab prefers a cmux browser, then system browser)
   swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
@@ -1071,14 +1079,27 @@ async function main() {
       }
 
       case 'board': {
+        const graphMode = hasFlag('--graph');
+        const tabMode = hasFlag('--tab');
         const watchIndex = args.indexOf('--watch');
         const rawInterval = watchIndex === -1 ? undefined : args[watchIndex + 1];
         const intervalSeconds = rawInterval === undefined || rawInterval.startsWith('--')
           ? BOARD_DEFAULT_WATCH_SECONDS
           : Number(rawInterval);
         if (watchIndex !== -1 && (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0)) {
-          console.error('Usage: swarm board [--watch [N]] (N must be a positive number of seconds)');
+          console.error('Usage: swarm board [--watch [N]] [--tab] | --graph [--out <path>] [--open] [--watch [N]] [--tab] (N must be a positive number of seconds)');
           process.exit(1);
+        }
+
+        const rawOutputPath = getFlag('--out');
+        if (graphMode && hasFlag('--out') && (!rawOutputPath || rawOutputPath.startsWith('--'))) {
+          console.error('Usage: swarm board --graph [--out <path>] [--open] [--watch [N]] [--tab]');
+          process.exit(1);
+        }
+
+        if (tabMode && !graphMode) {
+          spawnBoardTab({ cwd: process.cwd(), watchSeconds: intervalSeconds });
+          break;
         }
 
         const db = getDbReadOnly();
@@ -1108,7 +1129,33 @@ async function main() {
 
         const snapshot = () => renderBoard(db, swarmId);
         try {
-          if (watchIndex === -1) {
+          if (graphMode) {
+            const outputPath = rawOutputPath ?? path.join(os.homedir(), '.swarm', 'board.html');
+            let opened = false;
+            const regenerate = () => {
+              const mermaid = buildBoardMermaid(db, swarmId, { now: Date.now() });
+              const writtenPath = writeBoardGraphFile(outputPath, mermaid, {
+                watchSeconds: watchIndex === -1 ? undefined : intervalSeconds,
+              });
+              console.log(mermaid);
+              console.error(writtenPath);
+              if (!opened) {
+                if (tabMode) {
+                  const result = openBoardGraphTab(writtenPath, { cwd: process.cwd() });
+                  if (result) console.error(`Opened swarm graph: ${result.workspaceRef} ${result.surfaceRef}`);
+                } else if (hasFlag('--open')) {
+                  openBoardGraphFile(writtenPath);
+                }
+                opened = true;
+              }
+            };
+
+            if (watchIndex === -1) {
+              regenerate();
+            } else {
+              await watchBoardGraph({ regenerate, intervalMs: intervalSeconds * 1_000 });
+            }
+          } else if (watchIndex === -1) {
             console.log(snapshot());
           } else {
             await watchBoard({ render: snapshot, intervalMs: intervalSeconds * 1_000 });

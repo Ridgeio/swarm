@@ -167,7 +167,9 @@ Recovery and hygiene:
   swarm janitor install|uninstall              Manage the launchd schedule
 
 Operator visibility:
-  swarm board [--watch [N]]                    Render fleet state; refresh every N seconds
+  swarm board [--watch [N]] [--tab]            Render fleet state or open a live cmux workspace
+  swarm board --graph [--out <path>] [--open]  Write and print a Mermaid workflow graph
+        [--watch [N]] [--tab]                    (--tab prefers cmux browser, then system browser)
   swarm stats [--hours <N>]                    Show messaging and debris metrics
 
 Cmux Agents (local terminal sessions):
@@ -228,6 +230,11 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Install or remove scheduling | `swarm janitor install` or `swarm janitor uninstall` |
 | Render once | `swarm board` |
 | Keep a live board | `swarm board --watch 5` |
+| Open a live cmux board workspace | `swarm board --tab --watch 5` |
+| Generate the workflow graph | `swarm board --graph --out ~/.swarm/board.html --open` |
+| Keep the graph live in cmux | `swarm board --graph --tab --watch 5` |
+
+Graph mode writes HTML to `~/.swarm/board.html` by default, prints raw Mermaid to stdout, and prints the file path to stderr. `--graph --tab` prefers a cmux browser workspace pointed at the generated `file://` URL; if cmux/browser creation is unavailable it falls back to the macOS system browser. The pinned Mermaid CDN is optional at viewing time: if it cannot load, the raw diagram source remains visible in the page.
 
 ## Example workflows
 
@@ -374,7 +381,7 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`src/tasks.ts`** — Fenced task leases, checkpoints, evidence-gated close, handoff, and decisions
 - **`src/rescue.ts`** — Verified preservation artifacts and manifest verification
 - **`src/janitor.ts`** — Observe-only debris census, heartbeat, hook trigger, and launchd schedule
-- **`src/board.ts`** — Read-only fleet/task/debris/quota rendering and watch loop
+- **`src/board.ts`** — Read-only fleet/task/debris/quota rendering, watch loops, and Mermaid graph/HTML output
 - **`src/index.ts`** — CLI entry point
 - **`hooks/swarm-awareness.sh`** — Claude Code UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 - **`hooks/swarm-awareness-headless.sh`** — Headless awareness hook used where a host can poll inbox messages

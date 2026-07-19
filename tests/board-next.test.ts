@@ -6,7 +6,18 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { renderBoard, watchBoard } from '../src/board.js';
+import {
+  BOARD_CMUX_GUIDANCE,
+  BOARD_MERMAID_CDN_URL,
+  buildBoardHtml,
+  buildBoardMermaid,
+  openBoardGraphTab,
+  renderBoard,
+  spawnBoardTab,
+  watchBoard,
+  watchBoardGraph,
+  writeBoardGraphFile,
+} from '../src/board.js';
 import { getDbAt } from '../src/db.js';
 
 const NOW = Date.parse('2026-07-18T18:00:00.000Z');
@@ -299,6 +310,254 @@ describe('WI-7 swarm board', () => {
     } finally {
       fixture.db.close();
       fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('WI-7b board cmux tab', () => {
+  test('spawns the exact watch command with a round-tripped interval and workspace title', () => {
+    let invocation: { cwd: string; command: string; title?: string } | null = null;
+    const output: string[] = [];
+    const result = spawnBoardTab({
+      cwd: '/tmp/swarm board cwd',
+      watchSeconds: 17,
+      spawn: (cwd, command, title) => {
+        invocation = { cwd, command, title };
+        return { workspaceRef: 'workspace:7', surfaceRef: 'surface:8' };
+      },
+      write: value => { output.push(value); },
+    });
+
+    assert.deepStrictEqual(invocation, {
+      cwd: '/tmp/swarm board cwd',
+      command: 'swarm board --watch 17',
+      title: 'swarm board',
+    });
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:7', surfaceRef: 'surface:8' });
+    assert.deepStrictEqual(output, ['Opened swarm board: workspace:7 surface:8']);
+  });
+
+  test('cmux absence exits 1 with the exact guidance message instead of throwing', () => {
+    const errors: string[] = [];
+    let exitCode: number | null = null;
+    const result = spawnBoardTab({
+      spawn: () => { throw new Error('cmux not found'); },
+      writeError: value => { errors.push(value); },
+      exit: code => { exitCode = code; },
+    });
+    assert.strictEqual(result, null);
+    assert.strictEqual(exitCode, 1);
+    assert.deepStrictEqual(errors, [BOARD_CMUX_GUIDANCE]);
+  });
+});
+
+describe('WI-7c board Mermaid graph', () => {
+  test('populated graph renders host/state classes, ownership, handoff, and debris counts', () => {
+    const fixture = createFixture(true);
+    try {
+      insertTask(fixture.db, 'open-task', 'open', 'Alice', 1, 10);
+      insertEvent(fixture.db, 'stale-task', 'Bob', 'claimed', 80, { previous_owner: 'Alice' });
+      insertEvent(fixture.db, 'stale-task', 'Bob', 'claimed', 70, { previous_owner: 'Alice' });
+      const mermaid = buildBoardMermaid(fixture.db, 'default', { now: NOW });
+
+      assert.match(mermaid, /^flowchart LR$/m);
+      for (const className of [
+        'hostClaude', 'hostCodex', 'hostGrok', 'hostGemini', 'hostA2A', 'hostHeadless', 'hostUnknown',
+        'stActive', 'stAwaiting', 'stStale', 'stOpen', 'stDone',
+        'debrisWarn', 'debrisOk', 'debrisStale',
+      ]) {
+        assert.match(mermaid, new RegExp(`classDef ${className} `), className);
+      }
+      assert.match(mermaid, /agent0\("Alice<br\/>codex"\):::hostCodex/);
+      assert.match(mermaid, /agent1\("Bob<br\/>claude-code"\):::hostClaude/);
+      assert.match(mermaid, /task\d+\["open-task<br\/>\[open\] · no ckpt"\]:::stOpen/);
+      assert.match(mermaid, /task\d+\["review-task<br\/>\[awaiting_review\] · no ckpt"\]:::stAwaiting/);
+      assert.match(mermaid, /task\d+\["stale-task<br\/>\[active\] · ckpt 91m"\]:::stStale/);
+      assert.match(mermaid, /agent1 -->\|owns\| task\d+/);
+      assert.strictEqual((mermaid.match(/agent0 -\.->\|handoff\| agent1/g) ?? []).length, 1);
+      assert.match(mermaid, /debris0\["debris<br\/>4 worktrees \(1 detached\)<br\/>7 unpushed<br\/>tick 31m ago"\]/);
+      assert.match(mermaid, /class debris0 debrisWarn,debrisStale/);
+      assert.doesNotMatch(mermaid, /task\d+ -\.-> debris0/);
+      assert.match(mermaid, /subgraph legend\["Legend"\]/);
+      assert.match(mermaid, /2 agents/);
+      assert.match(mermaid, /4 tasks/);
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('includes recently done tasks dimmed and omits done tasks older than 24 hours', () => {
+    const fixture = createFixture(true);
+    try {
+      insertTask(fixture.db, 'recent-done', 'done', 'Alice', 1, 30);
+      insertTask(fixture.db, 'old-done', 'done', 'Bob', 1, 25 * 60);
+      const mermaid = buildBoardMermaid(fixture.db, 'default', { now: NOW });
+      assert.match(mermaid, /recent-done<br\/>\[done\] · no ckpt"\]:::stDone/);
+      assert.doesNotMatch(mermaid, /old-done/);
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('empty swarm remains a valid graph with idle and debris nodes', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-graph-empty-'));
+    const db = getDbAt(path.join(root, 'swarm.db'));
+    try {
+      const mermaid = buildBoardMermaid(db, 'default', { now: NOW });
+      assert.match(mermaid, /^flowchart LR$/m);
+      assert.match(mermaid, /idle\["idle swarm"\]:::note/);
+      assert.match(mermaid, /debris0\["debris<br\/>0 worktrees \(0 detached\)<br\/>0 unpushed<br\/>tick never"\]/);
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('missing tables return a minimal clear graph instead of throwing', () => {
+    const db = new Database(':memory:');
+    try {
+      const mermaid = buildBoardMermaid(db, 'legacy', { now: NOW });
+      assert.match(mermaid, /^flowchart LR$/m);
+      assert.match(mermaid, /board graph not available/);
+      assert.match(mermaid, /missing tables: agents, tasks, task_events, janitor_status/);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('labels cannot inject Mermaid syntax and node ids never derive from names or slugs', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-graph-labels-'));
+    const db = getDbAt(path.join(root, 'swarm.db'));
+    try {
+      insertAgent(db, 'Agent "One `', 'codex');
+      insertTask(db, 'task-with-hyphens', 'active', 'Agent "One `', 1, 5);
+      const mermaid = buildBoardMermaid(db, 'default', { now: NOW });
+      const agentLine = mermaid.split('\n').find(line => line.startsWith('agent0('));
+      const taskLine = mermaid.split('\n').find(line => line.startsWith('task0['));
+      assert.strictEqual(agentLine, 'agent0("Agent #quot;One #96;<br/>codex"):::hostCodex');
+      assert.ok(taskLine?.startsWith('task0["task-with-hyphens<br/>[active] · no ckpt"]:::stActive'));
+      assert.strictEqual((agentLine?.match(/"/g) ?? []).length, 2, 'only the label delimiters remain as quotes');
+      assert.doesNotMatch(mermaid, /^Agent/m);
+      assert.doesNotMatch(mermaid, /^task-with-hyphens/m);
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('HTML preserves raw Mermaid, pins Mermaid 11, and adds watch refresh metadata', () => {
+    const mermaid = 'flowchart LR\nagent0("Alice<br/>codex"):::hostCodex';
+    const html = buildBoardHtml(mermaid, { watchSeconds: 9 });
+    assert.ok(html.includes(`<pre class="mermaid">${mermaid}</pre>`));
+    assert.ok(html.includes(BOARD_MERMAID_CDN_URL));
+    assert.match(html, /mermaid\.initialize\(\{ startOnLoad: true, theme:/);
+    assert.match(html, /<meta http-equiv="refresh" content="9">/);
+    assert.match(html, /prefers-color-scheme: dark/);
+  });
+
+  test('graph watch regenerates twice without mutating the database', async () => {
+    const fixture = createFixture(true);
+    const outputPath = path.join(fixture.root, 'output', 'board.html');
+    try {
+      const beforeDb = databaseSnapshot(fixture.db);
+      fixture.db.pragma('query_only = ON');
+      let clock = NOW;
+      const waits: number[] = [];
+      const count = await watchBoardGraph({
+        intervalMs: 3,
+        regenerate: () => {
+          const mermaid = buildBoardMermaid(fixture.db, 'default', { now: clock });
+          clock += 60_000;
+          writeBoardGraphFile(outputPath, mermaid, { watchSeconds: 3 });
+        },
+        wait: async milliseconds => { waits.push(milliseconds); },
+        shouldContinue: renders => renders < 2,
+      });
+      assert.strictEqual(count, 2);
+      assert.deepStrictEqual(waits, [3]);
+      assert.match(fs.readFileSync(outputPath, 'utf-8'), /2026-07-18T18:01:00\.000Z/);
+      assert.strictEqual(databaseSnapshot(fixture.db), beforeDb);
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('graph tab falls back to the system browser when cmux is unavailable', () => {
+    const opened: string[] = [];
+    const errors: string[] = [];
+    const result = openBoardGraphTab('/tmp/swarm graph.html', {
+      spawn: () => { throw new Error('no cmux'); },
+      open: filePath => { opened.push(filePath); return true; },
+      writeError: value => { errors.push(value); },
+    });
+    assert.strictEqual(result, null);
+    assert.deepStrictEqual(opened, ['/tmp/swarm graph.html']);
+    assert.deepStrictEqual(errors, ['cmux browser unavailable; opened the graph with the system browser instead.']);
+  });
+
+  test('graph tab passes an encoded file URL and the required workspace title to cmux', () => {
+    let invocation: { cwd: string; url: string; title: string } | null = null;
+    const result = openBoardGraphTab('/tmp/swarm graph.html', {
+      cwd: '/tmp/project',
+      spawn: (cwd, url, title) => {
+        invocation = { cwd, url, title };
+        return { workspaceRef: 'workspace:3', surfaceRef: 'surface:4' };
+      },
+      open: () => { throw new Error('fallback should not run'); },
+    });
+    assert.deepStrictEqual(invocation, {
+      cwd: '/tmp/project',
+      url: 'file:///tmp/swarm%20graph.html',
+      title: 'swarm graph',
+    });
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:3', surfaceRef: 'surface:4' });
+  });
+
+  test('CLI writes HTML, prints raw Mermaid to stdout and the path to stderr without DB writes', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-graph-cli-'));
+    const swarmDir = path.join(home, '.swarm');
+    const dbPath = path.join(swarmDir, 'swarm.db');
+    fs.mkdirSync(swarmDir);
+    const db = getDbAt(dbPath);
+    insertAgent(db, 'Alice', 'codex');
+    db.close();
+    const beforeDb = fs.readFileSync(dbPath).toString('base64');
+    const outputPath = path.join(home, 'rendered', 'board.html');
+    const stderrPath = path.join(home, 'board.stderr');
+    try {
+      const stderrFd = fs.openSync(stderrPath, 'w');
+      let result: string;
+      try {
+        result = execFileSync(
+          'node',
+          ['--import', 'tsx', INDEX, 'board', '--graph', '--out', outputPath],
+          {
+            encoding: 'utf-8',
+            env: {
+              ...process.env,
+              HOME: home,
+              SWARM_ID: 'default',
+              SWARM_NAME: '',
+              SWARM_AGENT_NAME: '',
+              CMUX_SURFACE_ID: '',
+            },
+            stdio: ['ignore', 'pipe', stderrFd],
+          }
+        );
+      } finally {
+        fs.closeSync(stderrFd);
+      }
+      const mermaid = result.trimEnd();
+      const html = fs.readFileSync(outputPath, 'utf-8');
+      assert.match(mermaid, /^flowchart LR$/m);
+      assert.ok(html.includes(`<pre class="mermaid">${mermaid}</pre>`));
+      assert.strictEqual(fs.readFileSync(stderrPath, 'utf-8').trim(), path.resolve(outputPath));
+      assert.strictEqual(fs.readFileSync(dbPath).toString('base64'), beforeDb);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
     }
   });
 });

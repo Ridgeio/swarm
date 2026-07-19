@@ -12,7 +12,7 @@ export class SurfaceGoneError extends Error {
 
 let cachedCmuxPath: string | null = null;
 
-function resolveCmux(): string {
+export function resolveCmux(): string {
   if (cachedCmuxPath) return cachedCmuxPath;
 
   // 1. Check PATH
@@ -265,10 +265,17 @@ export function sendToSurface(
   }
 }
 
-export function spawnWorkspace(cwd: string, command: string): { workspaceRef: string; surfaceRef: string } | null {
+export function spawnWorkspace(
+  cwd: string,
+  command: string,
+  title?: string
+): { workspaceRef: string; surfaceRef: string } | null {
   const cmux = resolveCmux();
   // new-workspace returns "OK workspace:N"
-  const wsOut = execFileSync(cmux, ['new-workspace', '--cwd', cwd, '--command', command], STDIO_OPTS).toString().trim();
+  const args = ['new-workspace'];
+  if (title) args.push('--name', title);
+  args.push('--cwd', cwd, '--command', command);
+  const wsOut = execFileSync(cmux, args, STDIO_OPTS).toString().trim();
   const wsMatch = wsOut.match(/workspace:\d+/);
   if (!wsMatch) return null;
   const workspaceRef = wsMatch[0];
@@ -279,6 +286,31 @@ export function spawnWorkspace(cwd: string, command: string): { workspaceRef: st
   if (!surfMatch) return null;
 
   return { workspaceRef, surfaceRef: surfMatch[0] };
+}
+
+export function spawnBrowserWorkspace(
+  cwd: string,
+  url: string,
+  title: string
+): { workspaceRef: string; surfaceRef: string } | null {
+  const cmux = resolveCmux();
+  const wsOut = execFileSync(
+    cmux,
+    ['new-workspace', '--name', title, '--cwd', cwd],
+    STDIO_OPTS
+  ).toString().trim();
+  const wsMatch = wsOut.match(/workspace[:=]\d+/);
+  if (!wsMatch) return null;
+  const workspaceRef = wsMatch[0].replace('=', ':');
+
+  const surfaceOut = execFileSync(
+    cmux,
+    ['new-surface', '--type', 'browser', '--workspace', workspaceRef, '--url', url],
+    STDIO_OPTS
+  ).toString().trim();
+  const surfaceMatch = surfaceOut.match(/surface[:=]\d+/);
+  if (!surfaceMatch) return null;
+  return { workspaceRef, surfaceRef: surfaceMatch[0].replace('=', ':') };
 }
 
 export function spawnSurfaceInWorkspace(

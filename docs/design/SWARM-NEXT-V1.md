@@ -1,0 +1,209 @@
+# SWARM-NEXT v1 — design & specification
+
+Status: APPROVED FOR BUILD (Tom, 2026-07-19). Author: Fable-class lead (Sweeper session), per the routing rule that spec/architecture is frontier-model work and implementation routes to Codex.
+Provenance: synthesis of (a) the 2026-07-18 introspection review + Leasehold proposal, (b) a two-round, two-model-family research panel (codex gpt-5.6-sol + independent claude, repo-blind web research then repo-grounded gap analysis; grok failed 4/4 runs), (c) the field evidence from the week-long PromptEden GA run and its cleanup (~28 orphaned worktrees, ~129 stranded commits, dead registrations, stale-doctrine replay). Full trail: `Ridge.io/.briefs/swarm-next-plan.md`, `.briefs/swarm-introspection-review-and-leasehold-proposal.md`, judge files under `~/.local/state/alloy/runs/20260719T*/judge.json`.
+
+---
+
+## 1. Philosophy (the opinionated part)
+
+The swarm's first self-improvement wave fixed *messaging* and left *lifecycle* unmanaged, because messaging pain is visible per-turn while lifecycle debt accrues silently until a cleanup crew has to archaeology it out. This design inverts the system's defaults around five principles, each carrying its evidence:
+
+**P1 — Tasks, not agents, are the durable unit of work.** Agents are disposable processes; the assignment, its lease, its checkpoints, and its evidence live in SQLite rows that survive any agent. A dead agent's open tasks ARE its handoff. (Temporal's worker/workflow split; Kubernetes lease objects; codex-panel top adoption #1.)
+
+**P2 — Context is externalized continuously, or it never existed.** Every task carries an event-triggered checkpoint trail (goal, decisions+why, failed approaches, next action) plus git commits. A fresh context reorients from files in minutes; killing an agent loses minutes, not a context window of paid tokens. Checkpoints are 300–600 tokens at phase boundaries — never per-turn narration, which is furnace behavior. (Anthropic long-running-agent harness — progress files + git as memory; Manus filesystem-as-context; Amp's handoff-over-compaction; both panelists' #1 recommendation. A dead agent's transcript already persists on disk — we additionally index it, we do not dump it into context.)
+
+**P3 — Authority is fenced, not assumed.** Liveness (TTL, heartbeat) detects death; it cannot prevent a paused agent that wakes after expiry from making stale writes. Every task lease carries a monotonically increasing epoch; correctness-sensitive mutations must present the current epoch and are refused otherwise. (Kleppmann's fencing-token argument; codex-panel "most urgent gap".)
+
+**P4 — The bus shrinks; files and the ledger carry coordination state.** The strongest cross-source research finding: successful long-running fleets nearly eliminate agent-to-agent messaging (Anthropic's 16-agent C-compiler swarm coordinated via git + task-lock files with NO message bus; AgentTaxo's communication-tax measurements; MAST's inter-agent-misalignment failure class). The bus keeps: dispatch, gates/escalations, handoff pointers. It loses: status narration (→ journal), acks (→ delivery metadata), polling (→ deterministic watchers), doctrine (→ versioned files + spawn packets). Messages carry pointers; specs live in files.
+
+**P5 — Enforcement is deterministic; convention is a bug report waiting to happen.** Every rule that matters is either enforced at a CLI/code boundary or mechanically re-injected into every agent turn (the hook). Doc-only rules already failed in the field — including the self-improvement process leaving its own merged worktree behind. Deletion is last: observe → hold → rescue → quarantine → delete, with a verified preservation artifact before anything is removed.
+
+### Non-goals (deliberately not built, with reasons)
+
+- **No vector memory** — grep+files beat embeddings for code (Anthropic removed embeddings from Claude Code; Cursor/Devin converged).
+- **No auto-written doctrine** — automatic memory accumulation underperforms human-gated curation (Cursor shipped-then-killed Memories; MemGhost injection risk).
+- **No debate loops** — fail vs self-consistency at equal compute.
+- **No new daemons beyond the janitor tick**; no Temporal/BEAM — we steal recovery-boundary/fencing/supervision *semantics* onto the SQLite substrate we already trust.
+- **No deletion of anything in v1.** The janitor observes and rescues only.
+- **No hash-chained audit logs, dual-scheduler watchdogs, quota debt-inheritance, per-turn served-law digests** — cut by unanimous two-family panel verdict as v3 machinery ahead of need.
+- **No node:sqlite migration in v1** — recorded as a known dependency risk (better-sqlite3 ABI breaks take down all coordination at once; TROUBLESHOOTING.md), scheduled post-v1.
+
+---
+
+## 2. Current state (verified against source, 2026-07-19)
+
+- Schema (src/db.ts): `swarms`, `agents`, `messages(id, swarm_id, from_agent, to_agent NULL=broadcast, body, delivered, created_at, kind)`, `inbox_cursors(swarm_id, agent_name, last_read_id)`. Additive-nullable-column migration pattern established (`ensureMessageKindColumn`).
+- `getInbox` (src/mailbox.ts:116-155): cursor-watermark reads; **consuming by default**; kind-filtered reads peek-only by construction; `ORDER BY created_at` with cursor advanced from the last row (dormant ordering bug, TODO-ARCH §3).
+- Hook (src/index.ts:288 `printHookContext`): injects members + inbox into every turn via UserPromptSubmit across all three harnesses (hooks.ts); **consumes messages** (peek=false) — headless at-most-once-with-loss. Piggybacks redeliver-worker spawn (the proven anti-entropy-on-access pattern).
+- Broadcasts are `to_agent IS NULL` rows; a first-join agent has no cursor row → `lastReadId=0` → **replays all historical broadcasts as live doctrine**.
+- No resource-lifecycle verbs of any kind. No task concept. `swarm reset` wipes; reap is invocation-only; headless rows never auto-pruned (registry.ts:415).
+- MESSAGE_KINDS = status|digest|merge-req|escalation|ack|gate, validated at CLI boundary.
+- Tests: 12 files under tests/, run via `npm test` (tsx). All must stay green.
+
+---
+
+## 3. Work items
+
+Conventions for all items: follow the existing additive migration pattern in src/db.ts (new tables `CREATE TABLE IF NOT EXISTS` in `migrate()`; new columns via ensure-column guards). All timestamps ISO-8601 UTC strings. All new name comparisons `COLLATE NOCASE` (field-proven bug class). Never weaken sanitize()/execFileSync guarantees (transport.ts). Every behavior change lands with tests; every refusal path prints an actionable message. Keep the CLI thin — no frameworks, no manager layers (repo design constraint).
+
+### WI-1 — Broadcast backfill fence + supersession  (S)
+
+**Motivation.** A day-14 replacement agent's first read replays weeks of stale orders as live doctrine (verified: mailbox.ts:124-141). Supersession must be explicit metadata, not recency (STALE benchmark: implicit supersession ≈55% accuracy even for the best systems).
+
+**Spec.**
+1. On first-ever join of a name in a swarm (no existing `inbox_cursors` row), initialize the cursor to `MAX(messages.id)` for that swarm (0 if none). Applies to `joinAgent`, `joinHeadlessAgent`, `joinA2AAgent`. A re-join with an existing cursor row keeps it (a returning agent may still want what it missed; DMs can only be addressed to registered agents, so no legitimate pre-join DM exists to lose).
+2. `swarm inbox --recent N` remains the deliberate archaeology path (unchanged) — fencing hides history from the *default* read, it does not destroy it.
+3. New column `messages.superseded_by INTEGER` (nullable, additive). New flag `swarm send/broadcast --supersedes <msg-id>`:
+   - Validates: the referenced message exists in this swarm AND `from_agent` matches the sender (case-insensitive). Refuse otherwise ("you can only supersede your own messages").
+   - Sets `superseded_by = <new id>` on the referenced row (a tombstone pointing forward).
+4. Read behavior: `getInbox` and hook injection EXCLUDE superseded rows (`superseded_by IS NULL`). `--recent` INCLUDES them, annotated `[superseded by #<id>]`. Rationale: default reads must never serve a stale order as live; history stays inspectable.
+5. Chains are allowed (A superseded by B, B by C); each read simply filters non-null.
+
+**Acceptance.** New-join agent sees zero historical broadcasts in inbox/hook; `--recent` still replays; superseding message hides its target from all default reads including other recipients' unread inboxes; non-owner supersede refused; existing tests green.
+
+### WI-2 — Pull/ack delivery inversion  (M)
+
+**Motivation.** The hook consumes on read: a compacted turn or an ignored injection silently marks messages read (headless data loss, field-observed). TODO-ARCH 5.1/5.3. Delivery state must be per-recipient and explicit.
+
+**Spec.**
+1. New table:
+```sql
+CREATE TABLE IF NOT EXISTS message_deliveries (
+  message_id INTEGER NOT NULL,
+  swarm_id TEXT NOT NULL,
+  recipient TEXT NOT NULL COLLATE NOCASE,
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending | injected | acked
+  first_injected_at TEXT,
+  inject_count INTEGER NOT NULL DEFAULT 0,
+  acked_at TEXT,
+  PRIMARY KEY (message_id, recipient)
+);
+```
+   Rows created lazily the first time a message becomes visible to a recipient (hook or inbox read). No fan-out insert at send time (broadcast rows stay single-row — preserves the A2A-tolerant schema).
+2. **Hook reads become peek-only.** `printHookContext` calls `getInbox(..., peek=true)` and additionally filters to messages NOT `acked` by self. Each shown message: upsert delivery row, increment `inject_count`, stamp `first_injected_at`. Display includes the message id: `[#142 10:31 AM] [gate] Yulan: ...`.
+3. **Re-injection backoff.** A message with `inject_count >= 3` (or `first_injected_at` older than 45 min) collapses to one summary line in the hook: `(#142 from Yulan, unacked for 52m — swarm inbox --recent to review, swarm ack 142 to clear)`. Never auto-acked, never silently dropped. Constants as named exports for tuning.
+4. **`swarm ack <id...> | --all`** — marks delivery rows acked for self; advances the legacy `inbox_cursors` watermark to `max(acked ids, current)` for backward compatibility. Ack is idempotent.
+5. **Explicit `swarm inbox` (no flags)**: displaying a message IS an explicit read — it acks what it prints (delivery rows + cursor), preserving current UX. `--peek`, `--recent`, `--kind` never ack (unchanged semantics; kind-filtered stays peek-by-construction).
+6. Cursor-ordering defensive fix (TODO-ARCH 5.x) while the file is open: `getInbox` orders `BY id ASC`; watermark advances via `Math.max(...ids)`.
+7. `swarm stats` gains an unacked-age section: per agent, count + max age of unacked deliveries (replaces silence-based stall inference with delivery-grounded evidence).
+
+**Acceptance.** A hook injection followed by session death leaves messages pending (re-shown next turn); ack clears; third re-show collapses to summary; explicit inbox still one-shot reads; watermark still moves so old builds interoperate; A2A send path untouched; tests cover the compaction-loss scenario (peek → no cursor movement), backoff, idempotent ack, mixed-build tolerance (delivery table absent rows).
+
+### WI-3 — Task ledger, checkpoints, handoff, fencing  (M) — the context-insurance item
+
+**Motivation.** P1/P2/P3. Mechanizes: named-branch-only work (detached HEADs unconstructable), checkpoint discipline, succession without archaeology, stale-authority refusal.
+
+**Spec.**
+1. Tables:
+```sql
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT NOT NULL,                  -- slug [a-z0-9-]{3,64}
+  swarm_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'open',        -- open|active|awaiting_review|done|abandoned
+  owner_agent TEXT COLLATE NOCASE,
+  lease_epoch INTEGER NOT NULL DEFAULT 0,
+  lease_expires_at TEXT,                     -- soft TTL, default now+24h, renewed by checkpoint
+  repo_path TEXT, branch TEXT, worktree_path TEXT,
+  transcript_hint TEXT,                      -- harness + cwd + session file path when detectable
+  disposition TEXT,                          -- pr|merged|archive|discard (set at close)
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+  PRIMARY KEY (swarm_id, id)
+);
+CREATE TABLE IF NOT EXISTS task_events (    -- append-only
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  swarm_id TEXT NOT NULL, task_id TEXT NOT NULL,
+  epoch INTEGER NOT NULL, kind TEXT NOT NULL, -- started|checkpoint|claimed|handoff|closed|refused_stale_epoch|...
+  actor TEXT, data TEXT,                      -- JSON
+  created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  swarm_id TEXT NOT NULL, task_id TEXT,
+  body TEXT NOT NULL, made_by TEXT NOT NULL,
+  supersedes INTEGER,                         -- decisions.id
+  status TEXT NOT NULL DEFAULT 'active',      -- active|superseded
+  created_at TEXT NOT NULL
+);
+```
+2. **`swarm task start <slug> --title <t> [--repo <path>] [--no-worktree]`** — creates or claims the task: state=active, owner=self, `lease_epoch += 1`, records `transcript_hint` (detectHost() + process.cwd() + best-effort harness session dir). When `--repo` given and not `--no-worktree`: creates branch `swarm/<agent>/<slug>` and worktree at `~/.swarm/wt/<repo-basename>/<agent>--<slug>/` (canonical namespace; refuse /private/tmp and workspace-root targets). Claiming an actively-owned task requires `--takeover`, which bumps the epoch and emits a `claimed` event + a `handoff`-kind message to the previous owner. Every git invocation via execFileSync.
+3. **`swarm task checkpoint <slug> [--notes <text>]`** — fenced: caller must be owner AND present epoch (implicit: CLI rereads row and compares owner; a `--takeover` elsewhere bumps epoch → stale owner's checkpoint refused with `refused_stale_epoch` event). Writes `~/.swarm/briefs/checkpoints/<swarm>/<slug>/NNN.md` from the skeleton (below), pre-filled with mechanical facts (HEAD sha, branch, dirty/untracked counts via git when repo known); `--notes` fills the narrative section; without `--notes`, prints the skeleton path and instructs the agent to edit it, exiting nonzero until the file contains no `<FILL>` markers (checkpoint isn't "done" until the thinking is in it). Renews `lease_expires_at = now+24h`. Records a `checkpoint` event.
+   Checkpoint skeleton (exact headings, machine-parseable):
+```markdown
+# checkpoint <slug> #NNN
+- state: <one line>
+- head: <sha> on <branch> (dirty: N, untracked: M)
+## decisions (+why, +rejected alternatives)
+<FILL>
+## failed approaches (do-not-repeat)
+<FILL>
+## next action
+<FILL>
+## blockers / landmines
+<FILL>
+```
+4. **`swarm task close <slug> --disposition pr|merged|archive|discard`** — fenced. Refuses while the task worktree/branch has (a) unpushed commits (`git log <branch> --not --remotes` non-empty), (b) dirty tracked files, or (c) untracked files — unless disposition=archive AND a rescue artifact exists (WI-4), or `--force-discard` (double-confirm flag, event-logged). pr/merged evidence: branch tip sha reachable from any remote ref (`git branch -r --contains`); no hard `gh` dependency in v1. On success: state=done, disposition recorded, worktree removed via `git worktree remove` (branch ref kept — refs are cheap, worktrees are debris).
+5. **`swarm handoff <slug> --to <agent>`** — requires a checkpoint fresher than 60 min (or `--stale-ok`, which labels the brief STALE). Composes `~/.swarm/briefs/handoffs/<slug>--<date>.md`: latest checkpoint verbatim + task row facts + unpushed-branch inventory + transcript_hint. Sends the target a `handoff`-kind message containing the POINTER only (P4). Bumps epoch; new owner set on their `task start <slug>` (accept-by-claim, not accept-by-message).
+6. **`swarm decision <text> [--task <slug>] [--supersedes <id>]`** — one-line durable decision journal (`DECISION: X BECAUSE y` doctrine). Cheap, greppable, survives every context death.
+7. **Hook integration** (printHookContext): one line when self owns active tasks: `Your task: <slug> [<state>] — last checkpoint 94m ago (stale — swarm task checkpoint <slug>); next: <first line of ## next action>`. Threshold 90 min for the stale nag. No task → no line (zero tax).
+8. MESSAGE_KINDS += `'handoff'`.
+9. `swarm reset` preserves `tasks/task_events/decisions` tables (hygiene state survives fleet resets).
+
+**Acceptance.** start→checkpoint→close happy path; takeover bumps epoch and stale owner's checkpoint/close refused (event recorded); close refused on unpushed/dirty/untracked with exact counts in the message; handoff refuses stale checkpoints; skeleton `<FILL>` gate works; hook line appears only for owners; branch always named (no detached HEAD constructible through these verbs); worktrees only under `~/.swarm/wt/`; reset preserves ledger.
+
+### WI-4 — `swarm rescue`: verified preservation artifacts  (S)
+
+**Motivation.** Codifies the manual cleanup procedure that saved ~129 commits. Correction from the panel (factual): **git bundles do not carry dirty or untracked state** — preservation = bundle + patches + untracked archive, and it is not preserved until a restore is proven.
+
+**Spec.**
+1. **`swarm rescue --worktree <path> | --task <slug> | --agent <name>`** (agent = all worktrees recorded on their tasks). For each target worktree:
+   a. If HEAD is detached: create branch `rescue/<agent-or-unknown>/<slug-or-basename>-<yyyymmdd>` at HEAD.
+   b. Artifact dir `~/.swarm/archive/rescue/<basename>-<yyyymmddHHMM>/`: `repo.bundle` (git bundle: HEAD + all local branch tips of that worktree's repo not reachable from remotes), `staged.patch` (`git diff --cached --binary`), `unstaged.patch` (`git diff --binary`), `untracked.tar.gz` (`git ls-files --others --exclude-standard -z | tar`), `manifest.json` (worktree path, repo, branch, HEAD sha, per-file checksums, counts, created_at, swarm/task/agent attribution).
+   c. **Verification (mandatory, recorded in manifest):** `git bundle verify`; clone bundle to a temp dir, apply both patches, extract tar, compare resulting `git status --porcelain` + checksums against manifest. `verified: true` only on full match; on any failure the command exits nonzero and says exactly what didn't restore.
+2. Rescue NEVER deletes, unregisters, or modifies the source worktree (beyond creating the rescue branch ref).
+3. `swarm rescue --list` enumerates artifacts with verification state.
+4. Artifact dirs are plain files — they ride the existing cross-laptop rsync mesh for off-host redundancy (documented, not automated, in v1).
+
+**Acceptance.** Detached-HEAD + dirty + untracked fixture round-trips: rescue → wipe a copy → restore from artifact → byte-identical status; verification failure path exits nonzero; source untouched (git status identical before/after apart from the new ref).
+
+### WI-5 — Janitor tick, observe-only census  (M)
+
+**Motivation.** P5. Census-adopt is the PRIMARY mechanism (harnesses create most worktrees — the EXP-005 debris was harness-made, not verb-made). Deletion is not in this item; there is nothing destructive to configure wrong.
+
+**Spec.**
+1. **`swarm janitor tick --observe`** (the flag is required in v1; without it: exit 1 "only --observe is implemented; destructive phases are deliberately unbuilt — see docs/design/SWARM-NEXT-V1.md"). Singleton-locked via the redeliver.ts stale-break lock pattern. Pipeline (all read-only outside ~/.swarm):
+   a. Heartbeat: upsert `janitor_status` (single row: last_tick_at, last_duration_ms, counters JSON).
+   b. Repo census over roots from `~/.swarm/janitor-roots.json` (human-edited JSON array; `swarm janitor roots add/remove/list` to manage; seeded on first run with registered swarm root_paths). Per root: `git worktree list --porcelain` → orphans (gitdir missing), detached HEADs, per-worktree dirty/untracked counts; local branches with upstream `: gone`; unpushed-commit counts (`git log --branches --not --remotes --oneline`).
+   c. Temp scan: `/private/tmp` + `$TMPDIR` top level for entries with a `.git` file/dir whose gitdir resolves into a census root (worktrees stranded in temp — the field pattern).
+   d. Junk heuristic: direct children of census roots that contain ONLY build output (node_modules/.astro/dist/build/.next and no tracked source, no .git) — the pe-marketing-pixel class.
+   e. Findings upsert into `janitor_findings(id, first_seen_at, last_seen_at, kind, path, detail JSON, state)` — state always `'hold'` in v1 (panel correction: unknown ≠ expired; nothing is ever marked deletion-eligible here). Resolved findings (path gone) marked `cleared`.
+2. **Triggers** (both, complementary):
+   a. Hook piggyback (primary — the proven cleanupStale-rides-listAgents pattern): in `printHookContext`, if `janitor_status.last_tick_at` is older than 10 min, spawn a detached `swarm janitor tick --observe` exactly like `spawnRedeliverWorker`. Runs when the fleet is active — when debris is being made.
+   b. **`swarm janitor install`** — writes `~/Library/LaunchAgents/io.swarm.janitor.plist` (StartInterval 900, RunAtLoad) invoking the built CLI's `janitor tick --observe`; covers idle-fleet windows. `swarm janitor uninstall` removes it.
+3. **Visibility:** hook-context gains one line: `janitor: tick 4m ago | debris: 3 worktrees (1 detached), 129 unpushed commits, 2 temp strays, 1 junk dir` — with a LOUD variant when last_tick_at > 30 min (`janitor heartbeat stale`). `swarm stats` gains the same counters as a section; counters snapshotted per tick into `janitor_status.counters` history table `janitor_snapshots` for trend lines.
+4. Tick must be fast (<5s typical) and safe under concurrency (lock) and mid-tick crash (next tick recomputes from reality — no incremental state to corrupt).
+
+**Acceptance.** Fixture with a detached-HEAD worktree, a `: gone` branch, a temp-stranded worktree, and a junk dir: one tick populates findings with correct kinds/counts, all state=hold; second tick is idempotent (last_seen_at moves, no dupes); removing a fixture clears the finding; hook line renders both fresh and stale variants; tick refuses to run without --observe; launchd plist installs/uninstalls cleanly; no path outside ~/.swarm is written.
+
+### WI-6 — Documentation, doctrine, process  (S, split Fable/Codex)
+
+Codex scope (technical docs, same PR as the code they describe): update README.md command reference; CLAUDE.md architecture section (new tables, verbs, hook behavior, janitor); TROUBLESHOOTING.md entries for ack/backoff and janitor lock; mark TODO-ARCHITECTURE 5.1/5.3/5.x as landed with commit refs (do not delete the file's history).
+
+Fable scope (judgment docs, this session): `docs/philosophy.md` (the P1–P5 essay with sources — the durable "why"); replace `docs/model-routing.md` with the merged role×model×fallback table + quota-band protocol; move the org doc into the repo as `docs/org-template.md` (role templates + messaging rules, roster-free — the live roster is runtime state, not doctrine); orchestration.md addendum: bus-shrinking doctrine, journal/checkpoint rules, "a completion claim without its artifact is an ack, not a fact" cross-reference to `task close` evidence gates; experiments.md entries EXP-006..EXP-010 (one per WI, each with hypothesis, guard metric, due-date for the measurement — the loop governs its own rollout).
+
+### Tech-debt items (fold into the phase touching each file)
+
+- getInbox `ORDER BY id` + max-id watermark (WI-2, stated there).
+- stats.ts pair-key `\x00` separator → `'→'` so stats output is diffable/greppable (verify current code during WI-2 phase; cosmetic, test-covered).
+- hooks.ts `SWARM_DIR` derivation via `new URL(import.meta.url).pathname` breaks on paths with spaces — use `fileURLToPath` (touch in WI-5 phase which extends the hook).
+
+---
+
+## 4. Rollout & measurement
+
+Phases land as separate commits on `feat/swarm-next-v1`, each: implementation + tests green (`npm test`) + docs for that surface. Phase order: WI-1+WI-2 (mailbox/hooks lane) → WI-3+WI-4 (ledger lane) → WI-5 (janitor) → WI-6 (docs). Cross-family review: Codex implements, Fable-class reviews every diff before commit (this session); anything gate-critical gets a second look via `codex exec review` in a later session.
+
+Observation week: janitor runs observe-only during the next PromptEden session; its census IS the debris baseline (EXP-010's measurement). Deletion phases get designed only after that baseline exists — with the panel's corrections (hold-not-expired adoption, verified artifacts, restore windows) as standing constraints.
+
+Success criteria for the program (measured at the next session's retro): zero new stranded-commit incidents; zero stale-doctrine replays to new joiners; every agent death recoverable from checkpoint+handoff in <10 min of successor time; debris counters visible every turn and trending flat-or-down; message volume down with gate latency flat (guard metric).

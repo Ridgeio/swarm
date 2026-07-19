@@ -255,6 +255,11 @@ Common commands:
 - ${swarmBin} status --set "<description>"
 - ${swarmBin} leave
 
+Fleet UI (open it if you are the first/Lead agent so the operator can see the swarm):
+- ${swarmBin} board                 one-shot fleet view (NEEDS YOU / TASKS / FLEET / DEBRIS)
+- ${swarmBin} board --tab           live board in its own cmux tab (keep it open)
+- ${swarmBin} board --graph --open  visual workflow diagram (agents by model, tasks by state)
+
 Your current identity is resolved by the swarm CLI from the terminal/session marker. Run ${swarmBin} whoami to confirm which swarm you are in.
 `;
     fs.writeFileSync(basePath, baseContent);

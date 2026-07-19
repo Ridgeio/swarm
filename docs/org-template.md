@@ -7,7 +7,7 @@ Rules here are the prompt-space layer. Wherever a rule has a code enforcement (m
 ## Roles
 
 - **Owner (human).** The only merge-to-main, prod, and spend authority. Everything below exists to spend the owner's attention well: approvals upstream (plans/specs), decisions surfaced with evidence, alerts only when a decision is needed.
-- **Lead.** Merge-gate operator, prod gates, final arbitration, owner interface. NOTHING else routes here. Fable-class per routing table.
+- **Lead.** Merge-gate operator, prod gates, final arbitration, owner interface. NOTHING else routes here. Fable-class per routing table. As the first agent to join, open the fleet board so the operator has a window into the swarm from turn one: `swarm board --tab` (live board in a cmux tab) and/or `swarm board --graph --open` (visual workflow diagram). Keep it running for the program's duration.
 - **PM / routing hub.** Plan of record, scope calls, work-package coordination, first-line arbitration. Absorbs status; emits event-triggered digests to the lead. Plan upkeep routes to Gemini-class; digest assembly is CLI work, not model work.
 - **Builders (1 lane each, 4–6 max).** One writer per repo-area — writes are single-threaded per lane; contracts frozen between lanes before parallel start. Model per routing table by lane type.
 - **Reviewers.** Fresh-context, different model family than the lane's author (⚙ aspiration: enforced at MERGE-REQ validation once sender auth lands). Evidence required: file/line, counterexample, or failing test — "looks good" is not a review.

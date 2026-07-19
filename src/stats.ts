@@ -1,4 +1,5 @@
 import type Database from 'better-sqlite3';
+import { getJanitorStatus, janitorTickAgeMinutes, type JanitorStatus } from './janitor.js';
 
 /**
  * Fleet messaging metrics for the self-improvement loop (docs/self-improvement.md).
@@ -58,6 +59,8 @@ export interface FleetStats {
    *  last send, plus registered agents that have never sent at all. */
   possibleStalls: AgentStall[];
   unackedDeliveries: UnackedDeliveryStats[];
+  janitorStatus: JanitorStatus | null;
+  janitorAgeMinutes: number | null;
 }
 
 const STALL_THRESHOLD_MINUTES = 45;
@@ -185,6 +188,7 @@ export function getFleetStats(
     maxAgeMinutes: Math.max(0, Math.floor((now - new Date(row.oldest_at).getTime()) / 60_000)),
   }));
 
+  const janitorStatus = getJanitorStatus(db);
   return {
     windowHours,
     since,
@@ -198,6 +202,8 @@ export function getFleetStats(
     topPairs,
     possibleStalls,
     unackedDeliveries,
+    janitorStatus,
+    janitorAgeMinutes: janitorStatus ? janitorTickAgeMinutes(janitorStatus, now) : null,
   };
 }
 
@@ -248,6 +254,18 @@ export function formatFleetStats(stats: FleetStats): string {
       const age = s.minutesSinceLastSend === Infinity ? 'never sent' : `${s.minutesSinceLastSend}min silent`;
       lines.push(`  ${s.agent.padEnd(12)} ${age}, ${s.inboundSinceLastSend} inbound since — check surface (zombie? ack-loop? captive work?)`);
     }
+  }
+
+  lines.push('');
+  lines.push('Janitor/debris:');
+  if (!stats.janitorStatus) {
+    lines.push('  janitor: never run');
+  } else {
+    const counters = stats.janitorStatus.counters;
+    lines.push(`  janitor: tick ${stats.janitorAgeMinutes ?? 0}m ago (${stats.janitorStatus.lastDurationMs}ms)`);
+    lines.push(`  worktrees: ${counters.worktrees} total | ${counters.detachedHeads} detached | ${counters.orphanedWorktrees} orphaned`);
+    lines.push(`  commits: ${counters.unpushedCommits} unpushed | upstream branches gone: ${counters.goneUpstreamBranches}`);
+    lines.push(`  temp strays: ${counters.tempStrays} | junk dirs: ${counters.junkDirs} | repos scanned: ${counters.reposScanned}`);
   }
 
   if (stats.totalMessages === 0) {

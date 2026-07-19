@@ -61,6 +61,18 @@ import {
   type TaskDisposition,
 } from './tasks.js';
 import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './rescue.js';
+import {
+  addJanitorRoot,
+  formatJanitorHookLine,
+  getJanitorStatus,
+  installJanitorLaunchAgent,
+  readJanitorRoots,
+  removeJanitorRoot,
+  runJanitorTick,
+  shouldSpawnJanitorTick,
+  spawnJanitorTick,
+  uninstallJanitorLaunchAgent,
+} from './janitor.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -247,6 +259,12 @@ Task Ledger:
                                                      (plain files under ~/.swarm/archive/rescue/;
                                                      existing rsync may copy them off-host)
 
+Janitor (observe-only in v1):
+  swarm janitor tick --observe                    Run the read-only debris census
+  swarm janitor roots list                        List census roots
+  swarm janitor roots add|remove <path>           Manage census roots
+  swarm janitor install|uninstall                 Manage the 15-minute launchd schedule
+
 Status:
   swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
@@ -376,16 +394,19 @@ function printHookContext(): void {
     }).join('\n')}`;
   const taskLines = getActiveTaskHookLines(db, self.swarm_id, self.name);
   const taskSection = taskLines.length ? `\n${taskLines.join('\n')}` : '';
+  const janitorStatus = getJanitorStatus(db);
+  const janitorSection = janitorStatus ? `\n${formatJanitorHookLine(janitorStatus)}` : '';
 
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"${readCommand}
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
   // adds no meaningful latency to the prompt hook.
   if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
+  if (shouldSpawnJanitorTick(janitorStatus)) spawnJanitorTick();
 }
 
 async function main() {
@@ -887,6 +908,64 @@ async function main() {
           console.log(`Rescue verified: ${result.artifactDir}`);
           console.log(`Manifest: ${path.join(result.artifactDir, 'manifest.json')}`);
         }
+        break;
+      }
+
+      case 'janitor': {
+        const subcommand = args[1];
+        if (subcommand === 'tick') {
+          if (!hasFlag('--observe')) {
+            console.error('only --observe is implemented; destructive phases are deliberately unbuilt — see docs/design/SWARM-NEXT-V1.md');
+            process.exit(1);
+          }
+          const result = runJanitorTick(getDb());
+          if (result.lockedOut) {
+            console.log('Janitor tick already running; no-op.');
+          } else {
+            const counters = result.counters!;
+            console.log(
+              `Janitor observe tick complete in ${counters.tickMs}ms: ` +
+              `${counters.reposScanned} repos, ${counters.worktrees} worktrees, ` +
+              `${result.findings} findings.`
+            );
+          }
+          break;
+        }
+
+        if (subcommand === 'roots') {
+          const action = args[2];
+          if (action === 'list') {
+            const roots = readJanitorRoots();
+            if (roots.length === 0) console.log('No janitor roots configured.');
+            else for (const root of roots) console.log(root);
+            break;
+          }
+          const root = args[3];
+          if (!root || (action !== 'add' && action !== 'remove')) {
+            console.error('Usage: swarm janitor roots list|add <path>|remove <path>');
+            process.exit(1);
+          }
+          const roots = action === 'add' ? addJanitorRoot(root) : removeJanitorRoot(root);
+          console.log(`Janitor root ${action === 'add' ? 'added' : 'removed'}: ${path.resolve(root)}`);
+          console.log(`${roots.length} root(s) configured.`);
+          break;
+        }
+
+        if (subcommand === 'install') {
+          const plistPath = installJanitorLaunchAgent();
+          console.log(`Janitor launch agent installed: ${plistPath}`);
+          break;
+        }
+
+        if (subcommand === 'uninstall') {
+          const plistPath = path.join(os.homedir(), 'Library', 'LaunchAgents', 'io.swarm.janitor.plist');
+          const removed = uninstallJanitorLaunchAgent();
+          console.log(removed ? `Janitor launch agent uninstalled: ${plistPath}` : 'Janitor launch agent is not installed.');
+          break;
+        }
+
+        console.error('Usage: swarm janitor tick --observe | roots list|add <path>|remove <path> | install | uninstall');
+        process.exit(1);
         break;
       }
 

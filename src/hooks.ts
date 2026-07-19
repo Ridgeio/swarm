@@ -1,10 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import { fileURLToPath } from 'url';
 
 export type HostAgent = 'claude-code' | 'codex' | 'grok';
 
-const SWARM_DIR = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..');
+const SWARM_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK_SCRIPT = path.join(SWARM_DIR, 'hooks', 'swarm-awareness-headless.sh');
 const AWARENESS_HOOK_SCRIPT = path.join(SWARM_DIR, 'hooks', 'swarm-awareness.sh');
 const CODEX_BASE_MARKER = '<!-- swarm-instructions -->';

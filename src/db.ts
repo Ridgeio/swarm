@@ -152,6 +152,29 @@ function createCurrentTables(db: Database.Database): void {
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS janitor_status (
+      id INTEGER PRIMARY KEY CHECK (id = 1),
+      last_tick_at TEXT NOT NULL,
+      last_duration_ms INTEGER NOT NULL,
+      counters TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS janitor_findings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      path TEXT NOT NULL,
+      detail TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'hold'
+    );
+
+    CREATE TABLE IF NOT EXISTS janitor_snapshots (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      tick_at TEXT NOT NULL,
+      counters TEXT NOT NULL
+    );
   `);
 }
 
@@ -329,6 +352,9 @@ function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
     CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);
+    CREATE INDEX IF NOT EXISTS idx_janitor_findings_state ON janitor_findings(state, kind);
+    CREATE INDEX IF NOT EXISTS idx_janitor_snapshots_tick ON janitor_snapshots(tick_at);
   `);
 }
 

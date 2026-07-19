@@ -1,6 +1,8 @@
 # Swarm — Architecture Critique & Improvement Roadmap
 
-> **Status:** Design backlog, not yet started. Captured 2026-07-03.
+> **Landed via SWARM-NEXT v1:** The pull/ack, per-recipient delivery, and cursor-ordering items below landed on `feat/swarm-next-v1`; the governing rollout spec is [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md). This file remains the historical critique and backlog for still-open items.
+>
+> **Status:** Historical critique plus active backlog. Captured 2026-07-03; landed items are marked in §5.
 > **Source:** An `/alloy` multi-model panel (codex + grok + claude, each reading the
 > real source tree read-only) plus the judge synthesis (Claude, with hands-on repo
 > context from ~10 bug fixes landed on `master` this session).
@@ -165,6 +167,8 @@ working unbabysat."
 
 ### 5.1 — Invert delivery to PULL  ·  ~1 day  ·  **do first**
 
+**LANDED — `9743629` (`feat: broadcast backfill fence, supersession tombstones, pull/ack delivery`)**
+
 Make the durable log the source of truth. Agents poll their inbox (they already do,
 via the hook) and **ack explicitly**.
 
@@ -178,6 +182,8 @@ command + `acked`/cursor bookkeeping, hook script text.
 
 ### 5.2 — Thin per-host daemon (or long-lived `swarm watch`)  ·  2–3 days
 
+**OPEN**
+
 A single long-lived process per host that **holds the DB, owns delivery, and enforces
 a concurrency cap + token bucket.**
 
@@ -188,6 +194,8 @@ a concurrency cap + token bucket.**
 
 ### 5.3 — Per-recipient delivery rows + acks + idempotency + status  ·  1–2 days
 
+**LANDED — `9743629` (`feat: broadcast backfill fence, supersession tombstones, pull/ack delivery`)**
+
 Add a per-recipient delivery table with a `status` column
 (`pending | delivered | acked | dead`), redelivery, and dead-lettering.
 
@@ -195,6 +203,8 @@ Add a per-recipient delivery table with a `status` column
 - Idempotency keys so a redelivery never double-executes.
 
 ### 5.4 — Authenticate the sender  ·  ~1 day
+
+**OPEN**
 
 Issue a per-session token at `join`; require it on `send`.
 
@@ -209,6 +219,8 @@ clobber, focus theft, frontmost-tab footgun, single-line-only). Demote it to an
 **optional human-visible nudge** or remove it.
 
 ### 5.x — Defensive quick win (independent of the above)
+
+**LANDED — `9743629` (`feat: broadcast backfill fence, supersession tombstones, pull/ack delivery`)**
 
 Fix the cursor ordering (§3) even though it's dormant: order by `id`, advance via
 `Math.max(...ids)` instead of `created_at`. Trivial, do it while the file is open.

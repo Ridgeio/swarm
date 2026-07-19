@@ -24,7 +24,7 @@ Send messages between Claude Code, Codex, Grok CLI, OpenClaw, Hermes, and any A2
                                   └──────────────┘
 ```
 
-**Cmux agents** (Claude Code, Codex CLI, Grok CLI) register with `swarm join` and receive messages pushed directly into their terminal via Cmux's native `send` command.
+**Cmux agents** (Claude Code, Codex CLI, Grok CLI) register with `swarm join`. Messages are durable SQLite rows; terminal delivery is an immediate nudge, while the awareness hook peeks at pending deliveries until the recipient explicitly acknowledges them.
 
 **A2A agents** (OpenClaw, Hermes, or any agent with an A2A-compatible endpoint) register with `swarm register-a2a` and receive messages delivered over HTTP via the A2A protocol. This enables cross-user and cross-machine coordination.
 
@@ -102,6 +102,12 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 `swarm reset` clears only the selected/current swarm. Use `swarm reset --all` only when you explicitly want to wipe every swarm.
 
+## Task-based operation
+
+Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start` assigns an owner with a fenced lease epoch; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires remote or preservation evidence. Tasks, task events, and decisions survive `swarm reset`.
+
+The operating principles are in [docs/philosophy.md](docs/philosophy.md), and the exact v1 contracts and evidence gates are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md).
+
 ## Skills
 
 | Command | What it does |
@@ -126,9 +132,43 @@ Swarm management:
   swarm delete <name>                        Delete a non-default swarm
 
 Messaging:
-  swarm send <agent> <message>                Push a message to an agent in this swarm
-  swarm broadcast <message>                   Push to all agents in this swarm
-  swarm inbox [--peek]                        Read pending messages
+  swarm send <agent>[,<agent>...] <message>   Send to one or more agents
+        [--kind <kind>] [--supersedes <id>]
+        [--interject|--now]
+  swarm broadcast <message>                   Send to every agent in this swarm
+        [--kind <kind>] [--supersedes <id>]
+        [--interject|--now]
+  swarm inbox [--peek|--unread|--recent [N]]  Read pending or historical messages
+        [--kind <kind>]
+  swarm ack <msg-id...> | --all               Acknowledge pending deliveries
+  swarm redeliver [--dry-run]                 Retry eligible push notifications
+
+Task ledger:
+  swarm task start <slug> --title <text>       Create or claim a fenced task lease
+        [--repo <path>] [--no-worktree] [--takeover]
+  swarm task checkpoint <slug> [--notes <text>] Record a numbered durable checkpoint
+  swarm task close <slug> --disposition <kind> Close with pr|merged|archive|discard evidence
+        [--force-discard]
+  swarm task list                              List the durable task ledger
+  swarm task show <slug>                       Show task facts, events, and decisions
+  swarm handoff <slug> --to <agent>            Transfer with a fresh checkpoint brief
+        [--stale-ok]
+  swarm decision <text> [--task <slug>]        Record a durable decision
+        [--supersedes <decision-id>]
+
+Recovery and hygiene:
+  swarm rescue --worktree <path>               Create and verify a rescue artifact
+        | --task <slug> | --agent <name>
+  swarm rescue --list                          List rescue manifests and verification state
+  swarm rescue --verify <artifact-dir>         Re-verify an existing rescue artifact
+  swarm janitor tick --observe                 Run the observe-only debris census
+  swarm janitor roots list                     List census roots
+  swarm janitor roots add|remove <path>        Manage census roots
+  swarm janitor install|uninstall              Manage the launchd schedule
+
+Operator visibility:
+  swarm board [--watch [N]]                    Render fleet state; refresh every N seconds
+  swarm stats [--hours <N>]                    Show messaging and debris metrics
 
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
@@ -166,6 +206,28 @@ Session:
 ```
 
 Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visual identification. A2A agents are shown with their endpoint URL in `swarm members`.
+
+### New command examples
+
+| Command | One-line example |
+|---|---|
+| Acknowledge delivery | `swarm ack 41 42` or `swarm ack --all` |
+| Supersede an instruction | `swarm send Bob "use the revised migration plan" --kind gate --supersedes 41` |
+| Start or take over a task | `swarm task start auth-refresh --title "Refresh auth" --repo . --takeover` |
+| Checkpoint a task | `swarm task checkpoint auth-refresh --notes "Token rotation works; next run integration tests"` |
+| Close a task | `swarm task close auth-refresh --disposition pr` |
+| List tasks | `swarm task list` |
+| Show task history | `swarm task show auth-refresh` |
+| Hand off work | `swarm handoff auth-refresh --to Bob` |
+| Record a decision | `swarm decision "DECISION: keep JWT BECAUSE clients depend on it" --task auth-refresh` |
+| Create a rescue | `swarm rescue --task auth-refresh` |
+| List rescues | `swarm rescue --list` |
+| Verify a rescue | `swarm rescue --verify ~/.swarm/archive/rescue/20260718-auth-refresh` |
+| Run the janitor | `swarm janitor tick --observe` |
+| Manage janitor roots | `swarm janitor roots list`, `swarm janitor roots add /path/to/projects`, or `swarm janitor roots remove /path/to/projects` |
+| Install or remove scheduling | `swarm janitor install` or `swarm janitor uninstall` |
+| Render once | `swarm board` |
+| Keep a live board | `swarm board --watch 5` |
 
 ## Example workflows
 
@@ -293,7 +355,7 @@ Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear t
 
 ## How agents coordinate
 
-**Cmux agents**: Messages are injected directly into the target terminal via `cmux send`. The receiving agent sees it as user input and responds naturally. This is push-based delivery — agents don't need to poll.
+**Cmux/headless agents**: SQLite is the source of truth. The awareness hook peeks without consuming, records injection attempts, and keeps a delivery pending until `swarm ack <id>` (or a plain `swarm inbox` read) acknowledges it. Cmux/AppleScript push remains a best-effort nudge, not proof that work was seen or completed.
 
 **A2A agents**: Messages are delivered via HTTP POST to the agent's registered endpoint using the [A2A protocol](https://google.github.io/A2A/). The agent processes the message and can respond through the same channel.
 
@@ -309,11 +371,15 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
 - **`src/registry.ts`** — Swarm + agent CRUD, A2A registration, async stale cleanup
 - **`src/mailbox.ts`** — Swarm-scoped message send/broadcast/inbox with cursor tracking
+- **`src/tasks.ts`** — Fenced task leases, checkpoints, evidence-gated close, handoff, and decisions
+- **`src/rescue.ts`** — Verified preservation artifacts and manifest verification
+- **`src/janitor.ts`** — Observe-only debris census, heartbeat, hook trigger, and launchd schedule
+- **`src/board.ts`** — Read-only fleet/task/debris/quota rendering and watch loop
 - **`src/index.ts`** — CLI entry point
 - **`hooks/swarm-awareness.sh`** — Claude Code UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 - **`hooks/swarm-awareness-headless.sh`** — Headless awareness hook used where a host can poll inbox messages
 
-State is stored in `~/.swarm/swarm.db`. The database has a `swarms` table, and agents/messages/inbox cursors are partitioned by `swarm_id`. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
+State is stored in `~/.swarm/swarm.db`. Swarm-scoped tables include agents, messages, per-recipient deliveries, inbox cursors, tasks, task events, and decisions; janitor status, findings, and snapshots provide machine-level debris history. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 

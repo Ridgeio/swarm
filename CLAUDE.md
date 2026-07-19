@@ -10,12 +10,15 @@ Cross-terminal agent coordination CLI via Cmux and A2A protocol.
 
 ## How It Works
 
-Swarm supports two transport types:
+Swarm supports three registration/delivery modes:
 
 - **Cmux agents** (Claude Code, Codex, Grok CLI) register via `swarm join <name>`, which stores their Cmux surface ID in SQLite (`~/.swarm/swarm.db`). Messages are pushed via `cmux send` + `cmux send-key Enter`.
+- **Headless/Warp agents** register with terminal metadata. Warp push is optional; otherwise messages wait in the durable inbox.
 - **A2A agents** (OpenClaw, Hermes, etc.) register via `swarm register-a2a <name> --endpoint <url>`. Messages are delivered via the A2A protocol over HTTP. This enables cross-user and cross-machine coordination.
 
-Stale agents are cleaned up by checking liveness (Cmux surface check or A2A agent card ping) combined with a 30-minute heartbeat threshold, and only after several consecutive failed liveness probes. Headless agents are never auto-pruned (they have no probeable surface).
+SQLite is authoritative for delivery. The prompt hook peeks at pending rows without consuming them; explicit `swarm ack` or a normal inbox read marks per-recipient delivery rows acknowledged and advances the legacy cursor. Superseded messages remain historical but are excluded from live reads.
+
+Tasks are durable, fenced leases backed by append-only task events and checkpoint files. Stale agents are cleaned up by liveness plus heartbeat checks; headless agents are never auto-pruned. The observe-only janitor runs from both a 15-minute launchd trigger and opportunistic hook piggyback when its last tick is old.
 
 ## Architecture
 
@@ -26,8 +29,14 @@ Stale agents are cleaned up by checking liveness (Cmux surface check or A2A agen
 - `src/transport.ts` — Low-level Cmux utilities (send, read-screen, binary resolution)
 - `src/db.ts` — SQLite init with WAL mode, schema migrations
 - `src/registry.ts` — Agent CRUD, A2A registration, async stale cleanup
-- `src/mailbox.ts` — Async message send/broadcast/inbox with cursor
+- `src/mailbox.ts` — Pull/ack delivery rows, supersession, inbox reads, and cursor compatibility
+- `src/tasks.ts` — Fenced task epochs, checkpoints, evidence-gated close, handoff, and decisions
+- `src/rescue.ts` — Verified preservation artifacts and manifests
+- `src/janitor.ts` — Observe-only debris census, heartbeat, hook piggyback, and launchd management
+- `src/board.ts` — Read-only fleet board and watch loop
 - `src/index.ts` — CLI entry point (async main)
+
+Core tables are `swarms`, `agents`, `messages`, `message_deliveries`, `inbox_cursors`, `tasks`, `task_events`, `decisions`, `janitor_status`, `janitor_findings`, and `janitor_snapshots`.
 
 ## Security Notes
 

@@ -162,6 +162,72 @@ sqlite3 ~/.swarm/swarm.db "UPDATE agents SET host_agent = 'grok' WHERE name IN (
 
 ---
 
+## Messages keep reappearing in my hook
+
+### Cause
+
+The awareness hook deliberately peeks: injection is not acknowledgement. A delivery remains pending across turns until the recipient acks it, so context loss cannot silently consume an instruction. After repeated injections the hook collapses the body to a reminder, but it still does not clear the row.
+
+### Fix
+
+Use the message ID shown by the hook:
+
+```bash
+swarm ack 41
+# or, after reviewing everything pending:
+swarm ack --all
+```
+
+A plain `swarm inbox` read also acknowledges every row it prints. `--peek`, `--recent`, and kind-filtered reads do not.
+
+---
+
+## Janitor heartbeat stale
+
+The board/hook becomes loud after the WI-5 heartbeat threshold (30 minutes). Check that `~/Library/LaunchAgents/io.swarm.janitor.plist` exists and still points at the current Node binary and built `dist/index.js`. Re-run `swarm janitor install` if the plist is missing or stale.
+
+The prompt hook is the fallback trigger: `hook-context` piggybacks an observe-only tick when the last census is old. If both triggers are uncertain, run the same safe census manually:
+
+```bash
+swarm janitor tick --observe
+swarm board
+```
+
+If the manual tick succeeds but the heartbeat later goes stale again, inspect the launchd plist/registration and confirm the active agent host is actually running the swarm awareness hook.
+
+---
+
+## Task close refuses
+
+`task close` has an exact-count preservation gate. The error reports all three blocking counts: `unpushed commits: N, dirty tracked files: N, untracked files: N`. For `pr` or `merged`, the recorded branch tip must also be reachable from a remote ref.
+
+The normal fix is to push the branch and clean or commit the worktree. The explicit escape hatches are:
+
+- Preserve the worktree with `swarm rescue --task <slug>`, verify the artifact, then close with `--disposition archive`.
+- Intentionally throw it away with both `--disposition discard --force-discard`. This is event-logged and cannot be requested with only one of the two flags.
+
+```bash
+swarm rescue --task auth-refresh
+swarm task close auth-refresh --disposition archive
+
+# destructive intent, double-confirmed:
+swarm task close auth-refresh --disposition discard --force-discard
+```
+
+---
+
+## Rescue verification failed
+
+Read the `manifest.json` path printed in the error. The manifest records the source worktree/repository, task and agent attribution, HEAD and branch, porcelain status, dirty/untracked counts, artifact sizes and SHA-256 checksums, changed-source checksums, and any locally unreachable branches. A failed verification sets `verified: false`, clears `verified_at`, and puts the concrete mismatch in `verification_error` (for example a missing bundle, checksum mismatch, restore-status mismatch, or changed-file mismatch).
+
+Verification restores into a temporary directory. It does not clean, reset, remove, or otherwise repair the source worktree; the source is left untouched. If the artifact itself is damaged, keep the source in place and create a fresh rescue artifact rather than treating the failed manifest as preservation evidence. Re-check an intact artifact with:
+
+```bash
+swarm rescue --verify <artifact-dir>
+```
+
+---
+
 ## Long-term fixes (not yet implemented)
 
 - **Vendor a working prebuild** in this repo so `prebuild-install` doesn't have to fetch.

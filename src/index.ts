@@ -3,7 +3,7 @@ import os from 'os';
 import fs from 'fs';
 import { execFileSync } from 'child_process';
 import { DEFAULT_SWARM_ID } from './db.js';
-import { getDb } from './db.js';
+import { getDb, getDbReadOnly } from './db.js';
 import {
   Agent,
   Swarm,
@@ -54,6 +54,7 @@ import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 import {
   checkpointTask,
   closeTask,
+  getTask,
   getActiveTaskHookLines,
   handoffTask,
   recordDecision,
@@ -73,6 +74,12 @@ import {
   spawnJanitorTick,
   uninstallJanitorLaunchAgent,
 } from './janitor.js';
+import {
+  BOARD_DEFAULT_WATCH_SECONDS,
+  boardHasTable,
+  renderBoard,
+  watchBoard,
+} from './board.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -128,6 +135,11 @@ function requirePositiveIdFlag(flag: string, label: string, usage: string): numb
 
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function oneLineForCli(value: string, limit: number = 160): string {
+  const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return flattened.length <= limit ? flattened : `${flattened.slice(0, limit - 1)}\u2026`;
 }
 
 function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = false): Swarm {
@@ -250,6 +262,8 @@ Task Ledger:
                                                      narrative sections with "- none noted"
   swarm task close <slug> --disposition <kind>     Close with pr|merged|archive|discard evidence
     [--force-discard]
+  swarm task list                                  List the durable task ledger
+  swarm task show <slug>                           Show one task with events and decisions
   swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
   swarm decision <text> [--task <slug>]            Record a durable decision
     [--supersedes <decision-id>]
@@ -266,6 +280,7 @@ Janitor (observe-only in v1):
   swarm janitor install|uninstall                 Manage the 15-minute launchd schedule
 
 Status:
+  swarm board [--watch [N]]                       Render fleet tasks, agents, debris, and quota
   swarm members                                    List agents in the current swarm
   swarm status [--set <desc>] [--agent <name>]     Update or query status
   swarm whoami                                     Show own registration
@@ -788,11 +803,97 @@ async function main() {
       case 'task': {
         const subcommand = args[1];
         const slug = args[2];
-        if (!subcommand || !slug) {
-          console.error('Usage: swarm task start|checkpoint|close <slug> [options]');
+        if (!subcommand) {
+          console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
           process.exit(1);
         }
         const { db, self } = requireSelf();
+        if (subcommand === 'list') {
+          const tasks = db.prepare(`
+            SELECT id, title, state, owner_agent, lease_epoch, disposition, updated_at
+            FROM tasks
+            WHERE swarm_id = ?
+            ORDER BY CASE state WHEN 'awaiting_review' THEN 0 WHEN 'active' THEN 1 WHEN 'open' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
+                     updated_at DESC, id ASC
+          `).all(self.swarm_id) as Array<{
+            id: string;
+            title: string;
+            state: string;
+            owner_agent: string | null;
+            lease_epoch: number;
+            disposition: string | null;
+          }>;
+          if (tasks.length === 0) {
+            console.log('No tasks recorded.');
+          } else {
+            for (const task of tasks) {
+              const disposition = task.disposition ? `; disposition ${task.disposition}` : '';
+              console.log(`${task.id} [${task.state}] \u2014 ${task.owner_agent ?? 'unowned'}(${task.lease_epoch})${disposition} \u2014 ${task.title}`);
+            }
+            console.log(`\n${tasks.length} task(s)`);
+          }
+          break;
+        }
+        if (subcommand === 'show') {
+          if (!slug) {
+            console.error('Usage: swarm task show <slug>');
+            process.exit(1);
+          }
+          const task = getTask(db, self.swarm_id, slug);
+          if (!task) {
+            console.error(`Task "${slug}" not found in this swarm.`);
+            process.exit(1);
+          }
+          console.log(`${task.id}: ${task.title}`);
+          console.log(`state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; lease epoch: ${task.lease_epoch}`);
+          console.log(`lease expires: ${task.lease_expires_at ?? 'none'}; disposition: ${task.disposition ?? 'none'}`);
+          console.log(`repo: ${task.repo_path ?? 'none'}`);
+          console.log(`branch: ${task.branch ?? 'none'}; worktree: ${task.worktree_path ?? 'none'}`);
+          console.log(`transcript: ${task.transcript_hint ?? 'not available'}`);
+          const events = db.prepare(`
+            SELECT id, epoch, kind, actor, data, created_at
+            FROM task_events
+            WHERE swarm_id = ? AND task_id = ?
+            ORDER BY id ASC
+          `).all(self.swarm_id, slug) as Array<{
+            id: number;
+            epoch: number;
+            kind: string;
+            actor: string | null;
+            data: string | null;
+            created_at: string;
+          }>;
+          console.log('events:');
+          if (events.length === 0) console.log('  none');
+          for (const event of events) {
+            const data = event.data ? ` \u2014 ${oneLineForCli(event.data)}` : '';
+            console.log(`  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} @${event.epoch}${data}`);
+          }
+          const decisions = db.prepare(`
+            SELECT id, body, made_by, supersedes, status, created_at
+            FROM decisions
+            WHERE swarm_id = ? AND task_id = ?
+            ORDER BY id ASC
+          `).all(self.swarm_id, slug) as Array<{
+            id: number;
+            body: string;
+            made_by: string;
+            supersedes: number | null;
+            status: string;
+            created_at: string;
+          }>;
+          console.log('decisions:');
+          if (decisions.length === 0) console.log('  none');
+          for (const decision of decisions) {
+            const supersedes = decision.supersedes ? ` supersedes #${decision.supersedes}` : '';
+            console.log(`  #${decision.id} [${decision.status}] ${decision.body} \u2014 ${decision.made_by}${supersedes}`);
+          }
+          break;
+        }
+        if (!slug) {
+          console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
+          process.exit(1);
+        }
         if (subcommand === 'start') {
           const result = await startTask(db, self.swarm_id, self.name, slug, {
             title: getFlag('--title'),
@@ -831,7 +932,7 @@ async function main() {
           break;
         }
         console.error(`Unknown task command: ${subcommand}`);
-        console.error('Usage: swarm task start|checkpoint|close <slug> [options]');
+        console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
         process.exit(1);
         break;
       }
@@ -966,6 +1067,55 @@ async function main() {
 
         console.error('Usage: swarm janitor tick --observe | roots list|add <path>|remove <path> | install | uninstall');
         process.exit(1);
+        break;
+      }
+
+      case 'board': {
+        const watchIndex = args.indexOf('--watch');
+        const rawInterval = watchIndex === -1 ? undefined : args[watchIndex + 1];
+        const intervalSeconds = rawInterval === undefined || rawInterval.startsWith('--')
+          ? BOARD_DEFAULT_WATCH_SECONDS
+          : Number(rawInterval);
+        if (watchIndex !== -1 && (!Number.isFinite(intervalSeconds) || intervalSeconds <= 0)) {
+          console.error('Usage: swarm board [--watch [N]] (N must be a positive number of seconds)');
+          process.exit(1);
+        }
+
+        const db = getDbReadOnly();
+        let swarmId = DEFAULT_SWARM_ID;
+        if (db && boardHasTable(db, 'swarms')) {
+          let swarm: Swarm | null = null;
+          if (explicitSwarmName) {
+            swarm = getSwarm(db, explicitSwarmName);
+            if (!swarm) {
+              db.close();
+              console.error(`Error: Swarm "${explicitSwarmName}" not found.`);
+              process.exit(1);
+            }
+          } else if (process.env.SWARM_ID) {
+            swarm = getSwarmById(db, process.env.SWARM_ID);
+          } else if (process.env.SWARM_NAME) {
+            swarm = getSwarm(db, process.env.SWARM_NAME);
+          }
+          if (!swarm && boardHasTable(db, 'agents')) {
+            const self = getSelf(db);
+            if (self) swarm = getSwarmById(db, self.swarm_id);
+          }
+          if (!swarm) swarm = findSwarmForCwd(db);
+          if (!swarm) swarm = getSwarmById(db, DEFAULT_SWARM_ID);
+          if (swarm) swarmId = swarm.id;
+        }
+
+        const snapshot = () => renderBoard(db, swarmId);
+        try {
+          if (watchIndex === -1) {
+            console.log(snapshot());
+          } else {
+            await watchBoard({ render: snapshot, intervalMs: intervalSeconds * 1_000 });
+          }
+        } finally {
+          db?.close();
+        }
         break;
       }
 

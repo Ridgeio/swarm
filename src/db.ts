@@ -378,3 +378,16 @@ export function getDbAt(dbPath: string): Database.Database {
   migrate(testDb);
   return testDb;
 }
+
+/**
+ * Open the fleet database without creating it, migrating it, or changing its
+ * journal settings. Read-only commands such as `swarm board` use this path so
+ * observing the fleet cannot itself become fleet activity.
+ */
+export function getDbReadOnly(): Database.Database | null {
+  if (!fs.existsSync(DB_PATH)) return null;
+  const readDb = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+  readDb.pragma('busy_timeout = 5000');
+  readDb.pragma('query_only = ON');
+  return readDb;
+}

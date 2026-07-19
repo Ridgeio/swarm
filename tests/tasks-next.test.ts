@@ -480,4 +480,42 @@ describe('WI-3 task ledger CLI', () => {
       fs.rmSync(repo, { recursive: true, force: true });
     }
   });
+
+  test('task list and task show expose the durable ledger without changing it', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-inspect-'));
+    try {
+      joinAgent(home, 'Alice');
+      assert.strictEqual(runCli(home, ['task', 'start', 'inspect-me', '--title', 'Inspect ledger', '--no-worktree'], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, ['task', 'checkpoint', 'inspect-me', '--notes', 'Keep inspecting.'], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, ['decision', 'DECISION: expose history BECAUSE operators need it', '--task', 'inspect-me'], 'Alice').status, 0);
+
+      const db = openDb(home);
+      const before = JSON.stringify({
+        tasks: db.prepare('SELECT * FROM tasks ORDER BY id').all(),
+        events: db.prepare('SELECT * FROM task_events ORDER BY id').all(),
+        decisions: db.prepare('SELECT * FROM decisions ORDER BY id').all(),
+      });
+      db.close();
+
+      const list = runCli(home, ['task', 'list'], 'Alice');
+      assert.strictEqual(list.status, 0, list.stderr || list.stdout);
+      assert.match(list.stdout, /inspect-me \[active\] \u2014 Alice\(1\) \u2014 Inspect ledger/);
+      const show = runCli(home, ['task', 'show', 'inspect-me'], 'Alice');
+      assert.strictEqual(show.status, 0, show.stderr || show.stdout);
+      assert.match(show.stdout, /inspect-me: Inspect ledger/);
+      assert.match(show.stdout, /checkpoint by Alice @1/);
+      assert.match(show.stdout, /DECISION: expose history BECAUSE operators need it/);
+
+      const afterDb = openDb(home);
+      const after = JSON.stringify({
+        tasks: afterDb.prepare('SELECT * FROM tasks ORDER BY id').all(),
+        events: afterDb.prepare('SELECT * FROM task_events ORDER BY id').all(),
+        decisions: afterDb.prepare('SELECT * FROM decisions ORDER BY id').all(),
+      });
+      afterDb.close();
+      assert.strictEqual(after, before);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

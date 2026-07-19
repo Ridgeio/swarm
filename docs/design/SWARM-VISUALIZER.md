@@ -71,3 +71,40 @@ The current mermaid `swarm board --graph` renders blank offline because it CDN-l
 6. **(Gate) evaluate daily use** — only then consider v2 (§5).
 
 Each step is small, shippable, and reversible; the text board (`renderBoard`) stays as the terminal/degraded fallback forever.
+
+---
+
+## 9. v1 engineering contracts (APPROVED FOR BUILD — Tom, 2026-07-19)
+
+Build phases V1-A → V1-B → V1-C, each a separate reviewed commit. Conventions: all name comparisons COLLATE NOCASE; all subprocess calls execFileSync; DB access read-only (`getDbReadOnly`) everywhere in this feature; every refusal actionable; tests mandatory per phase; keep index.ts cases thin.
+
+### Vendored assets (repo `vendor/` directory — committed, pinned)
+
+`vendor/` holds pinned, minified UMD builds fetched from the npm registry (NOT CDNs): `mermaid.min.js` (mermaid@11), `cytoscape.min.js` (cytoscape@3), `dagre.min.js` (@dagrejs/dagre), `cytoscape-dagre.js` (cytoscape-dagre), `echarts.min.js` (echarts@5). `vendor/README.md` records exact versions, SHA-256 checksums, source tarball, and the update procedure. UMD (classic `<script>`) is REQUIRED — ES-module imports are blocked over `file://` by browser CORS rules, and v1 must work from both `file://` and `http://127.0.0.1`.
+
+### V1-A — offline fix + shared data layer  (S/M)
+
+1. **Mermaid offline fix**: `writeBoardGraphFile` copies `vendor/mermaid.min.js` to `~/.swarm/board-assets/` and the generated HTML references `./board-assets/mermaid.min.js` via a classic script tag (drop the jsdelivr ESM import + `BOARD_MERMAID_CDN_URL`). The raw-source `<pre>` fallback stays. Existing graph tests updated, no behavior change otherwise.
+2. **`src/board-data.ts`** — pure, read-only projection consumed by BOTH the text board and (later) the JSON endpoint:
+   `collectBoardData(db, swarmId, {now}) -> BoardData` where `BoardData = { generatedAt, swarm: {id,name}, agents: [{name, agentType, host, joinedAt, lastHeartbeat, surfaceKnown, currentTaskId, progressEvidenceAt, unackedCount, unackedMaxAgeMin}], tasks: [{id, title, state, owner, leaseEpoch, repoPath, branch, worktreePath, createdAt, checkpoint: {seq, ageMin, nextAction, path} | null, stale: bool, git: {dirty, untracked, unpushed} | null}], edges: {ownership: [{agent, taskId}], handoffs: [{from, to, taskId, at}], claims: [{from, to, taskId, at}]}, needsYou: [{kind, label, refId}], debris: {tickAgeMin, counters, findings: [{kind, path, state, firstSeenAt, lastSeenAt, detail}]}, timeline: [{taskId, epoch, kind, actor, at, summary}] (last 200 task_events, newest last), quota: string | null }`.
+   Handoff vs claim edges are distinguished per §3 (handoff events → `data.to`; claimed events → `data.previous_owner`). All fields derived with the SAME helpers/queries the text board uses today — refactor `renderBoard`/`buildBoardMermaid` to consume `collectBoardData` (or its sub-queries) so there is ONE projection. Graceful on missing tables: partial BoardData with an `unavailable: [tableName...]` field, never a throw.
+3. Tests: projection unit tests against a populated fixture (assert every field family incl. handoff-vs-claim separation and missing-table degradation); ALL existing board/graph/text tests stay green (pure-refactor invariant).
+
+### V1-B — served graph page  (M)
+
+1. **`swarm board --serve [--port N] [--tab | --open | --print-url]`**: `node:http` (zero new runtime deps), bind `127.0.0.1` only, default port 7787 (fail with actionable message if taken and no --port). Foreground process, Ctrl-C stops, prints URL on start.
+   Routes: `GET /` → `web/board.html` with a per-session token templated in; `GET /assets/*` → files from repo `vendor/` + `web/` (path-traversal-safe allowlist); `GET /api/board` → JSON of `collectBoardData` (Cache-Control: no-store). Security: random 32-hex session token generated at boot, required (`X-Swarm-Token` header or `?token=`) on `/api/*`; Host-header allowlist (`127.0.0.1[:port]`, `localhost[:port]`) on every route (DNS-rebinding defense); CSP header `default-src 'self'`; JSON bodies size-capped. `--tab` opens a cmux browser pane at the URL (reuse the existing browser-workspace spawn; fall back to `--open`); `--open` uses macOS `open`; both best-effort.
+2. **`web/` static page — no build step**: `board.html`, `board.css`, `board.js` (vanilla ES5-safe or plain ES2017, classic scripts). Layout: header (swarm, counts, updated-at, staleness dot) · left pane Cytoscape canvas · right pane = NEEDS YOU list + inspector drawer · bottom strip reserved for V1-C timeline. Poll `/api/board` every 2s; on topology hash change run `cytoscape-dagre` layout (LR), otherwise update data/classes in place so **pan/zoom and selection are preserved across polls**. Graph semantics per §3: agent nodes (rounded, host-colored classes matching the existing board palette), task nodes (rect, state classes incl. `stale`), solid `owns` edges, dashed `handoff` edges, dotted `claimed` edges, one debris node. Click node → inspector drawer renders detail **as text via `textContent`** (never innerHTML — checkpoint/message content is untrusted), including the task event sublist and debris findings. Theme-aware (prefers-color-scheme, both palettes).
+3. **Factor for testability**: `web/board-elements.js` — a pure function `boardElements(boardData) -> {elements, topologyHash}` (Cytoscape elements JSON) loadable in Node for unit tests; `board.js` only wires it to polling/rendering.
+4. Tests: server — token required (401 without), Host-header rejection, path-traversal refused, JSON shape matches projection, read-only (no DB writes across requests), port-in-use message; elements-builder — populated fixture → expected nodes/edges/classes incl. handoff-vs-claim styling and stale class; HTML contains no external URLs (grep: no `http://`/`https://` in `web/` + generated output).
+
+### V1-C — dashboard, timeline, focus-terminal  (M)
+
+1. **Dashboard pane** (ECharts, vendored): stat cards + sparklines — debris counters trend (`janitor_snapshots`), unacked count/age, task-state counts; NEEDS YOU list gets an "only what needs me" filter toggle that also filters the graph (coordinated views).
+2. **Timeline strip** (ECharts custom series): `BoardData.timeline` as outcome-colored spans grouped per task; selecting a task node filters the timeline to it; clicking a span shows the event in the inspector. This is the Temporal-pattern payoff — keep it simple (no zoom-sync ambitions in v1).
+3. **Focus terminal**: `POST /api/focus-agent` `{agent}` + token → server resolves the *registered* `surface_id`/workspace for that agent (registry lookup; refuse unknown agents) → focuses the cmux surface via the existing cmux CLI machinery (execFile; best-effort — return `{ok, message}`). NEVER accept surface ids, commands, or paths from the browser — the agent NAME is the only input, resolved server-side. Inspector drawer gets a "Focus terminal" button for agent nodes.
+4. Tests: focus endpoint — unknown agent refused, name-only contract (attempts to pass surface/command fields ignored/rejected), execFile invoked with expected args via injectable spawner; filter toggle logic (pure helper) unit-tested; timeline data mapping pure-function tested.
+
+### Explicitly NOT in v1
+
+No Vite/React/build step; no SSE/WebSocket/WAL-watch (2s poll is the contract; upgrade path documented in §5); no editing/dragging-to-rewire (operational map, not an editor); no message-traffic edges (P4); no 0.0.0.0 binding ever; no new runtime npm deps (vendored static files only).

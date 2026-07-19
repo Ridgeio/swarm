@@ -1,51 +1,43 @@
-# Model routing — task type → model, benchmark-grounded
+# Model routing — role × model × fallback, quota-aware
 
-Tom's rule (2026-07-17): route each task to the right model type. There is a
-cost-benefit tradeoff, but the default bias is **best possible output**; cheap
-models are for mechanical work, not for anything customers see or that gates
-production.
+Supersedes the 2026-07-17 table. Grounding order unchanged: (1) field bench — our own task outcomes; (2) published benchmarks/research with calibrated skepticism (Arena is a tiebreaker and drift detector, never a decider against field results); (3) cost/harness fit. New in this revision (2026-07-19, from the cross-model research panel + field events): Gemini joins the roster, every lane pre-declares a fallback order, quota is tracked as capacity bands, and cross-family review is a RULE, not a preference.
 
-## Evidence sources, in order of authority
+## Standing rules
 
-1. **Field bench** — our own task outcomes (e.g. the fable-subagent bench;
-   this sprint's per-lane performance). Outcome-based beats preference-based.
-2. **Arena.ai leaderboards** — refreshed periodically (see cadence below).
-   Treat with calibrated skepticism (Tom, 2026-07-17: "not sure how much
-   they're to be trusted, but worth considering"): preference-vote Elo
-   measures what raters LIKE, not task success — it is style-biased,
-   gameable by labs tuning for votes, and blind to harness/duration effects
-   that dominate real agent work. A wide ±CI means unstable rank (young
-   model). Arena is a tiebreaker and a drift detector, never a decider
-   against field results.
-3. **Cost/harness fit** — a model's CLI harness matters as much as the model
-   (repo tooling, session durability, rate-limit exposure).
+1. **Route by default; ensemble by exception.** Panels (alloy) are for decision gates only: architecture approval, security review, release review, contested root-cause. For throughput work, one well-routed model. (Evidence: routing retains ~95% of frontier quality at a fraction of frontier calls — RouteLLM; ensembles add ~two effective votes regardless of panel size — "Nine Judges" 2026; tests out-verify judges — CodeT.)
+2. **Planning/execution split.** Frontier plans and reviews; cheaper executes against the frozen plan. (Aider architect/editor: SOTA at 14× lower cost; Claude Code opusplan.)
+3. **Cross-family review rule.** The reviewer of gate-critical work must be a different model family than the author — same-family pairs share training blind spots (errors correlate across providers ~60% when both wrong; ICML 2025). Tests remain the gold verifier; review is the second layer; Fable judgment the third.
+4. **Fable turns are the scarcest resource.** Never spend them on absorption: acks, digests, status, sweeps, journals, inventories. Mechanical digesting is a CLI feature, not a model task.
+5. **Context affinity is paid capital.** Never swap a context-rich agent to a cheaper model mid-lane to save quota — rebuying its context costs more than the savings.
+6. **Deterministic code beats any model** for: polling, lease renewal, diffs, schema validation, budget accounting, cleanup inventory. An LLM enumerating worktrees is a bug.
 
-## Current routing table (Arena snapshot 2026-07-16; field notes 2026-07-17)
+## Routing table
 
-| Task type | Route to | Grounding |
-|---|---|---|
-| Lead / PM / arbitration / synthesis | claude (Fable-class) | Arena creative #1, coding #2; judgment-heavy work needs the strongest generalist |
-| Hard engineering execution (spine, migrations, security surfaces) | codex (gpt-5.6-sol xhigh) | Field bench: primary executor, sustained multi-hour lanes; Arena coding #14 UNDERSTATES field results — outcome evidence wins |
-| Design / creative / brand / copy drafting | kimi-k3 (opencode) | Arena creative #6 (1479±27) at a fraction of Fable cost; field: delivered identity gate 3 days early. Copy FINAL PASS still reviewed by claude-class (Fable #1 creative) |
-| QA / watchdog / checklist execution / smoke | grok | Field: excellent at bounded evidence-first probes (BL-5 discipline); Arena coding #22 — do not route build work here |
-| Mechanical sweeps (renames, inventories, log greps) | cheapest available harness | Output quality ceiling irrelevant |
-| Copy/messaging FINAL review (customer-facing) | claude (Fable-class) | Arena creative #1; also the lead's gate anyway |
+| Role | Primary | Fallback order | Grounding |
+|---|---|---|---|
+| Lead / arbitration / spec / architecture / final customer-facing copy | Fable-class (Claude) | Codex | Judgment-heavy, low-volume; strongest generalist |
+| PM: digest assembly | CLI code (not a model) | — | Mechanical absorption; orchestration backlog graduated |
+| PM: plan-of-record upkeep | Gemini | Codex → Fable (arbitration only) | Long-context plan maintenance; preserves Fable quota |
+| Builder: spine / migrations / security surfaces | Codex (gpt-5.6-sol, xhigh) | Gemini → Fable (gate-critical only) | Field-proven primary executor; outcome evidence over Arena rank |
+| Builder: frontend / marketing surfaces | Gemini (`gemini` CLI — NOT Antigravity; its wrapper is broken as of 2026-07) | Kimi → Codex | Fills roster gap; de-risks Codex cap-outs |
+| Design / brand / copy drafting | Kimi K3 (opencode) | Gemini | Field: identity gate 3 days early; keep k2.7 fallback for 429 storms; Fable final pass stands |
+| Adversarial reviewer (per PR) | Different family than author — pick from {Codex, Claude, Gemini} | Fable on gate-critical | Rule 3; fresh context per review (Devin Review evidence: fresh-context reviewers catch what authors can't) |
+| QA / dogfood / smoke probes | Grok — **ON PROBATION**: 4/4 silent stub-failures in the 2026-07-19 research panels; require a completion-quality check (output length/substance gate) before trusting a Grok lane result | Kimi → Gemini | Prior field record good (BL-5 discipline); harness reliability now in question — field bench beats reputation in BOTH directions |
+| Research / context mapping | Gemini | Codex synthesis → Fable reads the distillate | Long-context + search-native |
+| Janitor-adjacent ops / sweeps / inventories | Deterministic code; else cheapest with quota headroom | any | Rule 6 |
+| Rescue distillation (dead-agent transcript → checkpoint) | Kimi | Gemini | Mechanical summarization; the only LLM step in the rescue path, hence cheapest |
 
-Notes:
-- kimi-k3's ±27 CI is wide (new model) — recheck rank next refresh; its
-  OpenRouter capacity is currently saturated at peak (429 storms): keep the
-  k2.7-code fallback configured and expect throughput dips.
-- grok absent from Arena creative top-12 and coding #22: never route
-  customer-facing prose or spine code to grok lanes.
-- Arena coding shows claude-class dominating 1–7; we still route bulk
-  engineering to codex harnesses on cost + field-outcome grounds. If field
-  quality ever dips, this is the first table row to revisit.
+## Quota protocol (capacity bands)
+
+Subscriptions are caps, not meters — the marginal token is free until it isn't, and the failure mode is cap exhaustion starving high-value work, not dollar burn. At every phase boundary (same clock as the periodic review), record each provider's rough remaining headroom as a band:
+
+- **green** — route normally.
+- **yellow** (~<40%) — no NEW long builder lanes on this model; in-flight lanes finish (rule 5).
+- **red** (~<15%) — context-rich critical work only; new work routes to fallbacks.
+- **cooldown** — 429/limit storms; treat as red until two clean checks.
+
+Bands live in the phase-boundary note (and, once the task ledger lands, on the program task's checkpoint). Pre-declared fallback order activates on band change — no mid-sprint improvisation. `swarm stats` per-agent traffic joined against `host_agent` is the burn proxy until real telemetry earns automation.
 
 ## Update cadence
 
-- Refresh Arena snapshots (creative-writing + coding) at each phase boundary
-  or ~weekly during active sprints, whichever comes first — same rhythm as
-  the periodic orchestration review (docs/orchestration.md). Log material
-  rank changes in docs/experiments.md and update the table.
-- New fleet member provisioning MUST consult this table first (charter rule
-  for the lead + PMs).
+Re-verify the table at each phase boundary or ~weekly during active sprints: field outcomes first (merged-PR rate, first-pass acceptance, rework by lane), benchmark drift second. Log material changes in docs/experiments.md. New fleet members are provisioned from this table (charter rule for lead + PM). Any model failing silently (the Grok stub pattern: plausible completion, no substance) gets a probation row here — reputation never overrides a reproduced field failure.

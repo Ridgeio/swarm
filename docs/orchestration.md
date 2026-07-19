@@ -2,9 +2,21 @@
 
 Distilled from live fleet operation (13 agents, PromptEden GA program,
 2026-07-16). This is durable knowledge about *running* a swarm, kept in the
-swarm repo so it travels with the tool. The current org chart itself lives in
-`~/.swarm/briefs/swarm-org.md` (machine-local, program-specific); this doc is
-the general model behind it.
+swarm repo so it travels with the tool. Role/gate/messaging doctrine now lives
+in docs/org-template.md (versioned, roster-free); the architectural "why" in
+docs/philosophy.md; both supersede the machine-local swarm-org.md brief.
+
+> **2026-07-19 revision (SWARM-NEXT).** The research phase after this doc was
+> written established a stronger form of its message-economics section: the
+> mature pattern is not cheaper messaging but LESS messaging — coordination
+> state moves to the task ledger and files (swarm task / checkpoint /
+> decision), and the bus carries only dispatch, gates, escalations, and
+> handoff pointers (philosophy.md P4). The protocols below stand, but when a
+> status update, ack, or poll is about to become a message, the ledger verb is
+> the correct move. Completion claims are now code-enforced where possible:
+> `swarm task close` refuses without pushed/clean evidence — "a completion
+> claim without its artifact is an ack, not a fact" graduated from doctrine to
+> boundary check.
 
 ## The economics: every message is a context tax
 

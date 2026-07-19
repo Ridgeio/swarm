@@ -91,6 +91,48 @@ Template:
 - Decision: merged. Companion doctrine in orchestration.md (phase squeeze,
   zombie protocol, positive-evidence completion) from the MAP-CCS review.
 
+## EXP-006 — Broadcast backfill fence + supersession (WI-1)   [status: running]
+- Date opened: 2026-07-19. Measure by: first phase boundary of the next PromptEden program.
+- Hypothesis: fencing new joiners' cursors and adding --supersedes tombstones
+  reduces stale-doctrine incidents (agent acting on an expired order) to zero
+  without any joiner missing live doctrine (guard: onboarding gaps reported).
+- Change: spec WI-1 (docs/design/SWARM-NEXT-V1.md).
+- Baseline: 25 historical broadcasts replayed to each of 2 new joiners on
+  2026-07-18 (Sweeper, Broom), several containing expired squeezes/holds.
+
+## EXP-007 — Pull/ack delivery (WI-2)   [status: running]
+- Date opened: 2026-07-19. Measure by: next program phase boundary.
+- Hypothesis: peek-only hook reads + explicit ack eliminate silent message loss
+  (headless consume-on-inject) with re-injection backoff keeping per-turn hook
+  context under ~15 lines (guard: no gate-critical message unacked >45 min
+  without a visible summary line).
+- Change: spec WI-2. New instrument: unacked-age section in swarm stats.
+
+## EXP-008 — Task ledger + checkpoints (WI-3)   [status: running]
+- Date opened: 2026-07-19. Measure by: first agent death/replacement in the next program.
+- Hypothesis: with task rows, fenced epochs, and phase-boundary checkpoints,
+  a dead agent's lane resumes in <10 min of successor time (vs ~1 day of
+  forensic cleanup on 2026-07-18), and zero stale-epoch writes land.
+- Guard metric: checkpoint overhead stays <2% of session tokens (spot-check).
+- Change: spec WI-3.
+
+## EXP-009 — Verified rescue artifacts (WI-4)   [status: running]
+- Date opened: 2026-07-19. Measure by: first rescue in anger.
+- Hypothesis: swarm rescue preserves 100% of committed+dirty+untracked state
+  (test-restore proof) vs the manual 2026-07-18 procedure which preserved
+  commits but had no restore verification.
+- Change: spec WI-4. Note: bundles alone were proven insufficient (no
+  dirty/untracked) — panel correction, codified.
+
+## EXP-010 — Observe-only janitor census (WI-5)   [status: running]
+- Date opened: 2026-07-19. Measure by: one week of ticks during the next program.
+- Hypothesis: hook-piggyback + launchd ticks produce a continuous debris
+  baseline (worktrees, unpushed, temp strays, junk) with zero false-destruction
+  risk (nothing destructive is implemented) and <5s tick cost; debris counters
+  in hook context change agent behavior (guard: counters trend flat-or-down
+  during the program, vs +28 worktrees last program).
+- Change: spec WI-5. This baseline gates any future destructive phase.
+
 ## EXP-005 — Messaging dividends: multi-send, kinds, cursor clarity   [status: merged]
 - Date opened / closed: 2026-07-17 / 2026-07-17
 - Hypothesis: at ~640 msgs/3h fleet volume, (a) multi-recipient send removes

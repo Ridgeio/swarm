@@ -34,6 +34,8 @@ Tasks are durable, fenced leases backed by append-only task events and checkpoin
 - `src/rescue.ts` — Verified preservation artifacts and manifests
 - `src/janitor.ts` — Observe-only debris census, heartbeat, hook piggyback, and launchd management
 - `src/board.ts` — Read-only fleet board/watch loop plus Mermaid graph and fallback-safe HTML output
+- `src/board-data.ts` — Shared read-only projection for text and served boards, including task history and debris trends
+- `src/board-server.ts` + `web/` — Token/Host-guarded loopback graph, dashboard, timeline, inspector, and registry-resolved cmux focus action
 - `src/index.ts` — CLI entry point (async main)
 
 Core tables are `swarms`, `agents`, `messages`, `message_deliveries`, `inbox_cursors`, `tasks`, `task_events`, `decisions`, `janitor_status`, `janitor_findings`, and `janitor_snapshots`.

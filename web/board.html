@@ -36,14 +36,43 @@
         </div>
       </section>
 
-      <aside class="right-rail" aria-label="Triage and inspector">
+      <aside class="right-rail" aria-label="Dashboard, triage, and inspector">
+        <section class="dashboard-panel" aria-label="Fleet dashboard">
+          <div class="section-heading dashboard-heading">
+            <div>
+              <span class="eyebrow">DASHBOARD</span>
+              <h2>Fleet pulse</h2>
+            </div>
+          </div>
+          <div class="stat-cards" aria-label="Unacknowledged message summary">
+            <div class="stat-card"><span>Unacked</span><strong id="unacked-total">0</strong></div>
+            <div class="stat-card"><span>Oldest</span><strong id="unacked-max-age">—</strong></div>
+          </div>
+          <div class="dashboard-charts">
+            <div class="mini-chart-block">
+              <span class="chart-label">Task states</span>
+              <div id="task-state-chart" class="mini-chart" role="img" aria-label="Task state counts"></div>
+            </div>
+            <div class="mini-chart-block">
+              <span class="chart-label">Debris trend</span>
+              <div id="debris-trend-chart" class="mini-chart" role="img" aria-label="Recent debris counter trend"></div>
+            </div>
+          </div>
+        </section>
+
         <section class="needs-panel">
           <div class="section-heading">
             <div>
               <span class="eyebrow">TRIAGE</span>
-              <h2>Needs you</h2>
+              <h2 id="triage-title">Needs you</h2>
             </div>
-            <span id="needs-count" class="count-chip">0</span>
+            <div class="needs-controls">
+              <label class="filter-toggle">
+                <input id="needs-only-toggle" type="checkbox" checked>
+                <span>Only what needs me</span>
+              </label>
+              <span id="needs-count" class="count-chip">0</span>
+            </div>
           </div>
           <ul id="needs-list" class="needs-list" aria-live="polite"></ul>
         </section>
@@ -62,17 +91,29 @@
       </aside>
     </main>
 
-    <footer class="timeline-reserved" aria-label="Reserved event timeline">
-      <span class="timeline-mark" aria-hidden="true"></span>
-      <div>
-        <span class="eyebrow">EVENT TIMELINE</span>
-        <p>Reserved for V1-C</p>
+    <footer class="timeline-panel" aria-label="Task event timeline">
+      <div class="timeline-heading">
+        <div>
+          <span class="eyebrow">EVENT TIMELINE</span>
+          <p id="timeline-filter">All recent tasks</p>
+        </div>
+        <div class="timeline-legend" aria-label="Event kind colors">
+          <span class="kind-started">started</span>
+          <span class="kind-checkpoint">checkpoint</span>
+          <span class="kind-claimed">claimed</span>
+          <span class="kind-handoff">handoff</span>
+          <span class="kind-closed">closed</span>
+          <span class="kind-refused">refused</span>
+          <span class="kind-other">other</span>
+        </div>
       </div>
+      <div id="timeline-chart" class="timeline-chart" role="img" aria-label="Recent task events by task lane"></div>
     </footer>
   </div>
 
   <script src="./assets/cytoscape.min.js"></script>
   <script src="./assets/cytoscape-dagre.min.js"></script>
+  <script src="./assets/echarts.min.js"></script>
   <script src="./assets/board-elements.js"></script>
   <script src="./assets/board.js"></script>
 </body>

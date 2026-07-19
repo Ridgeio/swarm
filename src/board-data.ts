@@ -10,6 +10,7 @@ import {
 const URGENT_MESSAGE_KINDS = ['gate', 'escalation', 'merge-req'] as const;
 const RECENT_DONE_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const TIMELINE_LIMIT = 200;
+const DEBRIS_TREND_LIMIT = 50;
 
 const REQUIRED_COLUMNS: Record<string, string[]> = {
   swarms: ['id', 'name', 'root_path'],
@@ -33,6 +34,7 @@ const REQUIRED_COLUMNS: Record<string, string[]> = {
   janitor_findings: [
     'first_seen_at', 'last_seen_at', 'kind', 'path', 'detail', 'state',
   ],
+  janitor_snapshots: ['id', 'tick_at', 'counters'],
 };
 
 const BOARD_TABLES = Object.keys(REQUIRED_COLUMNS);
@@ -148,6 +150,11 @@ export interface BoardTimelineEvent {
   summary: string;
 }
 
+export interface BoardDebrisTrendPoint {
+  tickAt: string;
+  counters: JanitorCounters;
+}
+
 export interface BoardData {
   generatedAt: string;
   swarm: { id: string; name: string };
@@ -164,6 +171,7 @@ export interface BoardData {
     counters: JanitorCounters;
     findings: BoardDebrisFinding[];
   };
+  debrisTrend?: BoardDebrisTrendPoint[];
   timeline: BoardTimelineEvent[];
   quota: string | null;
   unavailable: string[];
@@ -688,6 +696,29 @@ export function collectBoardData(
     }
   }
 
+  let debrisTrend: BoardDebrisTrendPoint[] | undefined;
+  if (available('janitor_snapshots')) {
+    try {
+      const snapshots = database!.prepare(`
+        SELECT tick_at, counters
+        FROM (
+          SELECT id, tick_at, counters
+          FROM janitor_snapshots
+          ORDER BY id DESC
+          LIMIT ?
+        ) recent
+        ORDER BY id ASC
+      `).all(DEBRIS_TREND_LIMIT) as Array<{ tick_at: string; counters: string }>;
+      debrisTrend = snapshots.map(snapshot => ({
+        tickAt: snapshot.tick_at,
+        counters: parseCounters(snapshot.counters),
+      }));
+    } catch {
+      addUnavailable(unavailable, 'janitor_snapshots');
+      debrisTrend = undefined;
+    }
+  }
+
   let quota: string | null = null;
   if (available('tasks', 'task_events')) {
     try {
@@ -741,7 +772,7 @@ export function collectBoardData(
     }
   }
 
-  return {
+  const result: BoardData = {
     generatedAt: new Date(now).toISOString(),
     swarm: { id: swarmId, name: swarmName },
     agents,
@@ -753,4 +784,6 @@ export function collectBoardData(
     quota,
     unavailable: BOARD_TABLES.filter(table => unavailable.has(table)),
   };
+  if (debrisTrend !== undefined) result.debrisTrend = debrisTrend;
+  return result;
 }

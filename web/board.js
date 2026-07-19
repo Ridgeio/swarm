@@ -13,7 +13,10 @@
     topologyHash: null,
     firstRender: true,
     selectedId: null,
-    lastPollAt: 0
+    inspectedEvent: null,
+    lastPollAt: 0,
+    onlyNeeds: true,
+    charts: { debris: null, tasks: null, timeline: null }
   };
 
   if (hashToken && window.history && window.history.replaceState) {
@@ -43,7 +46,9 @@
   function timeLabel(value) {
     var timestamp = new Date(value);
     if (!Number.isFinite(timestamp.getTime())) return String(value || 'unknown');
-    return timestamp.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    return timestamp.toLocaleTimeString([], {
+      hour: '2-digit', minute: '2-digit', second: '2-digit'
+    });
   }
 
   function safeDetail(value) {
@@ -55,27 +60,37 @@
     }
   }
 
+  function isDarkMode() {
+    return Boolean(window.matchMedia &&
+      window.matchMedia('(prefers-color-scheme: dark)').matches);
+  }
+
   function palette() {
-    var dark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-    if (dark) {
+    if (isDarkMode()) {
       return {
         ink: '#e2e8f0', muted: '#95a3b1', line: '#43515e', selected: '#61b7e4',
-        claudeBg: '#392c63', claudeLine: '#9b83ff', codexBg: '#173f55', codexLine: '#52b7e8',
-        grokBg: '#55272b', grokLine: '#e06a71', geminiBg: '#183f2d', geminiLine: '#58b886',
-        a2aBg: '#503818', a2aLine: '#d69b38', headlessBg: '#333840', headlessLine: '#8e99a5',
-        unknownBg: '#27323d', unknownLine: '#7f8d9a', activeBg: '#193d25', activeLine: '#4dc468',
-        awaitingBg: '#4b3817', awaitingLine: '#e5a62c', staleBg: '#54242a', staleLine: '#f0646d',
-        openBg: '#2b333c', openLine: '#818d99', debrisBg: '#4a321c', debrisLine: '#df8d32'
+        panel: '#17212b', claudeBg: '#392c63', claudeLine: '#9b83ff',
+        codexBg: '#173f55', codexLine: '#52b7e8', grokBg: '#55272b',
+        grokLine: '#e06a71', geminiBg: '#183f2d', geminiLine: '#58b886',
+        a2aBg: '#503818', a2aLine: '#d69b38', headlessBg: '#333840',
+        headlessLine: '#8e99a5', unknownBg: '#27323d', unknownLine: '#7f8d9a',
+        activeBg: '#193d25', activeLine: '#4dc468', awaitingBg: '#4b3817',
+        awaitingLine: '#e5a62c', staleBg: '#54242a', staleLine: '#f0646d',
+        openBg: '#2b333c', openLine: '#818d99', debrisBg: '#4a321c',
+        debrisLine: '#df8d32'
       };
     }
     return {
       ink: '#172033', muted: '#687481', line: '#aeb7bf', selected: '#1677a8',
-      claudeBg: '#d9ccff', claudeLine: '#6d4aff', codexBg: '#c7e9ff', codexLine: '#1677a8',
-      grokBg: '#ffd0d0', grokLine: '#bb3e3e', geminiBg: '#c9f2dc', geminiLine: '#27845a',
-      a2aBg: '#ffe2ad', a2aLine: '#a86600', headlessBg: '#e4e4e7', headlessLine: '#71717a',
-      unknownBg: '#f1f5f9', unknownLine: '#64748b', activeBg: '#c8f3d1', activeLine: '#238636',
-      awaitingBg: '#ffe7a3', awaitingLine: '#b77900', staleBg: '#ffd0d0', staleLine: '#d1242f',
-      openBg: '#e5e7eb', openLine: '#6b7280', debrisBg: '#ffd8a8', debrisLine: '#d97706'
+      panel: '#ffffff', claudeBg: '#d9ccff', claudeLine: '#6d4aff',
+      codexBg: '#c7e9ff', codexLine: '#1677a8', grokBg: '#ffd0d0',
+      grokLine: '#bb3e3e', geminiBg: '#c9f2dc', geminiLine: '#27845a',
+      a2aBg: '#ffe2ad', a2aLine: '#a86600', headlessBg: '#e4e4e7',
+      headlessLine: '#71717a', unknownBg: '#f1f5f9', unknownLine: '#64748b',
+      activeBg: '#c8f3d1', activeLine: '#238636', awaitingBg: '#ffe7a3',
+      awaitingLine: '#b77900', staleBg: '#ffd0d0', staleLine: '#d1242f',
+      openBg: '#e5e7eb', openLine: '#6b7280', debrisBg: '#ffd8a8',
+      debrisLine: '#d97706'
     };
   }
 
@@ -99,8 +114,8 @@
       {
         selector: 'node',
         style: {
-          width: 'label', height: 'label', padding: '14px',
-          color: color.ink, 'font-family': 'Avenir Next, Helvetica Neue, sans-serif',
+          width: 'label', height: 'label', padding: '14px', color: color.ink,
+          'font-family': 'Avenir Next, Helvetica Neue, sans-serif',
           'font-size': '12px', 'font-weight': 600, label: 'data(label)',
           'text-wrap': 'wrap', 'text-max-width': '170px', 'text-valign': 'center',
           'text-halign': 'center', 'border-width': 2, 'border-color': color.line,
@@ -117,6 +132,7 @@
       { selector: 'node.stale', style: { 'background-color': color.staleBg, 'border-color': color.staleLine, 'border-width': 4 } },
       { selector: 'node.debris', style: { shape: 'round-tag', 'background-color': color.openBg, 'border-color': color.openLine } },
       { selector: 'node.debris-warn', style: { 'background-color': color.debrisBg, 'border-color': color.debrisLine } },
+      { selector: 'node.dimmed', style: { opacity: 0.16 } },
       {
         selector: 'edge',
         style: {
@@ -132,6 +148,34 @@
       { selector: 'edge.highlight', style: { width: 4, opacity: 1, 'line-color': color.selected, 'target-arrow-color': color.selected } },
       { selector: 'node:selected', style: { 'border-width': 5, 'border-color': color.selected } }
     ]);
+  }
+
+  function chartTheme() {
+    var color = palette();
+    return {
+      color: ['#3b82f6', '#22c55e', '#8b5cf6', '#f59e0b', '#14b8a6', '#ef4444', '#94a3b8'],
+      backgroundColor: 'transparent',
+      textStyle: { color: color.ink, fontFamily: 'Avenir Next, Helvetica Neue, sans-serif' },
+      title: { textStyle: { color: color.muted, fontSize: 10, fontWeight: 500 } },
+      categoryAxis: {
+        axisLine: { lineStyle: { color: color.line } },
+        axisTick: { lineStyle: { color: color.line } },
+        axisLabel: { color: color.muted, fontSize: 9 },
+        splitLine: { lineStyle: { color: color.line } }
+      },
+      valueAxis: {
+        axisLine: { lineStyle: { color: color.line } },
+        axisTick: { lineStyle: { color: color.line } },
+        axisLabel: { color: color.muted, fontSize: 9 },
+        splitLine: { lineStyle: { color: color.line, opacity: 0.35 } }
+      },
+      timeAxis: {
+        axisLine: { lineStyle: { color: color.line } },
+        axisTick: { lineStyle: { color: color.line } },
+        axisLabel: { color: color.muted, fontSize: 9 },
+        splitLine: { lineStyle: { color: color.line, opacity: 0.25 } }
+      }
+    };
   }
 
   function createGraph() {
@@ -157,6 +201,129 @@
     return cy;
   }
 
+  function chartFor(key, id) {
+    if (!window.echarts) return null;
+    if (!state.charts[key]) {
+      var target = element(id);
+      if (!target) return null;
+      state.charts[key] = window.echarts.init(target, chartTheme());
+      if (key === 'timeline') {
+        state.charts[key].on('click', function (parameters) {
+          if (parameters && parameters.data && parameters.data.event) {
+            state.inspectedEvent = parameters.data.event;
+            inspectSelection(state.selectedId);
+          }
+        });
+      }
+    }
+    return state.charts[key];
+  }
+
+  function disposeCharts() {
+    Object.keys(state.charts).forEach(function (key) {
+      if (state.charts[key]) state.charts[key].dispose();
+      state.charts[key] = null;
+    });
+  }
+
+  function emptyChartOption(message) {
+    return {
+      animation: false,
+      title: { text: message, left: 'center', top: 'middle' },
+      xAxis: { show: false },
+      yAxis: { show: false },
+      series: []
+    };
+  }
+
+  function taskStateColor(stateName) {
+    var colors = {
+      active: '#22c55e', awaiting_review: '#f59e0b', open: '#94a3b8', done: '#14b8a6'
+    };
+    return colors[stateName] || '#3b82f6';
+  }
+
+  function renderDashboard(board) {
+    var unackedTotal = board.agents.reduce(function (sum, agent) {
+      return sum + Number(agent.unackedCount || 0);
+    }, 0);
+    var maxAges = board.agents.map(function (agent) {
+      return agent.unackedMaxAgeMin;
+    }).filter(function (value) {
+      return typeof value === 'number' && Number.isFinite(value);
+    });
+    var unackedMaxAge = maxAges.length > 0 ? Math.max.apply(Math, maxAges) : null;
+    setText(element('unacked-total'), unackedTotal);
+    setText(element('unacked-max-age'), unackedMaxAge === null ? '—' : unackedMaxAge + 'm');
+
+    var counts = Object.create(null);
+    board.tasks.forEach(function (task) {
+      var taskState = String(task.state || 'unknown');
+      counts[taskState] = (counts[taskState] || 0) + 1;
+    });
+    var states = Object.keys(counts).sort();
+    var taskChart = chartFor('tasks', 'task-state-chart');
+    if (taskChart) {
+      if (states.length === 0) {
+        taskChart.setOption(emptyChartOption('no tasks'), true);
+      } else {
+        taskChart.setOption({
+          animation: false,
+          tooltip: { show: false },
+          grid: { left: 4, right: 12, top: 2, bottom: 2, containLabel: true },
+          xAxis: { type: 'value', minInterval: 1, axisLabel: { show: false }, splitLine: { show: false } },
+          yAxis: { type: 'category', inverse: true, data: states, axisTick: { show: false } },
+          series: [{
+            type: 'bar',
+            barMaxWidth: 9,
+            data: states.map(function (taskState) {
+              return { value: counts[taskState], itemStyle: { color: taskStateColor(taskState) } };
+            }),
+            label: { show: true, position: 'right', fontSize: 9 }
+          }]
+        }, true);
+      }
+    }
+
+    var debrisChart = chartFor('debris', 'debris-trend-chart');
+    if (!debrisChart) return;
+    if (!Object.prototype.hasOwnProperty.call(board, 'debrisTrend')) {
+      debrisChart.setOption(emptyChartOption('not available'), true);
+      return;
+    }
+    if (!Array.isArray(board.debrisTrend) || board.debrisTrend.length === 0) {
+      debrisChart.setOption(emptyChartOption('no snapshots'), true);
+      return;
+    }
+    var counterSeries = [
+      ['detachedHeads', '#3b82f6'],
+      ['orphanedWorktrees', '#8b5cf6'],
+      ['unpushedCommits', '#ef4444'],
+      ['goneUpstreamBranches', '#f59e0b'],
+      ['tempStrays', '#14b8a6'],
+      ['junkDirs', '#94a3b8']
+    ];
+    debrisChart.setOption({
+      animation: false,
+      tooltip: { show: false },
+      grid: { left: 4, right: 4, top: 5, bottom: 14, containLabel: true },
+      xAxis: { type: 'time', axisLabel: { show: false }, axisTick: { show: false } },
+      yAxis: { type: 'value', minInterval: 1, axisLabel: { fontSize: 8 }, splitNumber: 2 },
+      series: counterSeries.map(function (entry) {
+        return {
+          name: entry[0],
+          type: 'line',
+          showSymbol: false,
+          symbol: 'none',
+          lineStyle: { width: 1.25, color: entry[1] },
+          data: board.debrisTrend.map(function (point) {
+            return [point.tickAt, Number(point.counters[entry[0]] || 0)];
+          })
+        };
+      })
+    }, true);
+  }
+
   function renderHeader(board) {
     setText(element('swarm-name'), board.swarm.name);
     setText(element('agent-count'), board.agents.length);
@@ -165,18 +332,38 @@
     document.title = board.swarm.name + ' · Swarm board';
   }
 
+  function triageItems(board) {
+    var items = board.needsYou.slice();
+    if (state.onlyNeeds) return items;
+    var taskRefs = Object.create(null);
+    items.forEach(function (item) {
+      taskRefs[String(item.refId)] = true;
+    });
+    board.tasks.forEach(function (task) {
+      if (taskRefs[String(task.id)]) return;
+      items.push({
+        kind: task.state,
+        label: 'task ' + task.id + ' — ' + task.title + ' · ' + (task.owner || 'unowned'),
+        refId: task.id
+      });
+    });
+    return items;
+  }
+
   function renderNeeds(board) {
     var list = element('needs-list');
+    var items = triageItems(board);
     clear(list);
-    setText(element('needs-count'), board.needsYou.length);
-    if (board.needsYou.length === 0) {
+    setText(element('triage-title'), state.onlyNeeds ? 'Needs you' : 'Fleet triage');
+    setText(element('needs-count'), items.length);
+    if (items.length === 0) {
       var quiet = document.createElement('li');
       quiet.className = 'quiet-item';
-      quiet.textContent = 'Nothing needs you.';
+      quiet.textContent = state.onlyNeeds ? 'Nothing needs you.' : 'No fleet items.';
       list.appendChild(quiet);
       return;
     }
-    board.needsYou.forEach(function (need) {
+    items.forEach(function (need) {
       var item = document.createElement('li');
       var kind = document.createElement('span');
       var label = document.createElement('span');
@@ -198,7 +385,9 @@
     term.className = 'detail-key';
     detail.className = 'detail-value';
     term.textContent = key;
-    detail.textContent = value === null || value === undefined || value === '' ? 'not recorded' : String(value);
+    detail.textContent = value === null || value === undefined || value === ''
+      ? 'not recorded'
+      : String(value);
     row.appendChild(term);
     row.appendChild(detail);
     list.appendChild(row);
@@ -218,6 +407,40 @@
     return list;
   }
 
+  function showFocusStatus(target, message, failed) {
+    target.classList.toggle('is-error', failed);
+    target.textContent = message;
+    window.setTimeout(function () {
+      if (target.isConnected && target.textContent === message) target.textContent = '';
+    }, 4500);
+  }
+
+  function requestFocus(agentName, button, status) {
+    button.disabled = true;
+    showFocusStatus(status, 'Focusing terminal…', false);
+    fetch('/api/focus-agent', {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Swarm-Token': token
+      },
+      body: JSON.stringify({ agent: agentName })
+    }).then(function (response) {
+      return response.json().then(function (payload) {
+        return { response: response, payload: payload };
+      });
+    }).then(function (result) {
+      var message = result.payload.message || result.payload.error ||
+        (result.response.ok ? 'Focused terminal.' : 'Focus request failed.');
+      showFocusStatus(status, message, !result.payload.ok);
+    }).catch(function () {
+      showFocusStatus(status, 'Focus request failed; confirm the board server is still running.', true);
+    }).then(function () {
+      if (button.isConnected) button.disabled = false;
+    });
+  }
+
   function inspectAgent(agent, board) {
     var body = element('inspector-body');
     var list = inspectorList(body);
@@ -227,14 +450,33 @@
     detailRow(list, 'Heartbeat', ageLabel(agent.lastHeartbeat, board.generatedAt));
     detailRow(list, 'Current task', agent.currentTaskId || 'idle');
     detailRow(list, 'Progress evidence', ageLabel(agent.progressEvidenceAt, board.generatedAt));
-    detailRow(list, 'Unacked', agent.unackedCount + (agent.unackedMaxAgeMin === null ? '' : ' · oldest ' + agent.unackedMaxAgeMin + 'm'));
+    detailRow(list, 'Unacked', agent.unackedCount +
+      (agent.unackedMaxAgeMin === null ? '' : ' · oldest ' + agent.unackedMaxAgeMin + 'm'));
     detailRow(list, 'Surface known', agent.surfaceKnown ? 'yes' : 'no');
+
+    var button = document.createElement('button');
+    var status = document.createElement('p');
+    button.className = 'action-button';
+    button.type = 'button';
+    button.textContent = 'Focus terminal';
+    status.className = 'transient-status';
+    status.setAttribute('role', 'status');
+    if (agent.agentType !== 'cmux' || !agent.surfaceKnown) {
+      button.disabled = true;
+      button.title = 'This agent has no registered cmux terminal.';
+    } else {
+      button.addEventListener('click', function () {
+        requestFocus(agent.name, button, status);
+      });
+    }
+    body.appendChild(button);
+    body.appendChild(status);
   }
 
   function gitFacts(task) {
     if (!task.git) return 'not available';
-    return (task.git.dirty ? 'dirty' : 'tracked clean') +
-      ' · ' + task.git.untracked + ' untracked · ' + task.git.unpushed + ' unpushed';
+    return (task.git.dirty ? 'dirty' : 'tracked clean') + ' · ' + task.git.untracked +
+      ' untracked · ' + task.git.unpushed + ' unpushed';
   }
 
   function renderTaskEvents(body, task, board) {
@@ -274,7 +516,9 @@
     detailRow(list, 'Title', task.title);
     detailRow(list, 'State', task.state + (task.stale ? ' · stale' : ''));
     detailRow(list, 'Owner / epoch', (task.owner || 'unowned') + ' / ' + task.leaseEpoch);
-    detailRow(list, 'Checkpoint', task.checkpoint ? task.checkpoint.ageMin + 'm ago · #' + task.checkpoint.seq : 'none');
+    detailRow(list, 'Checkpoint', task.checkpoint
+      ? task.checkpoint.ageMin + 'm ago · #' + task.checkpoint.seq
+      : 'none');
     detailRow(list, 'Next action', task.checkpoint ? task.checkpoint.nextAction : 'not recorded');
     detailRow(list, 'Branch', task.branch || 'not recorded');
     detailRow(list, 'Git', gitFacts(task));
@@ -288,7 +532,9 @@
     var list = inspectorList(body);
     var counters = board.debris.counters;
     setText(element('inspector-title'), 'Debris');
-    detailRow(list, 'Janitor tick', board.debris.tickAgeMin === null ? 'never' : board.debris.tickAgeMin + 'm ago');
+    detailRow(list, 'Janitor tick', board.debris.tickAgeMin === null
+      ? 'never'
+      : board.debris.tickAgeMin + 'm ago');
     Object.keys(counters).forEach(function (key) {
       detailRow(list, key, counters[key]);
     });
@@ -304,27 +550,43 @@
     board.debris.findings.forEach(function (finding) {
       var item = document.createElement('li');
       var meta = document.createElement('div');
-      var path = document.createElement('div');
+      var findingPath = document.createElement('div');
       var detail = document.createElement('div');
       item.className = 'finding-item';
       meta.className = 'finding-meta';
-      path.className = 'event-summary';
+      findingPath.className = 'event-summary';
       detail.className = 'finding-detail';
       meta.textContent = finding.kind + ' · ' + finding.state;
-      path.textContent = finding.path;
+      findingPath.textContent = finding.path;
       detail.textContent = safeDetail(finding.detail);
       item.appendChild(meta);
-      item.appendChild(path);
+      item.appendChild(findingPath);
       item.appendChild(detail);
       findings.appendChild(item);
     });
     body.appendChild(findings);
   }
 
+  function inspectEvent(event) {
+    var body = element('inspector-body');
+    var list = inspectorList(body);
+    setText(element('inspector-title'), 'Task event');
+    detailRow(list, 'Task', event.taskId);
+    detailRow(list, 'Kind', event.kind);
+    detailRow(list, 'Epoch', event.epoch);
+    detailRow(list, 'Actor', event.actor || 'system');
+    detailRow(list, 'At', timeLabel(event.at));
+    detailRow(list, 'Summary', event.summary);
+  }
+
   function inspectSelection(nodeId) {
     var board = state.board;
     var body = element('inspector-body');
     clear(body);
+    if (state.inspectedEvent) {
+      inspectEvent(state.inspectedEvent);
+      return;
+    }
     if (!nodeId || !board) {
       setText(element('inspector-title'), 'Select a node');
       var quiet = document.createElement('p');
@@ -345,6 +607,13 @@
     } else if (kind === 'debris') {
       inspectDebris(board);
     }
+  }
+
+  function selectedTaskId() {
+    if (!state.cy || !state.selectedId) return null;
+    var selected = state.cy.getElementById(state.selectedId);
+    if (!selected || selected.empty() || selected.data('kind') !== 'task') return null;
+    return selected.data('taskId');
   }
 
   function applySelection() {
@@ -371,12 +640,29 @@
     }).addClass('highlight');
   }
 
+  function applyNeedsFilter() {
+    if (!state.cy) return;
+    state.cy.nodes().removeClass('dimmed');
+    if (!state.onlyNeeds || !state.board) return;
+    var referenced = window.needsYouNodeIds
+      ? window.needsYouNodeIds(state.board)
+      : [];
+    var keep = Object.create(null);
+    referenced.forEach(function (nodeId) { keep[nodeId] = true; });
+    state.cy.nodes().filter(function (node) {
+      return !keep[node.id()];
+    }).addClass('dimmed');
+  }
+
   function selectNode(nodeId) {
     if (!state.cy) return;
     state.cy.nodes().unselect();
     state.selectedId = nodeId;
+    state.inspectedEvent = null;
     applySelection();
+    applyNeedsFilter();
     inspectSelection(state.selectedId);
+    renderTimeline();
   }
 
   function updateGraph(board) {
@@ -411,7 +697,48 @@
       });
     }
     applySelection();
+    applyNeedsFilter();
     inspectSelection(state.selectedId);
+  }
+
+  function renderTimeline() {
+    if (!state.board || !window.timelineRecords) return;
+    var taskId = selectedTaskId();
+    var mapped = window.timelineRecords(state.board, taskId);
+    var chart = chartFor('timeline', 'timeline-chart');
+    setText(element('timeline-filter'), taskId ? 'Filtered to ' + taskId : 'All recent tasks');
+    if (!chart) return;
+    if (mapped.records.length === 0) {
+      chart.setOption(emptyChartOption(taskId ? 'no events for task' : 'no recent events'), true);
+      return;
+    }
+    chart.setOption({
+      animation: false,
+      tooltip: { show: false },
+      grid: { left: 12, right: 18, top: 8, bottom: 28, containLabel: true },
+      xAxis: {
+        type: 'time',
+        axisLabel: { hideOverlap: true, fontSize: 9 },
+        splitLine: { show: true }
+      },
+      yAxis: {
+        type: 'category',
+        data: mapped.lanes,
+        axisTick: { show: false },
+        axisLabel: { width: 120, overflow: 'truncate', fontSize: 9 }
+      },
+      series: [{
+        type: 'scatter',
+        symbolSize: 10,
+        data: mapped.records.map(function (record) {
+          return {
+            value: record.value,
+            event: record.event,
+            itemStyle: { color: record.color, borderColor: palette().panel, borderWidth: 1 }
+          };
+        })
+      }]
+    }, true);
   }
 
   function refreshFreshness() {
@@ -435,7 +762,9 @@
       state.lastPollAt = Date.now();
       renderHeader(board);
       renderNeeds(board);
+      renderDashboard(board);
       updateGraph(board);
+      renderTimeline();
       refreshFreshness();
     }).catch(function () {
       refreshFreshness();
@@ -447,12 +776,32 @@
   }
 
   state.cy = createGraph();
+  var toggle = element('needs-only-toggle');
+  if (toggle) {
+    toggle.checked = state.onlyNeeds;
+    toggle.addEventListener('change', function () {
+      state.onlyNeeds = toggle.checked;
+      if (state.board) renderNeeds(state.board);
+      applyNeedsFilter();
+    });
+  }
   var media = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
   if (media && media.addEventListener) {
     media.addEventListener('change', function () {
       if (state.cy) state.cy.style(cyStyles());
+      disposeCharts();
+      if (state.board) {
+        renderDashboard(state.board);
+        renderTimeline();
+      }
     });
   }
+  window.addEventListener('resize', function () {
+    if (state.cy) state.cy.resize();
+    Object.keys(state.charts).forEach(function (key) {
+      if (state.charts[key]) state.charts[key].resize();
+    });
+  });
   window.setInterval(refreshFreshness, 1000);
   refreshFreshness();
   poll();

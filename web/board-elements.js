@@ -6,6 +6,8 @@
   }
   if (root) {
     root.boardElements = build;
+    root.needsYouNodeIds = build.needsYouNodeIds;
+    root.timelineRecords = build.timelineRecords;
   }
 }(typeof window !== 'undefined' ? window :
   (typeof globalThis !== 'undefined' ? globalThis : this), function () {
@@ -55,6 +57,79 @@
       hash = Math.imul(hash, 16777619);
     }
     return ('00000000' + (hash >>> 0).toString(16)).slice(-8);
+  }
+
+  function needsYouNodeIds(boardData) {
+    var board = boardData || {};
+    var needs = Array.isArray(board.needsYou) ? board.needsYou : [];
+    var agents = Array.isArray(board.agents) ? board.agents : [];
+    var tasks = Array.isArray(board.tasks) ? board.tasks : [];
+    var found = Object.create(null);
+
+    needs.forEach(function (need) {
+      var refId = String(need && need.refId !== undefined ? need.refId : '');
+      if (refId === 'janitor' || refId === 'debris') found.debris = true;
+      tasks.forEach(function (task) {
+        if (String(task.id) === refId) found[nodeId('task', task.id)] = true;
+      });
+      agents.forEach(function (agent) {
+        if (String(agent.name).toLowerCase() === refId.toLowerCase()) {
+          found[nodeId('agent', agent.name)] = true;
+        }
+      });
+    });
+
+    return Object.keys(found).sort();
+  }
+
+  var TIMELINE_COLORS = {
+    started: '#3b82f6',
+    checkpoint: '#22c55e',
+    claimed: '#8b5cf6',
+    handoff: '#f59e0b',
+    closed: '#14b8a6',
+    refused_stale_epoch: '#ef4444',
+    other: '#94a3b8'
+  };
+
+  function timelineKind(kind) {
+    var normalized = String(kind || '').toLowerCase();
+    return Object.prototype.hasOwnProperty.call(TIMELINE_COLORS, normalized)
+      ? normalized
+      : 'other';
+  }
+
+  function timelineRecords(boardData, selectedTaskId) {
+    var board = boardData || {};
+    var timeline = Array.isArray(board.timeline) ? board.timeline : [];
+    var filter = selectedTaskId === null || selectedTaskId === undefined
+      ? null
+      : String(selectedTaskId);
+    var lanes = [];
+    var laneSeen = Object.create(null);
+    var records = [];
+
+    timeline.forEach(function (event) {
+      var taskId = String(event.taskId || 'unknown');
+      if (filter !== null && taskId !== filter) return;
+      if (!laneSeen[taskId]) {
+        laneSeen[taskId] = true;
+        lanes.push(taskId);
+      }
+      var kind = timelineKind(event.kind);
+      records.push({
+        taskId: taskId,
+        lane: taskId,
+        kind: kind,
+        eventKind: String(event.kind || 'other'),
+        color: TIMELINE_COLORS[kind],
+        value: [event.at, taskId],
+        event: event
+      });
+    });
+
+    if (filter !== null && lanes.length === 0) lanes.push(filter);
+    return { lanes: lanes, records: records };
   }
 
   function boardElements(boardData) {
@@ -180,6 +255,9 @@
       topologyHash: stableHash(nodeIds, edgeTriples)
     };
   }
+
+  boardElements.needsYouNodeIds = needsYouNodeIds;
+  boardElements.timelineRecords = timelineRecords;
 
   return boardElements;
 }));

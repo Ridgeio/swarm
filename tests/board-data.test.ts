@@ -191,6 +191,17 @@ function createFixture(): { root: string; db: Database.Database; gateId: number;
     ) VALUES (?, ?, 'unpushed-commits', ?, ?, 'hold')
   `).run(iso(60), iso(31), repo, JSON.stringify({ count: 2, note: 'held' }));
 
+  for (let index = 0; index < 52; index += 1) {
+    db.prepare(`
+      INSERT INTO janitor_snapshots (tick_at, counters)
+      VALUES (?, ?)
+    `).run(iso(52 - index), JSON.stringify({
+      unpushedCommits: index,
+      orphanedWorktrees: index % 3,
+      tickMs: index + 1,
+    }));
+  }
+
   for (let index = 0; index < 205; index += 1) {
     insertEvent(
       db,
@@ -304,6 +315,23 @@ describe('V1-A shared board data projection', () => {
         lastSeenAt: iso(31),
         detail: { count: 2, note: 'held' },
       }]);
+      assert.strictEqual(data.debrisTrend?.length, 50);
+      assert.deepStrictEqual(data.debrisTrend?.[0], {
+        tickAt: iso(50),
+        counters: {
+          worktrees: 0,
+          detachedHeads: 0,
+          orphanedWorktrees: 2,
+          unpushedCommits: 2,
+          goneUpstreamBranches: 0,
+          tempStrays: 0,
+          junkDirs: 0,
+          reposScanned: 0,
+          tickMs: 3,
+        },
+      });
+      assert.strictEqual(data.debrisTrend?.at(-1)?.tickAt, iso(1));
+      assert.strictEqual(data.debrisTrend?.at(-1)?.counters.unpushedCommits, 51);
       assert.strictEqual(data.quota, 'codex: green | claude: yellow');
 
       assert.strictEqual(data.timeline.length, 200);
@@ -332,10 +360,11 @@ describe('V1-A shared board data projection', () => {
         DROP TABLE task_events;
         DROP TABLE message_deliveries;
         DROP TABLE janitor_findings;
+        DROP TABLE janitor_snapshots;
       `);
       const data = collectBoardData(fixture.db, 'default', { now: NOW });
       assert.deepStrictEqual(data.unavailable, [
-        'message_deliveries', 'task_events', 'janitor_findings',
+        'message_deliveries', 'task_events', 'janitor_findings', 'janitor_snapshots',
       ]);
       assert.strictEqual(data.swarm.name, 'Ridge Fleet');
       assert.strictEqual(data.agents.length, 2);
@@ -346,6 +375,7 @@ describe('V1-A shared board data projection', () => {
       assert.deepStrictEqual(data.edges.claims, []);
       assert.deepStrictEqual(data.timeline, []);
       assert.deepStrictEqual(data.debris.findings, []);
+      assert.ok(!Object.hasOwn(data, 'debrisTrend'));
       assert.strictEqual(data.debris.tickAgeMin, 31);
       assert.strictEqual(data.quota, null);
     } finally {
@@ -358,12 +388,13 @@ describe('V1-A shared board data projection', () => {
       const data = collectBoardData(empty, 'legacy', { now: NOW });
       assert.deepStrictEqual(data.unavailable, [
         'swarms', 'agents', 'messages', 'message_deliveries', 'tasks',
-        'task_events', 'janitor_status', 'janitor_findings',
+        'task_events', 'janitor_status', 'janitor_findings', 'janitor_snapshots',
       ]);
       assert.deepStrictEqual(data.swarm, { id: 'legacy', name: 'legacy' });
       assert.deepStrictEqual(data.agents, []);
       assert.deepStrictEqual(data.tasks, []);
       assert.deepStrictEqual(data.timeline, []);
+      assert.ok(!Object.hasOwn(data, 'debrisTrend'));
     } finally {
       empty.close();
     }

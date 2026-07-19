@@ -10,12 +10,14 @@ import {
   type BoardData,
   type CollectBoardDataOptions,
 } from './board-data.js';
-import { spawnBrowserWorkspace } from './transport.js';
+import { resolveCmux, spawnBrowserWorkspace } from './transport.js';
 
 export const BOARD_SERVER_HOST = '127.0.0.1';
 export const BOARD_SERVER_DEFAULT_PORT = 7787;
 export const BOARD_SERVER_TOKEN_PLACEHOLDER = '__SWARM_BOARD_TOKEN__';
 export const BOARD_SERVER_MAX_JSON_BYTES = 2 * 1024 * 1024;
+export const BOARD_SERVER_MAX_BODY_BYTES = 4 * 1024;
+export const BOARD_SERVER_MAX_AGENT_NAME_LENGTH = 128;
 
 const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -30,6 +32,8 @@ export type BoardProjection = (
   options?: CollectBoardDataOptions
 ) => BoardData;
 
+export type BoardCmuxRunner = (binary: string, args: string[]) => string | Buffer;
+
 export interface StartBoardServerOptions {
   db: Database.Database | null;
   swarmId: string;
@@ -37,6 +41,8 @@ export interface StartBoardServerOptions {
   projection?: BoardProjection;
   assetRoots?: BoardAssetRoots;
   now?: () => number;
+  cmuxRunner?: BoardCmuxRunner;
+  resolveCmuxBinary?: () => string;
 }
 
 export interface RunningBoardServer {
@@ -58,6 +64,19 @@ interface StaticAsset {
   contentType: string;
 }
 
+interface FocusAgentRow {
+  name: string;
+  agent_type: string;
+  surface_id: string;
+  workspace_id: string | null;
+}
+
+interface FocusResult {
+  status: number;
+  ok: boolean;
+  message: string;
+}
+
 function defaultAssetRoots(): BoardAssetRoots {
   return {
     vendor: path.join(MODULE_ROOT, 'vendor'),
@@ -73,6 +92,10 @@ function assetAllowlist(roots: BoardAssetRoots): ReadonlyMap<string, StaticAsset
     }],
     ['/assets/cytoscape-dagre.min.js', {
       filePath: path.join(roots.vendor, 'cytoscape-dagre.min.js'),
+      contentType: 'text/javascript; charset=utf-8',
+    }],
+    ['/assets/echarts.min.js', {
+      filePath: path.join(roots.vendor, 'echarts.min.js'),
       contentType: 'text/javascript; charset=utf-8',
     }],
     ['/assets/board.css', {
@@ -140,6 +163,151 @@ function requestPath(request: IncomingMessage): string {
   return (request.url ?? '').split('?', 1)[0];
 }
 
+function defaultCmuxRunner(binary: string, args: string[]): string {
+  return execFileSync(binary, args, {
+    encoding: 'utf-8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: 5_000,
+  });
+}
+
+function parseFocusLocation(raw: string | Buffer): { pane: string; workspace: string | null } | null {
+  try {
+    const parsed = JSON.parse(raw.toString()) as Record<string, unknown>;
+    const candidates = [parsed.caller, parsed.focused, parsed.active, parsed];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue;
+      const location = candidate as Record<string, unknown>;
+      if (typeof location.pane_ref !== 'string' || location.pane_ref.length === 0) continue;
+      return {
+        pane: location.pane_ref,
+        workspace: typeof location.workspace_ref === 'string' && location.workspace_ref.length > 0
+          ? location.workspace_ref
+          : null,
+      };
+    }
+  } catch {
+    // A stale surface may make older cmux versions return plain text.
+  }
+  return null;
+}
+
+/** Resolve a registered agent and best-effort focus its exact cmux surface. */
+export function focusAgentTerminal(
+  db: Database.Database | null,
+  swarmId: string,
+  agentName: string,
+  options: Pick<StartBoardServerOptions, 'cmuxRunner' | 'resolveCmuxBinary'> = {}
+): FocusResult {
+  let agent: FocusAgentRow | undefined;
+  try {
+    agent = db?.prepare(`
+      SELECT name, agent_type, surface_id, workspace_id
+      FROM agents
+      WHERE swarm_id = ? AND name = ? COLLATE NOCASE
+      LIMIT 1
+    `).get(swarmId, agentName) as FocusAgentRow | undefined;
+  } catch {
+    return {
+      status: 503,
+      ok: false,
+      message: 'Agent registry is unavailable; reopen the board after the swarm database is restored.',
+    };
+  }
+
+  if (!agent) {
+    return {
+      status: 404,
+      ok: false,
+      message: `Unknown agent "${agentName}" in this swarm. Refresh the board and try again.`,
+    };
+  }
+  if (agent.agent_type !== 'cmux') {
+    return {
+      status: 400,
+      ok: false,
+      message: `Agent "${agent.name}" is ${agent.agent_type}, so it has no cmux terminal to focus.`,
+    };
+  }
+  if (!agent.surface_id) {
+    return {
+      status: 400,
+      ok: false,
+      message: `Agent "${agent.name}" has no registered cmux surface. Rejoin it and try again.`,
+    };
+  }
+
+  const runner = options.cmuxRunner ?? defaultCmuxRunner;
+  try {
+    const binary = (options.resolveCmuxBinary ?? resolveCmux)();
+    const identified = runner(binary, ['--json', 'identify', '--surface', agent.surface_id]);
+    const location = parseFocusLocation(identified);
+    if (!location) {
+      return {
+        status: 502,
+        ok: false,
+        message: `cmux could not locate the registered surface for "${agent.name}". Rejoin the agent and try again.`,
+      };
+    }
+    const workspace = agent.workspace_id ?? location.workspace;
+    if (!workspace) {
+      return {
+        status: 502,
+        ok: false,
+        message: `cmux could not resolve a workspace for "${agent.name}". Rejoin the agent and try again.`,
+      };
+    }
+    runner(binary, [
+      'focus-panel',
+      '--panel', agent.surface_id,
+      '--workspace', workspace,
+    ]);
+    return { status: 200, ok: true, message: `Focused terminal for "${agent.name}".` };
+  } catch {
+    return {
+      status: 502,
+      ok: false,
+      message: `Could not focus "${agent.name}". Confirm cmux is running and the agent is still joined.`,
+    };
+  }
+}
+
+function readJsonBody(request: IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    const contentLength = Number(request.headers['content-length']);
+    if (Number.isFinite(contentLength) && contentLength > BOARD_SERVER_MAX_BODY_BYTES) {
+      request.resume();
+      reject(new Error('too-large'));
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let oversized = false;
+    request.on('data', chunk => {
+      const buffer = Buffer.from(chunk);
+      size += buffer.byteLength;
+      if (size > BOARD_SERVER_MAX_BODY_BYTES) {
+        oversized = true;
+        chunks.length = 0;
+        return;
+      }
+      if (!oversized) chunks.push(buffer);
+    });
+    request.on('error', reject);
+    request.on('end', () => {
+      if (oversized) {
+        reject(new Error('too-large'));
+        return;
+      }
+      try {
+        resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')) as unknown);
+      } catch {
+        reject(new Error('invalid-json'));
+      }
+    });
+  });
+}
+
 function makeRequestHandler(
   options: StartBoardServerOptions,
   token: string,
@@ -150,14 +318,9 @@ function makeRequestHandler(
   const projection = options.projection ?? collectBoardData;
   const now = options.now ?? Date.now;
 
-  return (request, response) => {
+  return async (request, response) => {
     if (!hostAllowed(request.headers.host, getPort())) {
       sendText(response, 403, 'Forbidden: invalid Host header.');
-      return;
-    }
-
-    if (request.method !== 'GET') {
-      send(response, 405, 'text/plain; charset=utf-8', 'Method not allowed.', { Allow: 'GET' });
       return;
     }
 
@@ -180,6 +343,51 @@ function makeRequestHandler(
         }), { 'Cache-Control': 'no-store' });
         return;
       }
+    }
+
+    if (rawPath === '/api/focus-agent') {
+      if (request.method !== 'POST') {
+        send(response, 405, 'application/json; charset=utf-8', JSON.stringify({
+          ok: false,
+          message: 'Method not allowed; POST an agent name.',
+        }), { Allow: 'POST', 'Cache-Control': 'no-store' });
+        return;
+      }
+      let body: unknown;
+      try {
+        body = await readJsonBody(request);
+      } catch (error) {
+        const tooLarge = (error as Error).message === 'too-large';
+        send(response, tooLarge ? 413 : 400, 'application/json; charset=utf-8', JSON.stringify({
+          ok: false,
+          message: tooLarge
+            ? `Request body exceeds ${BOARD_SERVER_MAX_BODY_BYTES} bytes.`
+            : 'Request body must be valid JSON.',
+        }), { 'Cache-Control': 'no-store' });
+        return;
+      }
+      const agent = body !== null && typeof body === 'object' && !Array.isArray(body)
+        ? (body as Record<string, unknown>).agent
+        : null;
+      if (typeof agent !== 'string' || agent.length === 0 ||
+          agent.length > BOARD_SERVER_MAX_AGENT_NAME_LENGTH) {
+        send(response, 400, 'application/json; charset=utf-8', JSON.stringify({
+          ok: false,
+          message: `Agent must be a non-empty string of at most ${BOARD_SERVER_MAX_AGENT_NAME_LENGTH} characters.`,
+        }), { 'Cache-Control': 'no-store' });
+        return;
+      }
+      const result = focusAgentTerminal(options.db, options.swarmId, agent, options);
+      send(response, result.status, 'application/json; charset=utf-8', JSON.stringify({
+        ok: result.ok,
+        message: result.message,
+      }), { 'Cache-Control': 'no-store' });
+      return;
+    }
+
+    if (request.method !== 'GET') {
+      send(response, 405, 'text/plain; charset=utf-8', 'Method not allowed.', { Allow: 'GET' });
+      return;
     }
 
     if (rawPath === '/') {

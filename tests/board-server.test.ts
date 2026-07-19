@@ -8,8 +8,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { BoardData } from '../src/board-data.js';
 import {
+  BOARD_SERVER_MAX_BODY_BYTES,
   BOARD_SERVER_DEFAULT_PORT,
   boardServerUrl,
+  focusAgentTerminal,
   startBoardServer,
   type RunningBoardServer,
   type StartBoardServerOptions,
@@ -65,18 +67,22 @@ async function startOrSkip(
 function request(
   running: RunningBoardServer,
   requestPath: string,
-  options: { host?: string; token?: string } = {}
+  options: { host?: string; token?: string; method?: string; body?: string } = {}
 ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: string }> {
   return new Promise((resolve, reject) => {
     const headers: Record<string, string> = {
       Host: options.host ?? `127.0.0.1:${running.port}`,
     };
     if (options.token) headers['X-Swarm-Token'] = options.token;
+    if (options.body !== undefined) {
+      headers['Content-Type'] = 'application/json';
+      headers['Content-Length'] = String(Buffer.byteLength(options.body));
+    }
     const outgoing = http.request({
       hostname: '127.0.0.1',
       port: running.port,
       path: requestPath,
-      method: 'GET',
+      method: options.method ?? 'GET',
       headers,
     }, response => {
       const chunks: Buffer[] = [];
@@ -88,8 +94,24 @@ function request(
       }));
     });
     outgoing.on('error', reject);
-    outgoing.end();
+    outgoing.end(options.body);
   });
+}
+
+function insertFocusAgent(
+  db: Database.Database,
+  name: string,
+  agentType: string,
+  surfaceId: string,
+  workspaceId: string | null
+): void {
+  const now = '2026-07-19T12:00:00.000Z';
+  db.prepare(`
+    INSERT INTO agents (
+      id, swarm_id, name, description, surface_id, workspace_id, ppid,
+      joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
+    ) VALUES (?, 'default', ?, NULL, ?, ?, 1, ?, ?, ?, NULL, ?)
+  `).run(`focus-${name}`, name, surfaceId, workspaceId, now, now, agentType, agentType);
 }
 
 describe('V1-B served board', () => {
@@ -139,11 +161,14 @@ describe('V1-B served board', () => {
     if (!running) return;
     try {
       const known = await request(running, '/assets/board.js');
+      const echarts = await request(running, '/assets/echarts.min.js');
       const traversal = await request(running, '/assets/../../package.json');
       const encodedTraversal = await request(running, '/assets/%2e%2e/%2e%2e/package.json');
       const unknown = await request(running, '/assets/unknown.js');
       assert.strictEqual(known.status, 200);
       assert.match(String(known.headers['content-type']), /^text\/javascript/);
+      assert.strictEqual(echarts.status, 200);
+      assert.match(String(echarts.headers['content-type']), /^text\/javascript/);
       assert.strictEqual(traversal.status, 404);
       assert.strictEqual(encodedTraversal.status, 404);
       assert.strictEqual(unknown.status, 404);
@@ -249,6 +274,205 @@ describe('V1-B served board', () => {
   });
 });
 
+describe('V1-C focus-agent endpoint', () => {
+  test('registry focus invokes the injected binary and exact surface-focus args', () => {
+    const db = getDbAt(':memory:');
+    insertFocusAgent(db, 'Alice', 'cmux', 'surface-registered', 'workspace-registered');
+    const calls: Array<{ binary: string; args: string[] }> = [];
+    try {
+      const result = focusAgentTerminal(db, 'default', 'alice', {
+        resolveCmuxBinary: () => '/test/bin/cmux',
+        cmuxRunner: (binary, args) => {
+          calls.push({ binary, args: [...args] });
+          return args.includes('identify')
+            ? JSON.stringify({ caller: { pane_ref: 'pane-resolved' } })
+            : '';
+        },
+      });
+      assert.deepStrictEqual(result, {
+        status: 200,
+        ok: true,
+        message: 'Focused terminal for "Alice".',
+      });
+      assert.deepStrictEqual(calls, [
+        {
+          binary: '/test/bin/cmux',
+          args: ['--json', 'identify', '--surface', 'surface-registered'],
+        },
+        {
+          binary: '/test/bin/cmux',
+          args: [
+            'focus-panel', '--panel', 'surface-registered',
+            '--workspace', 'workspace-registered',
+          ],
+        },
+      ]);
+    } finally {
+      db.close();
+    }
+  });
+
+  test('requires the session token before reading a focus request', async context => {
+    const running = await startOrSkip(context, { db: null, swarmId: 'default' });
+    if (!running) return;
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        body: JSON.stringify({ agent: 'Alice' }),
+      });
+      assert.strictEqual(response.status, 401);
+    } finally {
+      await running.close();
+    }
+  });
+
+  test('rejects a bad Host before reading a focus request', async context => {
+    const running = await startOrSkip(context, { db: null, swarmId: 'default' });
+    if (!running) return;
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        host: 'board.attacker.test',
+        token: running.token,
+        body: JSON.stringify({ agent: 'Alice' }),
+      });
+      assert.strictEqual(response.status, 403);
+    } finally {
+      await running.close();
+    }
+  });
+
+  test('returns 404 for an unknown agent in the served swarm', async context => {
+    const db = getDbAt(':memory:');
+    const running = await startOrSkip(context, { db, swarmId: 'default' });
+    if (!running) {
+      db.close();
+      return;
+    }
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        token: running.token,
+        body: JSON.stringify({ agent: 'Nobody' }),
+      });
+      assert.strictEqual(response.status, 404);
+      assert.deepStrictEqual(JSON.parse(response.body).ok, false);
+      assert.match(JSON.parse(response.body).message, /Unknown agent/);
+    } finally {
+      await running.close();
+      db.close();
+    }
+  });
+
+  test('returns 400 for a registered non-cmux agent', async context => {
+    const db = getDbAt(':memory:');
+    insertFocusAgent(db, 'Remote', 'a2a', 'a2a:default:Remote', null);
+    const running = await startOrSkip(context, { db, swarmId: 'default' });
+    if (!running) {
+      db.close();
+      return;
+    }
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        token: running.token,
+        body: JSON.stringify({ agent: 'remote' }),
+      });
+      assert.strictEqual(response.status, 400);
+      assert.match(JSON.parse(response.body).message, /no cmux terminal/i);
+    } finally {
+      await running.close();
+      db.close();
+    }
+  });
+
+  test('focuses only the registry-resolved surface and ignores extra body fields', async context => {
+    const db = getDbAt(':memory:');
+    insertFocusAgent(db, 'Alice', 'cmux', 'surface-registered', 'workspace-registered');
+    const calls: Array<{ binary: string; args: string[] }> = [];
+    const running = await startOrSkip(context, {
+      db,
+      swarmId: 'default',
+      resolveCmuxBinary: () => '/test/bin/cmux',
+      cmuxRunner: (binary, args) => {
+        calls.push({ binary, args: [...args] });
+        if (args.includes('identify')) {
+          return JSON.stringify({
+            caller: {
+              surface_ref: 'surface-registered',
+              workspace_ref: 'workspace-from-cmux',
+              pane_ref: 'pane-resolved',
+            },
+          });
+        }
+        return '';
+      },
+    });
+    if (!running) {
+      db.close();
+      return;
+    }
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        token: running.token,
+        body: JSON.stringify({
+          agent: 'alice',
+          surface: 'surface-attacker',
+          workspace: 'workspace-attacker',
+          command: 'open-something',
+        }),
+      });
+      assert.strictEqual(response.status, 200);
+      assert.deepStrictEqual(JSON.parse(response.body), {
+        ok: true,
+        message: 'Focused terminal for "Alice".',
+      });
+      assert.deepStrictEqual(calls, [
+        {
+          binary: '/test/bin/cmux',
+          args: ['--json', 'identify', '--surface', 'surface-registered'],
+        },
+        {
+          binary: '/test/bin/cmux',
+          args: [
+            'focus-panel', '--panel', 'surface-registered',
+            '--workspace', 'workspace-registered',
+          ],
+        },
+      ]);
+    } finally {
+      await running.close();
+      db.close();
+    }
+  });
+
+  test('rejects an oversized JSON body without invoking cmux', async context => {
+    let runnerCalled = false;
+    const running = await startOrSkip(context, {
+      db: null,
+      swarmId: 'default',
+      cmuxRunner: () => {
+        runnerCalled = true;
+        return '';
+      },
+    });
+    if (!running) return;
+    try {
+      const response = await request(running, '/api/focus-agent', {
+        method: 'POST',
+        token: running.token,
+        body: JSON.stringify({ agent: 'A'.repeat(BOARD_SERVER_MAX_BODY_BYTES) }),
+      });
+      assert.strictEqual(response.status, 413);
+      assert.strictEqual(JSON.parse(response.body).ok, false);
+      assert.strictEqual(runnerCalled, false);
+    } finally {
+      await running.close();
+    }
+  });
+});
+
 describe('V1-B static board assets', () => {
   test('all web files are local-only and HTML references only the asset route', () => {
     const expected = ['board.html', 'board.css', 'board.js', 'board-elements.js'];
@@ -261,7 +485,7 @@ describe('V1-B static board assets', () => {
     assert.ok(references.length > 0);
     assert.ok(references.every(reference => reference.startsWith('./assets/')));
     assert.doesNotMatch(html, /type="module"/);
-    assert.doesNotMatch(html, /echarts/i);
+    assert.match(html, /assets\/echarts\.min\.js/);
     assert.doesNotMatch(
       fs.readFileSync(path.join(ROOT, 'web', 'board.js'), 'utf-8'),
       /innerHTML/

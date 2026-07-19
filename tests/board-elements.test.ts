@@ -17,14 +17,32 @@ type BuildElements = (data: BoardData) => {
   topologyHash: string;
 };
 
+interface TimelineRecord {
+  taskId: string;
+  lane: string;
+  kind: string;
+  eventKind: string;
+  color: string;
+  value: [string, string];
+  event: BoardData['timeline'][number];
+}
+
+type BoardElementsModule = BuildElements & {
+  needsYouNodeIds: (data: BoardData) => string[];
+  timelineRecords: (
+    data: BoardData,
+    selectedTaskId?: string | null
+  ) => { lanes: string[]; records: TimelineRecord[] };
+};
+
 const ELEMENTS_PATH = path.resolve(fileURLToPath(new URL('../web/board-elements.js', import.meta.url)));
 
-function loadBuilder(): BuildElements {
+function loadBuilder(): BoardElementsModule {
   const sandbox = { module: { exports: {} }, exports: {} };
   vm.runInNewContext(fs.readFileSync(ELEMENTS_PATH, 'utf-8'), sandbox, {
     filename: ELEMENTS_PATH,
   });
-  return sandbox.module.exports as BuildElements;
+  return sandbox.module.exports as BoardElementsModule;
 }
 
 function fixture(): BoardData {
@@ -192,5 +210,60 @@ describe('V1-B boardElements', () => {
       at: '2026-07-19T12:30:00.000Z',
     });
     assert.notStrictEqual(build(edgeAdded).topologyHash, baseline);
+  });
+});
+
+describe('V1-C coordinated board helpers', () => {
+  test('needsYouNodeIds returns only graph nodes directly referenced by needs-you items', () => {
+    const build = loadBuilder();
+    const data = fixture();
+    data.needsYou = [
+      { kind: 'awaiting_review', label: 'Review it', refId: 'review-task' },
+      { kind: 'janitor_stale', label: 'Run janitor', refId: 'janitor' },
+      { kind: 'gate', label: 'Message for Alice', refId: '42' },
+      { kind: 'agent', label: 'Check Alice', refId: 'alice' },
+    ];
+
+    assert.deepStrictEqual(Array.from(build.needsYouNodeIds(data)), [
+      'agent:Alice',
+      'debris',
+      'task:review-task',
+    ]);
+  });
+
+  test('timelineRecords maps task lanes and every v1 event-kind color without mutation', () => {
+    const build = loadBuilder();
+    const data = fixture();
+    const kinds = [
+      'started', 'checkpoint', 'claimed', 'handoff', 'closed',
+      'refused_stale_epoch', 'note',
+    ];
+    data.timeline = kinds.map((kind, index) => ({
+      taskId: index === kinds.length - 1 ? 'review-task' : 'stale-task',
+      epoch: index + 1,
+      kind,
+      actor: 'Alice',
+      at: `2026-07-19T12:0${index}:00.000Z`,
+      summary: `${kind} summary`,
+    }));
+    const before = JSON.stringify(data);
+    const mapped = build.timelineRecords(data);
+
+    assert.deepStrictEqual(Array.from(mapped.lanes), ['stale-task', 'review-task']);
+    assert.deepStrictEqual(
+      Array.from(mapped.records, record => record.kind),
+      ['started', 'checkpoint', 'claimed', 'handoff', 'closed', 'refused_stale_epoch', 'other']
+    );
+    assert.strictEqual(new Set(mapped.records.map(record => record.color)).size, kinds.length);
+    assert.deepStrictEqual(Array.from(mapped.records[0].value), [
+      '2026-07-19T12:00:00.000Z', 'stale-task',
+    ]);
+    assert.strictEqual(mapped.records[0].event, data.timeline[0]);
+
+    const filtered = build.timelineRecords(data, 'review-task');
+    assert.deepStrictEqual(Array.from(filtered.lanes), ['review-task']);
+    assert.strictEqual(filtered.records.length, 1);
+    assert.strictEqual(filtered.records[0].eventKind, 'note');
+    assert.strictEqual(JSON.stringify(data), before, 'pure mapping must not mutate BoardData');
   });
 });

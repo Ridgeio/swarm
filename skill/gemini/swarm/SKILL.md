@@ -85,3 +85,15 @@ When a message appears in your terminal as `[SWARM from <name>]: <text>`, treat 
 - Don't argue over messages. If there's a disagreement, one message each, then move on.
 - If an agent doesn't respond after one message, they may be busy. Check with `swarm read` before resending.
 - This is a trusted environment. All agents can read each other's terminal output. Don't put secrets in your terminal that you wouldn't want other agents to see.
+
+## Durable work: tasks, evidence, approvals (SWARM-NEXT)
+
+Messaging is for coordination; WORK goes through the durable task ledger — it survives your session ending. The live, always-current command map is `swarm help --agent`; load docs by open decision via the path it prints (docs/ROUTING.md). Core loop:
+
+1. `swarm task start <slug> --title "..." [--repo <path>] [--claim <kind>]` — claims are typed (code-merged | journey-works | deploy-healthy | analysis | decision | probe); start prints what evidence close will require. Repo tasks get a named branch + worktree under ~/.swarm/wt/.
+2. Work, capturing evidence: `swarm run --task <slug> -- <cmd>` logs full output to the task's evidence dir.
+3. `swarm task checkpoint <slug>` at phase boundaries — decisions/failed-approaches/next-action (gated until filled). Your death then costs minutes, not a context window.
+4. Blocked or need an approval (e.g. merge)? `swarm escalate <slug> --question "..."` — approvals are expiring grants issued by the operator; NEVER self-grant, never self-merge (close-as-merged verifies the commit is actually on the default branch).
+5. `swarm task close <slug> --disposition <d> --evidence <kind>:<ref> --not-established "..."` — closes are refused without matching evidence; state your evidence ceiling honestly. `swarm task reopen <slug> --reason` exists for false dispositions.
+
+Visibility: `swarm board --tab` (live fleet board in a cmux tab) / `swarm board --graph --open` (workflow diagram) — the first agent in a swarm (Lead) opens one. Waiting on a reply: `swarm inbox --wait 60`. Superseding a stale order: resend with `--supersedes <msg-id>`. If a refusal names a doc or command, treat it as instruction — the refusals teach.

@@ -76,3 +76,32 @@ describe('parseGlobalFlags', () => {
     );
   });
 });
+
+describe('swarm version', () => {
+  test('formatVersion reports sha, up-to-date, behind, and offline states', async () => {
+    const { formatVersion } = await import('../src/version.js');
+    const mk = (responses: Record<string, string | Error>) => (args: string[]) => {
+      const key = args.join(' ');
+      for (const [prefix, value] of Object.entries(responses)) {
+        if (key.startsWith(prefix)) {
+          if (value instanceof Error) throw value;
+          return value as string;
+        }
+      }
+      throw new Error(`unexpected git ${key}`);
+    };
+    assert.match(formatVersion(false, mk({ 'rev-parse': 'abc1234' })), /^swarm .+ \(abc1234\)$/);
+    assert.match(
+      formatVersion(true, mk({ 'rev-parse': 'abc1234', 'fetch': '', 'rev-list --count HEAD..origin/master': '0', 'rev-list --count origin/master..HEAD': '0' })),
+      /up to date with origin\/master/
+    );
+    assert.match(
+      formatVersion(true, mk({ 'rev-parse': 'abc1234', 'fetch': '', 'rev-list --count HEAD..origin/master': '7', 'rev-list --count origin/master..HEAD': '0' })),
+      /behind by 7.*git pull/
+    );
+    assert.match(
+      formatVersion(true, mk({ 'rev-parse': 'abc1234', 'fetch': new Error('could not resolve host') })),
+      /check unavailable/
+    );
+  });
+});

@@ -41,6 +41,7 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'members', group: 'identity', line: 'members — list active agents' },
   { command: 'status', group: 'identity', line: 'status — read or set agent status' },
   { command: 'whoami', group: 'identity', line: 'whoami — show current identity' },
+  { command: 'version', group: 'identity', line: 'version [--check] — build SHA; --check compares to origin' },
   { command: 'spawn', group: 'identity', line: 'spawn — open a local worker session' },
   { command: 'read', group: 'identity', line: 'read — inspect a local agent screen' },
   { command: 'rename', group: 'identity', line: 'rename — rename an agent tab' },

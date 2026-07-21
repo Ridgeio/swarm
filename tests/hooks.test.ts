@@ -88,7 +88,7 @@ describe('hook host detection', () => {
 });
 
 describe('Codex hook state', () => {
-  test('Codex session state does not overwrite or remove durable install instructions', () => {
+  test('Codex install refreshes the swarm-owned base instructions and preserves user instructions.md content', () => {
     const home = withTempHome();
     const codexHome = path.join(home, '.codex');
     fs.mkdirSync(codexHome, { recursive: true });
@@ -96,12 +96,19 @@ describe('Codex hook state', () => {
     const sessionPath = path.join(codexHome, 'swarm-session.md');
     const instructionsPath = path.join(codexHome, 'instructions.md');
 
-    fs.writeFileSync(basePath, '# Existing Durable Instructions\n');
+    // swarm-instructions.md is SWARM-OWNED: a stale copy from an old install must be
+    // refreshed to the current template (blind-test finding: write-once files kept
+    // teaching a dead command set). instructions.md user content stays untouched.
+    fs.writeFileSync(basePath, '# Stale Instructions From An Old Install\n');
     fs.writeFileSync(instructionsPath, '<!-- existing -->\nKeep this line.\n');
 
     installHook('codex', 'Alice', 'swarm-a', 'project-a');
 
-    assert.strictEqual(fs.readFileSync(basePath, 'utf-8'), '# Existing Durable Instructions\n');
+    const refreshed = fs.readFileSync(basePath, 'utf-8');
+    assert.doesNotMatch(refreshed, /Stale Instructions/);
+    assert.match(refreshed, /help --agent/);
+    assert.match(refreshed, /never self-grant/);
+    assert.match(fs.readFileSync(instructionsPath, 'utf-8'), /Keep this line\./);
     assert.match(fs.readFileSync(sessionPath, 'utf-8'), /joined swarm "project-a" as "Alice"/);
     assert.match(fs.readFileSync(sessionPath, 'utf-8'), /SWARM_ID="swarm-a"/);
     assert.match(fs.readFileSync(instructionsPath, 'utf-8'), /swarm-instructions/);

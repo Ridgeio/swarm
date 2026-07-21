@@ -251,27 +251,21 @@ function installCodexHook(agentName: string, swarmId: string, swarmName: string)
 
   fs.mkdirSync(codexHome, { recursive: true });
 
-  if (!fs.existsSync(basePath)) {
-    const baseContent = `# Swarm Coordination
+  // Content is swarm-owned: rewrite whenever the template changes so a stale
+  // file from an old install can never keep teaching a dead command set.
+  const baseContent = `# Swarm Coordination
 
-You can coordinate with other AI agents using the swarm CLI.
+You can coordinate with other AI agents on this machine via the swarm CLI.
 
-Common commands:
-- ${swarmBin} join "<name>" --swarm <swarm>
-- ${swarmBin} send <agent> "<message>"
-- ${swarmBin} broadcast "<message>"
-- ${swarmBin} inbox
-- ${swarmBin} members
-- ${swarmBin} status --set "<description>"
-- ${swarmBin} leave
-
-Fleet UI (open it if you are the first/Lead agent so the operator can see the swarm):
-- ${swarmBin} board                 one-shot fleet view (NEEDS YOU / TASKS / FLEET / DEBRIS)
-- ${swarmBin} board --tab           live board in its own cmux tab (keep it open)
-- ${swarmBin} board --graph --open  visual workflow diagram (agents by model, tasks by state)
-
-Your current identity is resolved by the swarm CLI from the terminal/session marker. Run ${swarmBin} whoami to confirm which swarm you are in.
+- LIVE COMMAND MAP (always current): ${swarmBin} help --agent
+- Identity: ${swarmBin} whoami. Join: ${swarmBin} join "<name>" --swarm <swarm> (child/scripted processes: add --headless)
+- WORK goes through durable tasks: task start (typed claims) -> ${swarmBin} run (evidence) -> task checkpoint (phase boundaries) -> task close (evidence-gated). Approvals are operator-issued expiring grants: request via ${swarmBin} escalate <slug> --question "..." — never self-grant, never self-merge.
+- Fleet UI (the first/Lead agent opens one so the operator can see the swarm):
+  ${swarmBin} board --tab (live cmux-tab board) | ${swarmBin} board --graph --open (workflow diagram)
+- Waiting on a reply: ${swarmBin} inbox --wait 60. Correcting a stale order: resend with --supersedes <msg-id>.
+- When a command refuses, the refusal names the fix — treat it as instruction. Docs route by open decision (${swarmBin} help --agent prints the routing doc path).
 `;
+  if (!fs.existsSync(basePath) || fs.readFileSync(basePath, 'utf-8') !== baseContent) {
     fs.writeFileSync(basePath, baseContent);
   }
 

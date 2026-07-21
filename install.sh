@@ -81,47 +81,15 @@ if command -v codex &>/dev/null; then
   cat > "${CODEX_HOME}/swarm-instructions.md" << SKILL
 # Swarm Coordination
 
-You can coordinate with other AI agents running in nearby terminals using the swarm CLI.
+You can coordinate with other AI agents on this machine via the swarm CLI.
 
-## Skills
-
-Codex skills installed by swarm:
-- \`swarm\` — coordination protocol and command reference
-- \`join-swarm\` — join the swarm and check initial messages
-- \`leave-swarm\` — leave the swarm and clean up session state
-- \`reset-swarm\` — clear the current swarm's agents and messages
-
-Swarm supports multiple independent project swarms on the same machine. If \`${CODEX_HOME}/swarm-session.md\` exists, use it as a hint, then run \`${SWARM_BIN} whoami\` to confirm the current terminal identity.
-
-## Joining
-
-To join a project swarm, pick a short creative name and run:
-\`\`\`bash
-${SWARM_BIN} join "<name>" --swarm <project-swarm>
-\`\`\`
-
-## Commands
-
-- \`${SWARM_BIN} create <swarm> --root <path>\` — create/update a project swarm
-- \`${SWARM_BIN} swarms\` — list known swarms
-- \`${SWARM_BIN} send <agent> "<message>"\` — send a direct message
-- \`${SWARM_BIN} broadcast "<message>"\` — send to all agents in the current swarm
-- \`${SWARM_BIN} inbox\` — check for pending messages
-- \`${SWARM_BIN} members\` — list active agents
-- \`${SWARM_BIN} status --set "<description>"\` — update your status
-- \`${SWARM_BIN} read <agent> --lines 20\` — read another agent's terminal
-- \`${SWARM_BIN} spawn --name <agent> --cwd <path> --swarm <swarm>\` — spawn Claude in a new Cmux tab in the current workspace
-- \`${SWARM_BIN} leave\` — leave the swarm
-- \`${SWARM_BIN} reset\` — clear the current swarm
-- \`${SWARM_BIN} reset --all\` — clear every swarm only when explicitly requested
-
-## Protocol
-
-- Confirm the current project swarm with \`${SWARM_BIN} whoami\` when unsure
-- Check inbox before starting new work and after completing tasks
-- When you see \`[SWARM from <name>]: <text>\` in your terminal, that's a message from another agent. Read and respond.
-- Send a message when you finish work that unblocks someone else
-- Be concise — other agents have limited context too
+- LIVE COMMAND MAP (always current): \`${SWARM_BIN} help --agent\`
+- Identity: \`${SWARM_BIN} whoami\` (if \`${CODEX_HOME}/swarm-session.md\` exists, treat it as a hint only)
+- Join: \`${SWARM_BIN} join "<name>" --swarm <project-swarm>\` (child/scripted processes: add \`--headless\`)
+- WORK goes through durable tasks: \`task start\` (typed claims) -> \`swarm run\` (evidence) -> \`task checkpoint\` (phase boundaries) -> \`task close\` (evidence-gated). Approvals are operator-issued expiring grants: request via \`${SWARM_BIN} escalate <slug> --question "..."\` — never self-grant, never self-merge.
+- Fleet visibility: \`${SWARM_BIN} board --tab\`. Waiting on a reply: \`${SWARM_BIN} inbox --wait 60\`.
+- Installed skills: swarm (protocol), join-swarm, leave-swarm, reset-swarm. Docs route by open decision — \`${SWARM_BIN} help --agent\` prints the routing doc path.
+- When you see \`[SWARM from <name>]:\` it is a message from another agent — read and respond. Refusals teach: if a command refuses, the message names the fix.
 SKILL
 
   # Append to global instructions if they exist, or note the file location

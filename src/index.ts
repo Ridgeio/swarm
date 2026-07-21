@@ -46,6 +46,7 @@ import {
   waitForInbox,
 } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
+import { formatVersion } from './version.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
 import {
   CMUX_LIVENESS_UNKNOWN_MESSAGE,
@@ -368,6 +369,7 @@ Janitor (observe-only in v1):
   swarm janitor install|uninstall                 Manage the 15-minute launchd schedule
 
 Status:
+  swarm version [--check]                          Show build (and compare to origin/master)
   swarm board [--watch [N]] [--tab]               Render fleet state or open it in a cmux workspace
   swarm board --graph [--out <path>] [--open]     Write and print a Mermaid workflow graph
     [--watch [N]] [--tab]                           (--tab prefers a cmux browser, then system browser)
@@ -507,7 +509,7 @@ function printHookContext(): void {
 
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
-Commands: swarm send <agent> "<msg>" | broadcast "<msg>" | inbox | members | status --set "<desc>"${readCommand}
+Commands: swarm send <agent> "<msg>" | inbox [--wait N] | members | status --set "<desc>" | task start/checkpoint/close | board --tab${readCommand} | help --agent (full map)
 When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
@@ -2043,6 +2045,11 @@ async function main() {
             for (const a of removed) console.log(`  ${a.name} (${a.agent_type})${swarm ? '' : ` from ${getSwarmById(db, a.swarm_id)?.name ?? a.swarm_id}`}`);
           }
         }
+        break;
+      }
+
+      case 'version': {
+        console.log(formatVersion(hasFlag('--check')));
         break;
       }
 

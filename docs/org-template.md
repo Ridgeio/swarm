@@ -15,6 +15,15 @@ Rules here are the prompt-space layer. Wherever a rule has a code enforcement (m
 - **Auditor.** Independent gate function OUTSIDE the hierarchy; verdicts to the PR author + lead only; takes direction from no one on verdicts.
 - **Janitor.** Not a role — a deterministic tick (⚙ WI-5). Agents never do cleanup-by-vibes; they file findings.
 
+## Fleet layout in cmux
+
+Containers carry meaning — don't create them casually:
+
+- **One workspace per program.** Named (never anonymous), created by the Lead at kickoff; the program's agents, board, and drilldowns all live in it. A new workspace means a new CONTEXT (another program, a separate repo cluster) — never a side effect of "show something."
+- **Swarmmates join as tabs** (new surfaces) in the program workspace — switching to the workspace shows the whole fleet.
+- **Seeing two+ things at once = a tiled split in the current workspace**, not a new workspace: the board beside your work, watching another agent, comparing outputs. 2–3 panes max; past that, tabs. (`swarm board --tab` splits beside you by default; `--own-workspace` is for the program-workspace setup.)
+- **Scripted/short-lived children get no surface at all** — join `--headless`.
+
 ## Fleet size
 
 1 PM + 4–6 builders, hard cap, regardless of available subscriptions. Concurrency is bounded by independent work packages and by the owner's review bandwidth — surplus agents become coordination load (field: 259 msgs/6h into the PM at 13 agents). Scaling up requires the plan to name the independent lanes first.

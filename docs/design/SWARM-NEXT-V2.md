@@ -120,6 +120,25 @@ Build phases T1 → T2 → T3/4 → T5, each a separate reviewed commit. Convent
 3. **On every start**: `swarm join` prints the same line immediately from cache when update-available; when cache is absent or older than 6h, join spawns the detached janitor tick (existing spawnJanitorTick helper) so the cache refreshes without blocking the join. `swarm version --check` unchanged (full fetch + ahead/behind counts for explicit runs).
 4. Tests: cache write from a stubbed ls-remote (current/differs/failure→unknown); banner line renders only on update-available; join prints from cache + spawns on stale-cache (injectable spawner); tick never fails on network error; no fetch invoked by the periodic path (assert runner args).
 
+## T8 — cmux layout discipline: splits over new workspaces  (S/M) — added 2026-07-21
+
+**Operator finding (Tom):** for see-two-things-at-once, a tiled split in ONE workspace beats a new workspace — but agents (and our own tools) default to `new-workspace`. Defaults ARE doctrine (P5), so both change together.
+
+**Layout rules (doctrine, also §Fleet layout in org-template.md):**
+- **New workspace** = a new CONTEXT only: one per swarm program (its agents, board, and briefs live there), or a genuinely separate repo/lane cluster. Agents never create workspaces as a side effect of "show something."
+- **Tab (new surface in the current workspace)** = adding a swarmmate or long-lived surface to the SAME context.
+- **Tiled split** = the default whenever the point is simultaneous visibility: board beside your work, watching another agent, comparing two outputs. 2–3 panes max; beyond that use tabs.
+- **Headless** = scripted/short-lived children — no visual surface at all (G1 already routes them here).
+
+**Mechanics (make the defaults match):**
+1. transport.ts gains `spawnSplitInWorkspace(cwd, command, direction='right', workspaceId?)` using cmux `new-split <dir>` (resolve the created surface via list-pane-surfaces, send the command — mirror spawnSurfaceInWorkspace's pattern). Injectable for tests.
+2. **`swarm board --tab` default flips to a SPLIT in the CURRENT workspace** (direction right). `--own-workspace` restores the old behavior (for the program-workspace setup case). Same for the graph browser pane (`board --graph --tab`): prefer a browser split/pane in the current workspace (cmux `new-pane --type browser --direction right --url ...` or equivalent — inspect cmux help), falling back to the existing browser-workspace path, then `open`.
+3. **`swarm spawn`** (already surface-in-current-workspace by default — verify): gains `--split [dir]` (tiled beside caller) and `--new-workspace <name>` (program creation, names the workspace). Refuse `--new-workspace` without a name (named contexts only — no anonymous workspace litter).
+4. Teaching: help --agent board/spawn lines mention split-default + when to use which container; hook banner unchanged (no room).
+5. **Rider (wart from live use):** `task close --disposition discard --force-discard` additionally bypasses the claim-evidence matrix (it already bypasses git gates; discard declares the work void — demanding evidence for voided work forces theater). Audited event unchanged; `--not-established` still required.
+
+**Acceptance.** spawnSplit sends the command into the new split surface (stubbed cmux runner asserts new-split + send); board --tab default splits in current workspace and --own-workspace creates the named workspace (old path preserved + tested); spawn --split/--new-workspace(name-required) paths; graph --tab prefers in-workspace browser pane with tested fallback chain; discard+force-discard closes an evidence-less analysis task (event recorded), while discard WITHOUT --force-discard still refuses; docs lines updated.
+
 ## Explicitly changed roadmap items (from the review)
 
 - **React SPA graduation: DROPPED** (SWARM-VISUALIZER §5 edited): the served board meets the visibility claim; a promised second UI era is competing prompt material. Revisit only with a named unresolved decision it would resolve.

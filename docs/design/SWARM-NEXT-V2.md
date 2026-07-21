@@ -139,6 +139,19 @@ Build phases T1 → T2 → T3/4 → T5, each a separate reviewed commit. Convent
 
 **Acceptance.** spawnSplit sends the command into the new split surface (stubbed cmux runner asserts new-split + send); board --tab default splits in current workspace and --own-workspace creates the named workspace (old path preserved + tested); spawn --split/--new-workspace(name-required) paths; graph --tab prefers in-workspace browser pane with tested fallback chain; discard+force-discard closes an evidence-less analysis task (event recorded), while discard WITHOUT --force-discard still refuses; docs lines updated.
 
+## T9 — responsive text board + live-agent triage scoping  (S/M) — added 2026-07-21
+
+**Operator finding (screenshot):** in a narrow split (T8's new default home for `board --tab`), the text board's fixed-width boxes shatter — long NEEDS YOU lines hard-wrap through the borders. And NEEDS YOU was drowning in unacked gate messages addressed to DEAD old-program agents.
+
+1. **Width-aware rendering** (src/board.ts render path):
+   - Effective width = `--width <n>` flag > `COLUMNS` env > `process.stdout.columns` > 80. In `--watch`, re-read every render so live pane resizes adapt.
+   - All section content WRAPS at word boundaries to fit inside the box (continuation lines indented 2); message-body/triage lines clamp to 2 wrapped lines + `…` (full text lives in `swarm inbox`/inspector — the board is a glance surface). Box width = min(needed, effective width).
+   - **Narrow mode** below 70 cols: drop box-drawing entirely — `== NEEDS YOU ==` header style, plain indented lines, same content. Boxes must never emit a line wider than the effective width in either mode.
+2. **Live-agent triage scoping** (src/board-data.ts): needsYou unacked-delivery items include ONLY messages whose recipient is a currently registered agent in the swarm (COLLATE NOCASE join against agents). Dead-agent unacked mail is excluded from needsYou and from the unacked stat cards/agent rows (which are naturally scoped already — verify). The messages themselves are untouched (archaeology via --recent).
+3. Web board unaffected. `renderBoard` signature keeps compatibility (options gains width?).
+
+**Acceptance.** At width 60: no emitted line exceeds 60 cols, narrow mode active (no box chars), long fixture message clamps to 2 lines + ellipsis; at width 120: boxed mode, wrapped-not-truncated section lines except the 2-line clamp rows; --width flag + COLUMNS + stdout.columns precedence tested; watch re-reads width between renders (injectable); needsYou fixture with an unacked message to a dead (unregistered) agent EXCLUDES it while a live agent's shows; existing board tests green (update exact-string assertions as needed, flag them).
+
 ## Explicitly changed roadmap items (from the review)
 
 - **React SPA graduation: DROPPED** (SWARM-VISUALIZER §5 edited): the served board meets the visibility claim; a promised second UI era is competing prompt material. Revisit only with a named unresolved decision it would resolve.

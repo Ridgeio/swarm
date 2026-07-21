@@ -97,6 +97,29 @@ Build phases T1 → T2 → T3/4 → T5, each a separate reviewed commit. Convent
 
 ---
 
+## T6 — Model-inversion review routing  (S/M) — added 2026-07-21
+
+**Source:** Greptile, "Model Inversion" (greptile.com/blog/model-inversion). Evidence: across 500 PRs/model, cross-model review beat same-model review in BOTH directions (Claude-authored: GPT 62.0% recall vs Opus 53.7%; Codex-authored: Opus 60.0% vs GPT 50.5%). Mechanism: "the types of bugs a model introduces most often are the same types it's more likely to miss during review." Category priors: Claude-authored → missing-behavior is the top hunt (GPT 69.0% vs Opus 63.3%); Codex-authored → build breakage (Opus 82.4% vs GPT 58.8%); semantic-intent/error-handling in Codex code are weak for BOTH (27.4%/22.6% ties — tests, not reviewers, must catch those). Caveat verbatim: "experimental… still learning how far the effect goes as models improve." This upgrades our existing cross-family rule (model-routing.md rule 3) from convention to enforced routing with priors.
+
+1. **`swarm review <task-slug> [--to <agent>]`** — the review-request verb (sibling of escalate):
+   - Resolves the AUTHOR model family from the task owner's `agents.host_agent` (claude-code|codex|grok|gemini → family claude|openai|xai|google; unknown → 'unknown').
+   - `--to` given: refuse when the reviewer's family EQUALS the author's — message cites model inversion, lists live different-family members, and offers `--same-family-ok` (audited via task_events kind=`same_family_review` with a reason flag... require `--reason`). No `--to`: pick the live agent of a different family with the fewest open reviews (fallback: print that no cross-family reviewer is live and suggest spawning one).
+   - Generates a review brief beside the escalation packets (`~/.swarm/briefs/reviews/<slug>--<ts>.md`): task state, checkpoint, evidence list, git facts, PLUS an **inversion prior block**: author family + the category priors table row for that family ("author: claude-family — prioritize: missing behavior; also semantic-intent/error-handling per baseline"). Priors live in a small exported map (REVIEW_PRIORS) so doctrine and code share one source.
+   - Sends pointer-only kind=`gate` message to the reviewer; records task_events kind=`review_requested` (author_family, reviewer, reviewer_family); sets state `awaiting_review`.
+2. Board: awaiting_review already surfaces; the inspector shows review_requested events with families.
+3. Doctrine: model-routing.md rule 3 rewritten as "Model inversion (enforced)" with the numbers + caveat + source; org-template reviewer role references `swarm review`.
+
+**Acceptance.** Family derivation per host; same-family refusal names live alternatives + requires reason on override (audited); auto-pick prefers different family; brief contains the correct prior block per author family; pointer-only message; events recorded; no reviewer live → actionable message, no state change.
+
+## T7 — Automatic update awareness  (S) — added 2026-07-21
+
+"Is this device current?" must not depend on anyone remembering `version --check`.
+
+1. **Janitor tick step `checkSwarmVersion`** (observe tick): `git ls-remote origin master` on the swarm repo (execFile, 5s timeout — a pure network READ: preserves the tick's no-writes-outside-~/.swarm property; do NOT fetch). Cache {local_sha (rev-parse HEAD), remote_sha, checked_at, status: current|update-available|unknown} in janitor_kv. Any failure → status unknown, never fails the tick.
+2. **Hook banner**: when cache says update-available, append one line: `swarm update available — cd <repo> && git pull && npm install && npm run build` (absolute repo path). Nothing when current/unknown (no noise).
+3. **On every start**: `swarm join` prints the same line immediately from cache when update-available; when cache is absent or older than 6h, join spawns the detached janitor tick (existing spawnJanitorTick helper) so the cache refreshes without blocking the join. `swarm version --check` unchanged (full fetch + ahead/behind counts for explicit runs).
+4. Tests: cache write from a stubbed ls-remote (current/differs/failure→unknown); banner line renders only on update-available; join prints from cache + spawns on stale-cache (injectable spawner); tick never fails on network error; no fetch invoked by the periodic path (assert runner args).
+
 ## Explicitly changed roadmap items (from the review)
 
 - **React SPA graduation: DROPPED** (SWARM-VISUALIZER §5 edited): the served board meets the visibility claim; a promised second UI era is competing prompt material. Revisit only with a named unresolved decision it would resolve.

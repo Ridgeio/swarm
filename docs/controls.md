@@ -12,3 +12,4 @@ Row format is machine-parsed (strict): `| id | mechanism | guards-against | YYYY
 | janitor-hook-piggyback | hook spawns janitor tick when >10 min stale | idle-fleet census gaps between launchd ticks | 2026-08-17 | retire if launchd alone keeps tick age <15 min for 2 weeks |
 | checkpoint-stale-nag-90m | 90-min stale-checkpoint nag in hook | context loss from unexternalized work | 2026-09-01 | threshold retune allowed; mechanism permanent while P2 stands |
 | close-git-gates | unpushed/dirty/untracked refusal at task close | stranded-work loss at task end | 2026-10-01 | permanent (founding failure class); overrides are audited, not exempted |
+| review-priors-greptile | model-inversion priors in swarm review briefs | reviewers hunting the wrong bug classes | 2026-10-01 | retire/refresh when a newer cross-model study or field data supersedes the Greptile 2026 numbers |

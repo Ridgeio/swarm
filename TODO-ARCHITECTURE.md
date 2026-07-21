@@ -204,13 +204,15 @@ Add a per-recipient delivery table with a `status` column
 
 ### 5.4 — Authenticate the sender  ·  ~1 day
 
-**OPEN**
+**LANDED WITH TRUST-MODEL CAVEAT — SWARM-NEXT v2 T2**
 
-Issue a per-session token at `join`; require it on `send`.
+Local joins issue a per-session token and identity-resolving verbs verify it
+against the current TTY/Cmux marker. Legacy NULL-token rows are grandfathered
+until rejoin; A2A endpoint identity is unchanged.
 
-- Closes the §2a spoofing / prompt-injection primitive.
-- Keep the "trusted environment" default for local-only use, but make impersonation
-  require the token rather than a free-text `from` label.
+This lands records-and-audit identity checking, not a cryptographic security
+boundary. A malicious local process under the same operator account can read the
+database and marker files. See the [SWARM-NEXT v2 honest trust-model note](docs/design/SWARM-NEXT-V2.md#honest-trust-model-note-applies-to-t2).
 
 ### 5.5 — Retire / quarantine the AppleScript/Warp keystroke transport  ·  hours
 

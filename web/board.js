@@ -675,6 +675,12 @@
           (item.bypassedGates.length > 0 ? item.bypassedGates.join(', ') : 'none') + ']';
       }).join(' · ')
       : 'none');
+    detailRow(list, 'Grant usage', task.grantUsage && task.grantUsage.length > 0
+      ? task.grantUsage.map(function (item) {
+        return '#' + item.eventId + ' grant #' + (item.grantId === null ? 'unknown' : item.grantId) +
+          ' ' + item.op + ' on ' + item.resource + ' by ' + (item.actor || 'unknown');
+      }).join(' · ')
+      : 'none');
     detailRow(list, 'Checkpoint', task.checkpoint
       ? task.checkpoint.ageMin + 'm ago · #' + task.checkpoint.seq
       : 'none');

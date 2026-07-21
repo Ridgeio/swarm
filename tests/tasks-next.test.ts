@@ -15,6 +15,18 @@ const TSX_IMPORT = import.meta.resolve('tsx');
 interface CliResult { stdout: string; stderr: string; status: number }
 
 function runCli(home: string, args: string[], agent?: string, cwd?: string): CliResult {
+  let sessionToken = '';
+  const dbPath = path.join(home, '.swarm', 'swarm.db');
+  if (agent && fs.existsSync(dbPath)) {
+    const identityDb = new SQLite(dbPath, { readonly: true });
+    try {
+      const row = identityDb.prepare('SELECT session_token FROM agents WHERE name = ? COLLATE NOCASE')
+        .get(agent) as { session_token: string | null } | undefined;
+      sessionToken = row?.session_token ?? '';
+    } finally {
+      identityDb.close();
+    }
+  }
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? '',
     HOME: home,
@@ -22,6 +34,7 @@ function runCli(home: string, args: string[], agent?: string, cwd?: string): Cli
     SWARM_ID: '',
     SWARM_NAME: '',
     SWARM_AGENT_NAME: agent ?? '',
+    SWARM_SESSION_TOKEN: sessionToken,
     CMUX_SURFACE_ID: '',
     CMUX_WORKSPACE_ID: '',
     TERM_PROGRAM: '',
@@ -753,6 +766,11 @@ describe('WI-3 task ledger CLI', () => {
       ], 'Alice');
       assert.notStrictEqual(noReason.status, 0);
       assert.match(noReason.stderr, /--override.*requires --reason/s);
+
+      const grant = runCli(home, [
+        'grant', 'create', '--op', 'override', '--resource', 'override-gates', '--ttl', '2h',
+      ], 'Alice');
+      assert.strictEqual(grant.status, 0, grant.stderr || grant.stdout);
 
       const overridden = runCli(home, [
         'task', 'close', 'override-gates', '--disposition', 'archive', '--override', '--reason', 'urgent audit handoff',

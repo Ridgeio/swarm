@@ -492,5 +492,6 @@ describe('V1-B static board assets', () => {
     assert.match(boardScript, /'Not established'/);
     assert.match(boardScript, /'Close evidence'/);
     assert.match(boardScript, /'GATE OVERRIDES'/);
+    assert.match(boardScript, /'Grant usage'/);
   });
 });

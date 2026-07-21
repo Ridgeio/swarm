@@ -106,7 +106,22 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
 
-Claim kinds are `code-merged`, `journey-works`, `deploy-healthy`, `analysis`, `decision`, and `probe`. Evidence uses repeatable `--evidence <kind>:<ref>` flags. `swarm run` executes an argv array without a shell, stores the full combined log under `~/.swarm/evidence/<swarm>/<task>/`, prints a bounded summary, and returns the child exit code. `--override --reason <text>` bypasses evidence/Git gates with a `gate_override` audit event.
+Claim kinds are `code-merged`, `journey-works`, `deploy-healthy`, `analysis`, `decision`, and `probe`. Evidence uses repeatable `--evidence <kind>:<ref>` flags. `swarm run` executes an argv array without a shell, stores the full combined log under `~/.swarm/evidence/<swarm>/<task>/`, prints a bounded summary, and returns the child exit code. `--override --reason <text>` also requires a live matching `override` grant and records both grant use and the bypassed gates.
+
+## Grants and escalations
+
+Use typed grants for time-bounded authority and `swarm escalate` for the decision-ready request. A `code-merged` task closing with `--disposition merged` needs a live `merge` grant matching its slug or branch. Resources match exactly, globally with `*`, or by a trailing-prefix wildcard such as `swarm/Foreman/*`.
+
+```bash
+swarm grant create --op merge --resource my-task --ttl 2h --to Alice
+swarm grant list --live
+swarm grant revoke 12
+swarm escalate my-task --question "May this branch merge?" --to Lead
+```
+
+Escalation packets are written under `~/.swarm/briefs/escalations/`; the mailbox carries only the packet path. Future production and spending commands must enforce the same live, matching `prod` or `spend` grant check; no such command exists yet. See [docs/ROUTING.md](docs/ROUTING.md) for when to grant or escalate, and keep credentials out of notes, packets, and evidence as required by [docs/credentials.md](docs/credentials.md).
+
+Trust model: on this trusted, single-operator machine, grants and session tokens add records, expiry, scope, and audit; they do not create cryptographic separation from a malicious local process. Local joins mint a session token and identity-resolving mutation verbs verify the matching session marker. Legacy NULL-token rows remain usable until rejoin. A2A identity remains endpoint-based.
 
 The operating principles are in [docs/philosophy.md](docs/philosophy.md), the ledger contracts are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md), and the claim/evidence contracts are in [docs/design/SWARM-NEXT-V2.md](docs/design/SWARM-NEXT-V2.md).
 
@@ -154,6 +169,12 @@ Task ledger:
         [--outcome inconclusive] [--force-discard]
         [--override --reason <text>]
   swarm run [--task <slug>] -- <cmd> [args...] Capture a full task evidence log
+  swarm grant create --op <op> --resource <r>   Create an expiring scoped grant
+        --ttl <30m|2h|1d> [--to <agent>] [--note <text>]
+  swarm grant list [--live]                     List grants
+  swarm grant revoke <id>                       Revoke a grant
+  swarm escalate <slug> [--question <text>]     Write and send an escalation packet
+        [--to <agent>]
   swarm task list                              List the durable task ledger
   swarm task show <slug>                       Show task facts, events, and decisions
   swarm handoff <slug> --to <agent>            Transfer with a fresh checkpoint brief

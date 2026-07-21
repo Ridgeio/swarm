@@ -16,6 +16,7 @@ const URGENT_MESSAGE_KINDS = ['gate', 'escalation', 'merge-req'] as const;
 const RECENT_DONE_WINDOW_MS = 24 * 60 * 60 * 1_000;
 const TIMELINE_LIMIT = 200;
 const DEBRIS_TREND_LIMIT = 50;
+const GRANT_EXPIRY_SOON_MS = 15 * 60_000;
 
 const REQUIRED_COLUMNS: Record<string, string[]> = {
   swarms: ['id', 'name', 'root_path'],
@@ -34,6 +35,9 @@ const REQUIRED_COLUMNS: Record<string, string[]> = {
   ],
   task_events: [
     'id', 'swarm_id', 'task_id', 'epoch', 'kind', 'actor', 'data', 'created_at',
+  ],
+  grants: [
+    'id', 'swarm_id', 'op', 'resource', 'granted_to', 'granted_by', 'expires_at', 'revoked_at',
   ],
   janitor_status: ['id', 'last_tick_at', 'counters'],
   janitor_findings: [
@@ -119,6 +123,15 @@ export interface BoardGateOverrideData {
   at: string;
 }
 
+export interface BoardGrantUsageData {
+  eventId: number;
+  grantId: number | null;
+  op: string;
+  resource: string;
+  actor: string | null;
+  at: string;
+}
+
 export interface BoardTaskData {
   id: string;
   title: string;
@@ -132,6 +145,7 @@ export interface BoardTaskData {
   evidence: BoardCloseEvidenceData[];
   notEstablished: string | null;
   overrides: BoardGateOverrideData[];
+  grantUsage: BoardGrantUsageData[];
   createdAt: string;
   checkpoint: BoardCheckpointData | null;
   stale: boolean;
@@ -439,6 +453,7 @@ export function collectBoardData(
     let checkpoint: BoardCheckpointData | null = null;
     const evidence: BoardCloseEvidenceData[] = [];
     const overrides: BoardGateOverrideData[] = [];
+    const grantUsage: BoardGrantUsageData[] = [];
     let notEstablished: string | null = null;
     if (available('task_events')) {
       try {
@@ -466,7 +481,7 @@ export function collectBoardData(
           SELECT id, task_id, epoch, kind, actor, data, created_at
           FROM task_events
           WHERE swarm_id = ? AND task_id = ?
-            AND kind IN ('close_evidence', 'closed', 'gate_override')
+            AND kind IN ('close_evidence', 'closed', 'gate_override', 'grant_used')
           ORDER BY id ASC
         `).all(swarmId, task.id) as RawTaskEvent[];
         for (const event of closeEvents) {
@@ -493,6 +508,15 @@ export function collectBoardData(
               actor: event.actor,
               at: event.created_at,
             });
+          } else if (event.kind === 'grant_used') {
+            grantUsage.push({
+              eventId: event.id,
+              grantId: typeof data?.grant_id === 'number' ? data.grant_id : null,
+              op: typeof data?.op === 'string' ? data.op : 'unknown',
+              resource: typeof data?.resource === 'string' ? data.resource : 'unknown',
+              actor: typeof data?.actor === 'string' ? data.actor : event.actor,
+              at: event.created_at,
+            });
           }
         }
       } catch {
@@ -513,6 +537,7 @@ export function collectBoardData(
       evidence,
       notEstablished,
       overrides,
+      grantUsage,
       createdAt: task.created_at,
       checkpoint,
       stale: task.state === 'active' && evidenceAge !== null && evidenceAge > CHECKPOINT_STALE_MINUTES,
@@ -657,12 +682,14 @@ export function collectBoardData(
   if (available('messages', 'message_deliveries')) {
     try {
       const deliveries = database!.prepare(`
-        SELECT m.id, m.kind, m.from_agent, m.body, d.recipient
-        FROM message_deliveries d
-        JOIN messages m ON m.id = d.message_id AND m.swarm_id = d.swarm_id
-        WHERE d.swarm_id = ?
+        SELECT m.id, m.kind, m.from_agent, m.body, COALESCE(d.recipient, m.to_agent) AS recipient
+        FROM messages m
+        LEFT JOIN message_deliveries d
+          ON m.id = d.message_id AND m.swarm_id = d.swarm_id
+        WHERE m.swarm_id = ?
+          AND COALESCE(d.recipient, m.to_agent) IS NOT NULL
           AND d.acked_at IS NULL
-          AND d.status <> 'acked'
+          AND COALESCE(d.status, 'pending') <> 'acked'
           AND m.superseded_by IS NULL
           AND m.kind IN (${URGENT_MESSAGE_KINDS.map(() => '?').join(', ')})
         ORDER BY m.id ASC, d.recipient COLLATE NOCASE ASC
@@ -683,6 +710,37 @@ export function collectBoardData(
       }
     } catch {
       addUnavailable(unavailable, 'messages', 'message_deliveries');
+    }
+  }
+
+  if (available('grants')) {
+    try {
+      const nowIso = new Date(now).toISOString();
+      const soonIso = new Date(now + GRANT_EXPIRY_SOON_MS).toISOString();
+      const grants = database!.prepare(`
+        SELECT id, op, resource, granted_to, expires_at
+        FROM grants
+        WHERE swarm_id = ? AND revoked_at IS NULL
+          AND expires_at > ? AND expires_at < ?
+        ORDER BY expires_at ASC, id ASC
+      `).all(swarmId, nowIso, soonIso) as Array<{
+        id: number;
+        op: string;
+        resource: string;
+        granted_to: string | null;
+        expires_at: string;
+      }>;
+      for (const grant of grants) {
+        const expiresIn = Math.max(0, Math.floor((new Date(grant.expires_at).getTime() - now) / 60_000));
+        needsYou.push({
+          kind: 'grant_expiring',
+          label: `grant #${grant.id} ${grant.op} on ${grant.resource} expires in ${expiresIn}m — ` +
+            `to ${grant.granted_to ?? 'any'}`,
+          refId: String(grant.id),
+        });
+      }
+    } catch {
+      addUnavailable(unavailable, 'grants');
     }
   }
 

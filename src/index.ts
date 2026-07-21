@@ -11,6 +11,7 @@ import {
   findSwarmForCwd,
   forceReap,
   getAgent,
+  getAuthenticatedSelf,
   getOrCreateSwarm,
   getSelf,
   getSwarm,
@@ -96,6 +97,8 @@ import {
   startBoardServer,
   waitForBoardServerStop,
 } from './board-server.js';
+import { createGrant, listGrants, revokeGrant } from './grants.js';
+import { escalateTask } from './escalations.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -197,7 +200,7 @@ function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = fa
   return getOrCreateSwarm(db);
 }
 
-function requireSelf(): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
+function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
   const db = getDb();
   const explicitSwarm = explicitSwarmName ? getSwarm(db, explicitSwarmName) : null;
   if (explicitSwarmName && !explicitSwarm) {
@@ -205,7 +208,9 @@ function requireSelf(): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swar
     process.exit(1);
   }
 
-  const self = getSelf(db, explicitSwarm?.id);
+  const self = authenticate
+    ? getAuthenticatedSelf(db, explicitSwarm?.id)
+    : getSelf(db, explicitSwarm?.id);
   if (!self) {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     const agentName = process.env.SWARM_AGENT_NAME;
@@ -288,6 +293,12 @@ Task Ledger:
     --not-established <text> [--evidence <kind>:<ref>] [--outcome inconclusive]
     [--force-discard] [--override --reason <text>]
   swarm run [--task <slug>] -- <cmd> [args...]     Capture full output as task evidence
+  swarm grant create --op <op> --resource <r>      Create a scoped, expiring grant
+    --ttl <30m|2h|1d> [--to <agent>] [--note <t>]
+  swarm grant list [--live]                        List grants
+  swarm grant revoke <id>                          Revoke a grant
+  swarm escalate <slug> [--question <text>]        Write and send a decision-ready packet
+    [--to <agent>]
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
   swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
@@ -716,7 +727,7 @@ async function main() {
       }
 
       case 'send': {
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
         // Flags may appear anywhere before/among free-text; strip them from the body.
         const interject = hasFlag('--interject') || hasFlag('--now');
@@ -776,7 +787,7 @@ async function main() {
       }
 
       case 'broadcast': {
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm broadcast <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
         const interject = hasFlag('--interject') || hasFlag('--now');
         const kind = requireValidKind(usage);
@@ -806,7 +817,7 @@ async function main() {
       }
 
       case 'ack': {
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf(true);
         const all = hasFlag('--all');
         const rawIds = args.slice(1).filter(arg => arg !== '--all');
         if ((all && rawIds.length > 0) || (!all && rawIds.length === 0)) {
@@ -837,7 +848,7 @@ async function main() {
           console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
           process.exit(1);
         }
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf(true);
         if (subcommand === 'list') {
           const tasks = db.prepare(`
             SELECT id, title, state, owner_agent, lease_epoch, disposition, claim_kind, updated_at
@@ -926,6 +937,16 @@ async function main() {
               : 'none';
             console.log(`  #${item.event.id} reason: ${String(item.data?.reason ?? 'not recorded')}; bypassed: ${gates}`);
           }
+          const grantUsage = parsedEvents.filter(({ event }) => event.kind === 'grant_used');
+          console.log('grant usage:');
+          if (grantUsage.length === 0) console.log('  none');
+          for (const item of grantUsage) {
+            console.log(
+              `  #${item.event.id} grant #${String(item.data?.grant_id ?? 'unknown')} ` +
+              `${String(item.data?.op ?? 'unknown')} on ${String(item.data?.resource ?? 'unknown')} ` +
+              `by ${String(item.data?.actor ?? item.event.actor ?? 'unknown')}`
+            );
+          }
           console.log('events:');
           if (events.length === 0) console.log('  none');
           for (const event of events) {
@@ -1003,6 +1024,90 @@ async function main() {
         console.error(`Unknown task command: ${subcommand}`);
         console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
         process.exit(1);
+        break;
+      }
+
+      case 'grant': {
+        const subcommand = args[1];
+        const usage = 'Usage: swarm grant create --op <merge|prod|spend|override|custom:name> --resource <r> --ttl <30m|2h|1d> [--to <agent>] [--note <text>] | swarm grant list [--live] | swarm grant revoke <id>';
+        if (subcommand === 'create') {
+          const op = getFlag('--op');
+          const resource = getFlag('--resource');
+          const ttl = getFlag('--ttl');
+          if (!op || !resource || !ttl) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf(true);
+          const grant = createGrant(db, self.swarm_id, self.name, {
+            op,
+            resource,
+            ttl,
+            grantedTo: getFlag('--to'),
+            note: getFlag('--note'),
+          });
+          console.log(`Grant #${grant.id} created; expires ${grant.expires_at}.`);
+          break;
+        }
+        const db = getDb();
+        const swarm = resolveSelectedSwarm(db);
+        if (subcommand === 'list') {
+          const rows = listGrants(db, swarm.id, hasFlag('--live'));
+          if (rows.length === 0) {
+            console.log(hasFlag('--live') ? 'No live grants.' : 'No grants recorded.');
+          } else {
+            const now = Date.now();
+            for (const grant of rows) {
+              const status = grant.revoked_at
+                ? `revoked ${grant.revoked_at}`
+                : new Date(grant.expires_at).getTime() <= now
+                  ? `expired ${grant.expires_at}`
+                  : `expires ${grant.expires_at}`;
+              const recipient = grant.granted_to ?? 'any';
+              const note = grant.note ? `; note ${grant.note}` : '';
+              console.log(`#${grant.id} ${grant.op} ${grant.resource} -> ${recipient}; by ${grant.granted_by}; ${status}${note}`);
+            }
+            console.log(`\n${rows.length} grant(s)`);
+          }
+          break;
+        }
+        if (subcommand === 'revoke') {
+          const rawId = args[2];
+          const id = Number(rawId);
+          if (!rawId || !/^\d+$/.test(rawId) || id <= 0 || !Number.isSafeInteger(id)) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const grant = revokeGrant(db, swarm.id, id);
+          if (!grant) {
+            console.error(`Grant #${id} not found in swarm "${swarm.name}".`);
+            process.exit(1);
+          }
+          console.log(`Grant #${grant.id} revoked at ${grant.revoked_at}.`);
+          break;
+        }
+        console.error(usage);
+        process.exit(1);
+        break;
+      }
+
+      case 'escalate': {
+        const slug = args[1];
+        if (!slug) {
+          console.error('Usage: swarm escalate <slug> [--question <text>] [--to <agent>]');
+          process.exit(1);
+        }
+        const { db, self } = requireSelf(true);
+        const result = await escalateTask(db, self.swarm_id, self.name, slug, {
+          question: getFlag('--question'),
+          to: getFlag('--to'),
+        });
+        console.log(`Escalation packet: ${result.briefPath}`);
+        if (result.recipient) {
+          console.log(`Pointer sent to ${result.recipient}; task "${slug}" is awaiting_review.`);
+        } else {
+          console.log(`No active recipient found. Deliver this path manually: ${result.briefPath}`);
+        }
         break;
       }
 

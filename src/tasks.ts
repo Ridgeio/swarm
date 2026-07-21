@@ -6,6 +6,7 @@ import path from 'path';
 import { detectHost } from './hooks.js';
 import { sendMessage } from './mailbox.js';
 import { getAgent } from './registry.js';
+import { findLiveGrant, recordGrantUsed, type Grant } from './grants.js';
 
 export const TASK_LEASE_HOURS = 24;
 export const HANDOFF_FRESH_MINUTES = 60;
@@ -64,7 +65,7 @@ interface TaskEvent {
   created_at: string;
 }
 
-interface GitFacts {
+export interface GitFacts {
   head: string;
   branch: string;
   dirtyTracked: number;
@@ -479,7 +480,7 @@ export async function startTask(
   return result;
 }
 
-function taskGitFacts(task: Task): GitFacts {
+export function taskGitFacts(task: Task): GitFacts {
   if (!task.repo_path) {
     return { head: 'unknown', branch: task.branch ?? 'unknown', dirtyTracked: 0, untracked: 0, unpushed: [] };
   }
@@ -840,6 +841,37 @@ function gitGateFailures(
   return failures;
 }
 
+function closeGrantCommand(op: 'merge' | 'override', slug: string): string {
+  return `swarm grant create --op ${op} --resource ${slug} --ttl 2h`;
+}
+
+function missingCloseGrantMessage(
+  task: Task,
+  actor: string,
+  op: 'merge' | 'override'
+): string {
+  const scope = op === 'merge'
+    ? `task slug "${task.id}" or branch "${task.branch ?? 'none'}"`
+    : `task slug "${task.id}"`;
+  return `Refused task close for "${task.id}": ${actor} requires a live ${op} grant matching ${scope}. ` +
+    `Run exactly: ${closeGrantCommand(op, task.id)}. See docs/ROUTING.md for the grant/escalation decision path.`;
+}
+
+function requireCloseGrant(
+  db: Database.Database,
+  task: Task,
+  actor: string,
+  op: 'merge' | 'override',
+  now?: number
+): Grant {
+  const resources = op === 'merge'
+    ? [task.id, ...(task.branch ? [task.branch] : [])]
+    : [task.id];
+  const match = findLiveGrant(db, task.swarm_id, { op, resources, actor, now });
+  if (!match) throw new Error(missingCloseGrantMessage(task, actor, op));
+  return match.grant;
+}
+
 export async function closeTask(
   db: Database.Database,
   swarmId: string,
@@ -871,6 +903,10 @@ export async function closeTask(
   const authority = requireAuthority(db, swarmId, slug, actor, 'close');
   const task = authority.task;
   const claimKind = effectiveClaimKind(task);
+  if (options.override) requireCloseGrant(db, task, actor, 'override');
+  if (claimKind === 'code-merged' && options.disposition === 'merged') {
+    requireCloseGrant(db, task, actor, 'merge');
+  }
   const evidenceReview = await reviewCloseEvidence(
     db,
     task,
@@ -903,6 +939,16 @@ export async function closeTask(
       return { error: `Task "${slug}" not found in this swarm.` };
     }
 
+    const grantsUsed: Grant[] = [];
+    try {
+      if (options.override) grantsUsed.push(requireCloseGrant(db, current, actor, 'override'));
+      if (effectiveClaimKind(current) === 'code-merged' && options.disposition === 'merged') {
+        grantsUsed.push(requireCloseGrant(db, current, actor, 'merge'));
+      }
+    } catch (error: unknown) {
+      return { error: error instanceof Error ? error.message : String(error) };
+    }
+
     if (current.worktree_path && fs.existsSync(current.worktree_path) && current.repo_path) {
       const removeArgs = ['worktree', 'remove'];
       if (preservedArchive || forcedDiscard || options.override) removeArgs.push('--force');
@@ -920,6 +966,9 @@ export async function closeTask(
     }
     for (const item of evidenceReview.evidence) {
       insertEvent(db, current, 'close_evidence', actor, item, timestamp);
+    }
+    for (const grant of grantsUsed) {
+      recordGrantUsed(db, current, grant, actor, timestamp);
     }
     if (options.override) {
       insertEvent(db, current, 'gate_override', actor, {

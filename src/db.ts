@@ -41,6 +41,9 @@ function ensureLegacyAgentColumns(db: Database.Database): void {
   if (!columns.has('host_agent')) {
     db.exec('ALTER TABLE agents ADD COLUMN host_agent TEXT');
   }
+  if (!columns.has('session_token')) {
+    db.exec('ALTER TABLE agents ADD COLUMN session_token TEXT');
+  }
 }
 
 function createSwarmsTable(db: Database.Database): void {
@@ -77,6 +80,7 @@ function createCurrentTables(db: Database.Database): void {
       agent_type TEXT NOT NULL DEFAULT 'cmux',
       endpoint_url TEXT,
       host_agent TEXT,
+      session_token TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       UNIQUE (swarm_id, name)
     );
@@ -154,6 +158,20 @@ function createCurrentTables(db: Database.Database): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS grants (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      op TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      granted_to TEXT COLLATE NOCASE,
+      granted_by TEXT NOT NULL,
+      note TEXT,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
     CREATE TABLE IF NOT EXISTS janitor_status (
       id INTEGER PRIMARY KEY CHECK (id = 1),
       last_tick_at TEXT NOT NULL,
@@ -210,6 +228,7 @@ function migrateAgents(db: Database.Database): void {
         agent_type TEXT NOT NULL DEFAULT 'cmux',
         endpoint_url TEXT,
         host_agent TEXT,
+        session_token TEXT,
         FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
         UNIQUE (swarm_id, name)
       );
@@ -220,11 +239,11 @@ function migrateAgents(db: Database.Database): void {
       -- the NOCASE unique constraint and leave the migration permanently failing.
       INSERT INTO agents_new (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
       )
       SELECT
         id, '${DEFAULT_SWARM_ID}', name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
       FROM agents a
       WHERE NOT EXISTS (
         SELECT 1 FROM agents b
@@ -346,6 +365,14 @@ function ensureTaskClaimKindColumn(db: Database.Database): void {
   }
 }
 
+function ensureAgentSessionTokenColumn(db: Database.Database): void {
+  if (!tableExists(db, 'agents')) return;
+  const columns = tableColumns(db, 'agents');
+  if (!columns.has('session_token')) {
+    db.exec('ALTER TABLE agents ADD COLUMN session_token TEXT');
+  }
+}
+
 function migrate(db: Database.Database): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -355,6 +382,7 @@ function migrate(db: Database.Database): void {
   ensureMessageKindColumn(db);
   ensureMessageSupersededByColumn(db);
   ensureTaskClaimKindColumn(db);
+  ensureAgentSessionTokenColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);
@@ -365,6 +393,7 @@ function migrate(db: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
     CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_grants_swarm_live ON grants(swarm_id, op, revoked_at, expires_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);
     CREATE INDEX IF NOT EXISTS idx_janitor_findings_state ON janitor_findings(state, kind);
     CREATE INDEX IF NOT EXISTS idx_janitor_snapshots_tick ON janitor_snapshots(tick_at);

@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import { randomUUID } from 'crypto';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -36,11 +36,18 @@ export interface Agent {
   ppid: number;
   joined_at: string;
   last_heartbeat: string;
+  session_token: string | null;
 }
 
 interface SessionMarker {
   swarm_id: string;
   agent_name: string;
+  session_token: string | null;
+}
+
+interface ResolvedSelf {
+  agent: Agent;
+  presentedToken: string | null;
 }
 
 /**
@@ -92,20 +99,63 @@ function readSessionMarker(): SessionMarker | null {
         return {
           swarm_id: parsed.swarm_id || DEFAULT_SWARM_ID,
           agent_name: parsed.agent_name,
+          session_token: typeof parsed.session_token === 'string' ? parsed.session_token : null,
         };
       }
     } catch { /* fall through to legacy marker */ }
   }
 
-  return { swarm_id: DEFAULT_SWARM_ID, agent_name: raw };
+  return { swarm_id: DEFAULT_SWARM_ID, agent_name: raw, session_token: null };
 }
 
-function writeSessionMarker(swarmId: string, agentName: string): void {
+function writeSessionMarker(swarmId: string, agentName: string, sessionToken: string): void {
   const markerPath = getSessionMarkerPath();
   if (!markerPath) return;
 
   fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-  fs.writeFileSync(markerPath, JSON.stringify({ swarm_id: swarmId, agent_name: agentName }, null, 2), 'utf-8');
+  fs.writeFileSync(
+    markerPath,
+    JSON.stringify({ swarm_id: swarmId, agent_name: agentName, session_token: sessionToken }, null, 2),
+    { encoding: 'utf-8', mode: 0o600 }
+  );
+}
+
+function surfaceSessionMarkerPath(surfaceId: string): string {
+  const key = createHash('sha256').update(surfaceId).digest('hex');
+  return path.join(SWARM_DIR, 'sessions', `cmux-${key}.json`);
+}
+
+function readSurfaceSessionMarker(surfaceId: string): SessionMarker | null {
+  const markerPath = surfaceSessionMarkerPath(surfaceId);
+  if (!fs.existsSync(markerPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf-8')) as Partial<SessionMarker>;
+    if (!parsed.agent_name || !parsed.swarm_id) return null;
+    return {
+      swarm_id: parsed.swarm_id,
+      agent_name: parsed.agent_name,
+      session_token: typeof parsed.session_token === 'string' ? parsed.session_token : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function writeSurfaceSessionMarker(agent: Agent): void {
+  if (!agent.session_token) return;
+  const markerPath = surfaceSessionMarkerPath(agent.surface_id);
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  fs.writeFileSync(markerPath, JSON.stringify({
+    swarm_id: agent.swarm_id,
+    agent_name: agent.name,
+    session_token: agent.session_token,
+  }, null, 2), { encoding: 'utf-8', mode: 0o600 });
+}
+
+function removeSurfaceSessionMarker(swarmId: string, surfaceId: string): void {
+  const markerPath = surfaceSessionMarkerPath(surfaceId);
+  const marker = readSurfaceSessionMarker(surfaceId);
+  if (marker?.swarm_id === swarmId) fs.rmSync(markerPath, { force: true });
 }
 
 function removeSessionMarker(swarmId: string, agentName: string): void {
@@ -208,6 +258,7 @@ export function joinAgent(
   hostAgent?: HostAgentKind | null
 ): Agent {
   const id = randomUUID();
+  const sessionToken = agentType === 'a2a' ? null : randomBytes(16).toString('hex');
   const now = nowIso();
   const host = hostAgent ?? null;
 
@@ -225,10 +276,10 @@ export function joinAgent(
     db.prepare(`
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null, host);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null, host, sessionToken);
 
     db.prepare(`
       INSERT OR IGNORE INTO inbox_cursors (swarm_id, agent_name, last_read_id)
@@ -241,7 +292,7 @@ export function joinAgent(
   });
   tx.immediate();
 
-  return {
+  const agent: Agent = {
     id,
     swarm_id: swarmId,
     name,
@@ -254,7 +305,12 @@ export function joinAgent(
     ppid,
     joined_at: now,
     last_heartbeat: now,
+    session_token: sessionToken,
   };
+  if (agentType === 'cmux' && process.env.CMUX_SURFACE_ID === surfaceId) {
+    writeSurfaceSessionMarker(agent);
+  }
+  return agent;
 }
 
 export function joinA2AAgent(
@@ -274,6 +330,7 @@ export function joinA2AAgent(
 
 export function leaveAgent(db: Database.Database, swarmId: string, surfaceId: string): boolean {
   const result = db.prepare('DELETE FROM agents WHERE swarm_id = ? AND surface_id = ?').run(swarmId, surfaceId);
+  if (result.changes > 0) removeSurfaceSessionMarker(swarmId, surfaceId);
   return result.changes > 0;
 }
 
@@ -310,7 +367,8 @@ export function joinHeadlessAgent(
     description, 'headless', undefined, options.hostAgent
   );
   if (options.trackSession) {
-    writeSessionMarker(swarmId, name);
+    if (!agent.session_token) throw new Error(`Failed to mint a session token for headless agent "${name}".`);
+    writeSessionMarker(swarmId, name, agent.session_token);
   }
   return agent;
 }
@@ -329,7 +387,7 @@ export function leaveHeadlessAgent(
   return result.changes > 0;
 }
 
-export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
+function resolveSelf(db: Database.Database, swarmId?: string): ResolvedSelf | null {
   const envSwarmId = process.env.SWARM_ID;
   const envSwarmName = process.env.SWARM_NAME;
   let resolvedSwarmId = swarmId || envSwarmId;
@@ -345,7 +403,17 @@ export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
       : 'SELECT * FROM agents WHERE surface_id = ? ORDER BY joined_at DESC LIMIT 1';
     const params = resolvedSwarmId ? [resolvedSwarmId, surfaceId] : [surfaceId];
     const bySurface = db.prepare(sql).get(...params) as Agent | undefined;
-    if (bySurface) return bySurface;
+    if (bySurface) {
+      const marker = readSurfaceSessionMarker(surfaceId);
+      return {
+        agent: bySurface,
+        presentedToken:
+          marker?.swarm_id === bySurface.swarm_id &&
+          marker.agent_name.toLowerCase() === bySurface.name.toLowerCase()
+            ? marker.session_token
+            : null,
+      };
+    }
     // No Cmux agent owns this surface — fall through to the headless resolution paths so an
     // agent that joined with `--headless` from inside a Cmux tab can still find itself.
   }
@@ -358,21 +426,53 @@ export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
       ? "SELECT * FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type IN ('headless', 'a2a') ORDER BY joined_at DESC LIMIT 1"
       : "SELECT * FROM agents WHERE name = ? COLLATE NOCASE AND agent_type IN ('headless', 'a2a') ORDER BY joined_at DESC LIMIT 1";
     const params = resolvedSwarmId ? [resolvedSwarmId, agentName] : [agentName];
-    return db.prepare(sql).get(...params) as Agent | undefined ?? null;
+    const byName = db.prepare(sql).get(...params) as Agent | undefined;
+    if (!byName) return null;
+    return {
+      agent: byName,
+      presentedToken: byName.agent_type === 'a2a' ? null : process.env.SWARM_SESSION_TOKEN ?? null,
+    };
   }
 
   const marker = readSessionMarker();
   if (marker) {
     const markerSwarmId = resolvedSwarmId || marker.swarm_id;
-    return db.prepare(`
+    const byMarker = db.prepare(`
       SELECT * FROM agents
       WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
       ORDER BY joined_at DESC
       LIMIT 1
-    `).get(markerSwarmId, marker.agent_name) as Agent | undefined ?? null;
+    `).get(markerSwarmId, marker.agent_name) as Agent | undefined;
+    if (!byMarker) return null;
+    return { agent: byMarker, presentedToken: marker.session_token };
   }
 
   return null;
+}
+
+export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
+  return resolveSelf(db, swarmId)?.agent ?? null;
+}
+
+function tokensMatch(expected: string, presented: string | null): boolean {
+  if (!presented) return false;
+  const expectedBytes = Buffer.from(expected, 'utf-8');
+  const presentedBytes = Buffer.from(presented, 'utf-8');
+  if (expectedBytes.length !== presentedBytes.length) return false;
+  return timingSafeEqual(expectedBytes, presentedBytes);
+}
+
+export function getAuthenticatedSelf(db: Database.Database, swarmId?: string): Agent | null {
+  const resolved = resolveSelf(db, swarmId);
+  if (!resolved) return null;
+  const { agent, presentedToken } = resolved;
+  // Existing A2A endpoint identity remains unchanged. Legacy local rows with a
+  // NULL token are grandfathered until their next join mints one.
+  if (agent.agent_type === 'a2a' || agent.session_token === null) return agent;
+  if (!tokensMatch(agent.session_token, presentedToken)) {
+    throw new Error(`identity could not be authenticated for ${agent.name} — rejoin with swarm join ${agent.name}`);
+  }
+  return agent;
 }
 
 export function getAgent(db: Database.Database, swarmId: string, name: string): Agent | null {

@@ -19,10 +19,23 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
     PATH: process.env.PATH ?? '',
     HOME: home,
     // Start each call from a clean identity so nothing leaks in from the test runner.
-    SWARM_ID: '', SWARM_NAME: '', SWARM_AGENT_NAME: '',
+    SWARM_ID: '', SWARM_NAME: '', SWARM_AGENT_NAME: '', SWARM_SESSION_TOKEN: '',
     CMUX_SURFACE_ID: '', CMUX_WORKSPACE_ID: '', TERM_PROGRAM: '',
     ...env,
   };
+  if (childEnv.SWARM_AGENT_NAME && !Object.prototype.hasOwnProperty.call(env, 'SWARM_SESSION_TOKEN')) {
+    const dbPath = join(home, '.swarm', 'swarm.db');
+    if (existsSync(dbPath)) {
+      const identityDb = new SQLite(dbPath, { readonly: true });
+      try {
+        const row = identityDb.prepare('SELECT session_token FROM agents WHERE name = ? COLLATE NOCASE')
+          .get(childEnv.SWARM_AGENT_NAME) as { session_token: string | null } | undefined;
+        childEnv.SWARM_SESSION_TOKEN = row?.session_token ?? '';
+      } finally {
+        identityDb.close();
+      }
+    }
+  }
   try {
     const stdout = execFileSync('node', ['--import', 'tsx', INDEX, ...args], {
       encoding: 'utf-8', env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],

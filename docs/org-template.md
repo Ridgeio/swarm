@@ -25,7 +25,8 @@ Rules here are the prompt-space layer. Wherever a rule has a code enforcement (m
 - **MERGE-REQ format** (send ONLY when every clause is already true):
   `MERGE-REQ #<PR> @<exact-sha> — CI green (run <id>), review PASS @<same-sha>, mergeable clean.`
 - **Prod gate:** migrations, env, promotions, data mutations — lead executes, owner-visible.
-- **Task gate (⚙ WI-3):** `swarm task close` refuses while unpushed/dirty/untracked work exists. A completion claim without its artifact is an ack, not a fact.
+- **Task gate (⚙ WI-3, T1):** `swarm task close` refuses while unpushed/dirty/untracked work exists, and refuses evidence that doesn't match the task's claim kind; every close states its evidence ceiling (`--not-established`). A completion claim without its artifact is an ack, not a fact.
+- **Grant gate (⚙ T2):** closing as *merged* and any `--override` require a live, expiring grant (`swarm grant create --op merge|override --resource <task|branch> --ttl <t>`); every use is audited. Approvals are records with scope and expiry, not chat memories. Request one with `swarm escalate <task>` — the packet carries the state, evidence, and the one question, so the operator decides without reconstructing your trajectory.
 
 ## Messaging rules (the bus is small — P4)
 

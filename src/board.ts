@@ -96,7 +96,7 @@ function branchFacts(task: BoardTaskData): string {
 
 function renderNeedsYou(data: BoardData): string[] | null {
   if (isUnavailable(data, [
-    'messages', 'message_deliveries', 'tasks', 'task_events', 'janitor_status',
+    'messages', 'message_deliveries', 'tasks', 'task_events', 'grants', 'janitor_status',
   ])) return null;
   return data.needsYou.length > 0
     ? data.needsYou.map(item => item.label)

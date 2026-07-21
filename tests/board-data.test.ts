@@ -414,7 +414,7 @@ describe('V1-A shared board data projection', () => {
       const data = collectBoardData(empty, 'legacy', { now: NOW });
       assert.deepStrictEqual(data.unavailable, [
         'swarms', 'agents', 'messages', 'message_deliveries', 'tasks',
-        'task_events', 'janitor_status', 'janitor_findings', 'janitor_snapshots',
+        'task_events', 'grants', 'janitor_status', 'janitor_findings', 'janitor_snapshots',
       ]);
       assert.deepStrictEqual(data.swarm, { id: 'legacy', name: 'legacy' });
       assert.deepStrictEqual(data.agents, []);

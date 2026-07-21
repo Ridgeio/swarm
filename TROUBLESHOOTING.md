@@ -169,7 +169,7 @@ Every close, including an override, must type `--not-established "<text>"`; use 
 
 ## Task close refuses because Git state is not preserved
 
-`task close` has an exact-count preservation gate. The error reports all three blocking counts: `unpushed commits: N, dirty tracked files: N, untracked files: N`. For `pr` or `merged`, the recorded branch tip must also be reachable from a remote ref.
+`task close` has an exact-count preservation gate. The error reports all three blocking counts: `unpushed commits: N, dirty tracked files: N, untracked files: N`. For `pr`, the recorded branch tip must also be reachable from a remote ref; a `code-merged` task recorded as `merged` must pass the stricter default-branch check below.
 
 The normal fix is to push the branch and clean or commit the worktree. The explicit escape hatches are:
 
@@ -183,6 +183,12 @@ swarm task close auth-refresh --disposition archive --not-established "none"
 # destructive intent, double-confirmed:
 swarm task close auth-refresh --disposition discard --force-discard --not-established "none"
 ```
+
+## close refused: commit not on default branch
+
+For a `code-merged` claim, `--disposition merged` compares the source SHA with origin's resolved default-branch ref and target SHA. A pushed feature branch does not satisfy this gate: have the operator merge and push the default branch, fetch that branch in the task repository if its remote-tracking ref is stale, then retry `swarm task close`.
+
+For a local or `file://` remote, do the merge in the operator's default-branch checkout and push it back to `origin`; the refusal's source SHA, target ref, and target SHA show exactly which comparison still fails.
 
 ---
 

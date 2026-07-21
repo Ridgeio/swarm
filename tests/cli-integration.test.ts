@@ -96,6 +96,72 @@ describe('cli integration', () => {
     assert.match(who.stdout, /Type: cmux/);
   });
 
+  test('--force-surface takes over a different cmux name with a loud audit line', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'swarm-surface-claim-'));
+    const fixtureHome = join(fixture, 'home');
+    const fixturePath = fakeUnavailableCmuxPath(fixture);
+    const cmuxLog = join(fixture, 'cmux.log');
+    const env = {
+      PATH: fixturePath,
+      SWARM_TEST_CMUX_LOG: cmuxLog,
+      CMUX_SURFACE_ID: 'surface-shared',
+      CMUX_WORKSPACE_ID: 'workspace-shared',
+    };
+    try {
+      const lead = runCli(fixtureHome, ['join', 'Lead'], env);
+      assert.strictEqual(lead.status, 0, lead.stderr || lead.stdout);
+
+      const refused = runCli(fixtureHome, ['join', 'Child'], env);
+      assert.notStrictEqual(refused.status, 0);
+      assert.match(refused.stderr, /already registered as agent "Lead"/);
+      assert.match(refused.stderr, /join with --headless/);
+      assert.match(refused.stderr, /--force-surface/);
+
+      const forced = runCli(fixtureHome, ['join', 'Child', '--force-surface'], env);
+      assert.strictEqual(forced.status, 0, forced.stderr || forced.stdout);
+      assert.match(
+        forced.stderr,
+        /SURFACE TAKEOVER: "Child" replaced "Lead" on Cmux surface "surface-shared" via --force-surface/
+      );
+      const db = new DatabaseSync(join(fixtureHome, '.swarm', 'swarm.db'), { readOnly: true });
+      const rows = db.prepare('SELECT name, surface_id FROM agents').all() as Array<{ name: string; surface_id: string }>;
+      assert.deepStrictEqual(rows.map(row => ({ ...row })), [{ name: 'Child', surface_id: 'surface-shared' }]);
+      db.close();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test('reap --name --force removes a same-surface ghost by its registered name', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'swarm-reap-name-'));
+    const fixtureHome = join(fixture, 'home');
+    try {
+      const joined = runCli(fixtureHome, ['join', 'Ghost', '--headless'], { SWARM_AGENT_NAME: 'Ghost' });
+      assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
+      const reaped = runCli(fixtureHome, ['reap', '--name', 'ghost', '--force']);
+      assert.strictEqual(reaped.status, 0, reaped.stderr || reaped.stdout);
+      assert.match(reaped.stdout, /Force-reaped "Ghost" \(headless\)/);
+      const db = new DatabaseSync(join(fixtureHome, '.swarm', 'swarm.db'), { readOnly: true });
+      assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM agents').get() as any).n, 0);
+      db.close();
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test('inbox --wait reports timeout distinctly and exits zero', () => {
+    const fixtureHome = mkdtempSync(join(tmpdir(), 'swarm-inbox-wait-cli-'));
+    try {
+      const joined = runCli(fixtureHome, ['join', 'Waiter', '--headless'], { SWARM_AGENT_NAME: 'Waiter' });
+      assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
+      const waited = runCli(fixtureHome, ['inbox', '--wait', '0'], { SWARM_AGENT_NAME: 'Waiter' });
+      assert.strictEqual(waited.status, 0, waited.stderr || waited.stdout);
+      assert.strictEqual(waited.stdout, 'Inbox wait timed out after 0 second(s); no new messages.\n');
+    } finally {
+      rmSync(fixtureHome, { recursive: true, force: true });
+    }
+  });
+
   test('a headless holder is never auto-evicted — reclaim is --force only, even when stale', () => {
     const j1 = runCli(home, ['join', 'Qux', '--headless'], { SWARM_AGENT_NAME: 'Qux' });
     assert.strictEqual(j1.status, 0, j1.stderr || j1.stdout);

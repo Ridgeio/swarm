@@ -84,6 +84,17 @@ export interface HeadlessSessionOptions {
   trackSession?: boolean;
 }
 
+export interface JoinAgentOptions {
+  forceSurface?: boolean;
+}
+
+export interface JoinedAgent extends Agent {
+  surface_takeover?: {
+    prior_name: string;
+    surface_id: string;
+  };
+}
+
 export function captureWorkerVersion(
   host: HostAgentKind | null,
   runner: WorkerVersionRunner = execFileSync
@@ -297,8 +308,9 @@ export function joinAgent(
   agentType: AgentType = 'cmux',
   endpointUrl?: string,
   hostAgent?: HostAgentKind | null,
-  versionRunner?: WorkerVersionRunner
-): Agent {
+  versionRunner?: WorkerVersionRunner,
+  options: JoinAgentOptions = {}
+): JoinedAgent {
   const id = randomUUID();
   const sessionToken = agentType === 'a2a' ? null : randomBytes(16).toString('hex');
   const now = nowIso();
@@ -307,6 +319,7 @@ export function joinAgent(
     ? null
     : captureWorkerVersion(host, versionRunner);
 
+  let surfaceTakeover: JoinedAgent['surface_takeover'];
   withImmediateTransaction(db, () => {
     const existing = getAgent(db, swarmId, name);
     if (existing && existing.surface_id !== surfaceId) {
@@ -314,6 +327,31 @@ export function joinAgent(
     }
 
     if (agentType === 'cmux') {
+      const surfaceOwners = db.prepare(`
+        SELECT * FROM agents
+        WHERE swarm_id = ? AND surface_id = ? AND agent_type = 'cmux'
+          AND name != ? COLLATE NOCASE
+        ORDER BY joined_at DESC
+      `).all(swarmId, surfaceId, name) as unknown as Agent[];
+      const surfaceOwner = surfaceOwners[0];
+      if (surfaceOwner && !options.forceSurface) {
+        throw new Error(
+          `Cmux surface "${surfaceId}" is already registered as agent "${surfaceOwner.name}" in this swarm. ` +
+          'Child or scripted processes should join with --headless. ' +
+          'To take over this surface explicitly, re-run with --force-surface.'
+        );
+      }
+      if (surfaceOwner) {
+        db.prepare(`
+          DELETE FROM agents
+          WHERE swarm_id = ? AND surface_id = ? AND agent_type = 'cmux'
+            AND name != ? COLLATE NOCASE
+        `).run(swarmId, surfaceId, name);
+        surfaceTakeover = {
+          prior_name: surfaceOwners.map(owner => owner.name).join(', '),
+          surface_id: surfaceId,
+        };
+      }
       db.prepare("DELETE FROM agents WHERE surface_id = ? AND swarm_id != ? AND agent_type = 'cmux'")
         .run(surfaceId, swarmId);
     }
@@ -359,7 +397,7 @@ export function joinAgent(
   if (agentType === 'cmux' && process.env.CMUX_SURFACE_ID === surfaceId) {
     writeSurfaceSessionMarker(agent);
   }
-  return agent;
+  return surfaceTakeover ? { ...agent, surface_takeover: surfaceTakeover } : agent;
 }
 
 export function joinA2AAgent(

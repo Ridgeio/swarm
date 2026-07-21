@@ -15,6 +15,7 @@ import {
   HOOK_INJECT_COLLAPSE_COUNT,
   recordHookInjections,
   sendMessage,
+  waitForInbox,
 } from '../src/mailbox.js';
 import {
   getOrCreateSwarm,
@@ -212,6 +213,43 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
       { message_id: secondId, status: 'acked' },
     ]);
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob'), []);
+  });
+
+  test('inbox wait polls with an injected clock until a message arrives and reports timeout distinctly', async () => {
+    joinHeadlessAgent(db, SWARM_ID, 'Bob');
+    let now = 0;
+    const arrivals: number[] = [];
+    const sleeps: number[] = [];
+    const arrived = await waitForInbox(db, SWARM_ID, 'Bob', {
+      timeoutSeconds: 10,
+      now: () => now,
+      sleep: async milliseconds => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+        if (now === 4_000) arrivals.push(insertMessage('Alice', 'Bob', 'arrived while waiting'));
+      },
+    });
+    assert.strictEqual(arrived.timedOut, false);
+    assert.deepStrictEqual(arrived.messages.map(message => message.id), arrivals);
+    assert.deepStrictEqual(sleeps, [2_000, 2_000]);
+    assert.strictEqual(cursor('Bob'), arrivals[0], 'the normal wait path acknowledges what it returns');
+    assert.strictEqual(
+      (db.prepare('SELECT status FROM message_deliveries WHERE message_id = ?').get(arrivals[0]) as any).status,
+      'acked'
+    );
+
+    now = 0;
+    sleeps.length = 0;
+    const timedOut = await waitForInbox(db, SWARM_ID, 'Bob', {
+      timeoutSeconds: 5,
+      now: () => now,
+      sleep: async milliseconds => {
+        sleeps.push(milliseconds);
+        now += milliseconds;
+      },
+    });
+    assert.deepStrictEqual(timedOut, { messages: [], timedOut: true });
+    assert.deepStrictEqual(sleeps, [2_000, 2_000, 1_000]);
   });
 
   test('peek, recent, and kind-filtered reads never acknowledge messages', () => {

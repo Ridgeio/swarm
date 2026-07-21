@@ -339,7 +339,12 @@ describe('T4 observer hardening and agent surfaces', () => {
 
     const rendered = renderAgentHelp();
     const lines = rendered.split('\n');
-    assert.ok(lines.slice(0, -1).every(line => line.length <= 60), `overlong line: ${lines.find(line => line.length > 60)}`);
+    const closeTeaching = 'close records a disposition; it never performs a merge — landing happens via your operator/gates';
+    assert.ok(rendered.includes(closeTeaching));
+    assert.ok(
+      lines.slice(0, -1).filter(line => line !== closeTeaching).every(line => line.length <= 60),
+      `overlong line: ${lines.find(line => line.length > 60 && line !== closeTeaching)}`
+    );
     const footer = lines.at(-1)!;
     assert.ok(path.isAbsolute(footer), footer);
     assert.ok(fs.existsSync(footer), footer);
@@ -354,6 +359,13 @@ describe('T4 observer hardening and agent surfaces', () => {
     const cli = runCli(os.tmpdir(), ['help', '--agent']);
     assert.strictEqual(cli.status, 0, cli.stderr);
     assert.strictEqual(cli.stdout.trimEnd(), rendered);
+
+    const readme = fs.readFileSync(path.resolve(path.dirname(INDEX_SOURCE), '..', 'README.md'), 'utf-8');
+    assert.match(readme, /`--disposition merged` verifies that the task commit is reachable from origin's default branch/);
+    assert.match(readme, /With a local `file:\/\/` remote, the operator merges in the default-branch checkout and pushes that branch/);
+    const troubleshooting = fs.readFileSync(path.resolve(path.dirname(INDEX_SOURCE), '..', 'TROUBLESHOOTING.md'), 'utf-8');
+    assert.match(troubleshooting, /^## close refused: commit not on default branch$/m);
+    assert.match(troubleshooting, /source SHA, target ref, and target SHA/);
   });
 
   test('harness-review renders all events and gates its dated skeleton until filled', () => {

@@ -56,7 +56,7 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'inbox', group: 'messaging', line: 'inbox — read queued messages' },
   { command: 'redeliver', group: 'messaging', line: 'redeliver — retry pending pushes' },
 
-  { command: 'task', group: 'tasks+evidence', line: 'task — start, checkpoint, show, list, close' },
+  { command: 'task', group: 'tasks+evidence', line: 'task — start, checkpoint, show, list, close, reopen' },
   { command: 'run', group: 'tasks+evidence', line: 'run — capture a task evidence log' },
   { command: 'handoff', group: 'tasks+evidence', line: 'handoff — transfer task authority' },
   { command: 'decision', group: 'tasks+evidence', line: 'decision — record a durable decision' },
@@ -90,6 +90,7 @@ export function renderAgentHelp(): string {
         return `claim ${claimKind} → ${required}`;
       }));
       lines.push('claim change: task start <slug> --claim <kind> [--takeover]');
+      lines.push('close records a disposition; it never performs a merge — landing happens via your operator/gates');
     }
   }
   if (fs.existsSync(ROUTING_DOC_PATH)) lines.push(ROUTING_DOC_PATH);

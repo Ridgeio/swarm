@@ -43,6 +43,7 @@ import {
   MESSAGE_KINDS,
   recordHookInjections,
   sendMessage,
+  waitForInbox,
 } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
@@ -74,6 +75,7 @@ import {
   getTask,
   getActiveTaskHookLines,
   handoffTask,
+  reopenTask,
   recordDecision,
   runTaskCommand,
   startTask,
@@ -300,7 +302,9 @@ Swarm Management:
 
 Agent Management:
   swarm join <name> [--description <text>]        Register in the selected swarm
-    [--headless] [--push] [--force] [--root <path>]  Force headless / Warp push / reclaim name / set root
+    [--headless] [--push] [--force] [--force-surface]
+    [--root <path>]                                  Force headless / Warp push / reclaim name /
+                                                     take surface / set root
   swarm leave                                      Deregister from the current swarm
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>] [--force]
@@ -320,6 +324,7 @@ Communication:
     [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
     [--supersedes <msg-id>]                           escalation, ack, gate, handoff)
   swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
+    [--wait <seconds>]
     [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
                                                       --recent N replays last N regardless of cursor;
                                                       --kind filters and never advances the cursor)
@@ -335,6 +340,8 @@ Task Ledger:
   swarm task close <slug> --disposition <kind>     Close with pr|merged|archive|discard evidence
     --not-established <text> [--evidence <kind>:<ref>] [--outcome inconclusive]
     [--force-discard] [--override --reason <text>]
+  swarm task reopen <slug> --reason <text>         Reactivate done/abandoned work
+    [--takeover]
   swarm run [--task <slug>] -- <cmd> [args...]     Capture full output as task evidence
   swarm grant create --op <op> --resource <r>      Create a scoped, expiring grant
     --ttl <30m|2h|1d> [--to <agent>] [--note <t>]
@@ -557,7 +564,7 @@ async function main() {
       case 'join': {
         const name = args[1];
         if (!name) {
-          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--force] [--swarm <name>]');
+          console.error('Usage: swarm join <name> [--description <text>] [--headless] [--push] [--force] [--force-surface] [--swarm <name>]');
           process.exit(1);
         }
         try {
@@ -570,6 +577,11 @@ async function main() {
         const headless = hasFlag('--headless');
         const pushEnabled = hasFlag('--push');
         const force = hasFlag('--force');
+        const forceSurface = hasFlag('--force-surface');
+        if (headless && forceSurface) {
+          console.error('--force-surface requires a resolved Cmux surface; remove --headless or use --force to reclaim a headless name.');
+          process.exit(1);
+        }
         const description = getFlag('--description');
         const db = getDb();
         const swarm = explicitSwarmName
@@ -602,13 +614,23 @@ async function main() {
         } else {
           const { surfaceId, workspaceId } = identify();
           if (!surfaceId) {
+            if (forceSurface) {
+              console.error('--force-surface requires CMUX_SURFACE_ID to resolve; child or scripted processes should join with --headless.');
+              process.exit(1);
+            }
             joinAsHeadless(db, swarm, name, description, pushEnabled);
           } else {
             const host = detectHost();
             const agent = joinAgent(
               db, swarm.id, name, surfaceId, workspaceId, process.ppid,
-              description, 'cmux', undefined, host
+              description, 'cmux', undefined, host, undefined, { forceSurface }
             );
+            if (agent.surface_takeover) {
+              console.warn(
+                `SURFACE TAKEOVER: "${name}" replaced "${agent.surface_takeover.prior_name}" ` +
+                `on Cmux surface "${agent.surface_takeover.surface_id}" via --force-surface.`
+              );
+            }
             renameTab(surfaceId, `${swarm.name}/${name}`, workspaceId);
             // Refresh host session files (critical for Codex: stale
             // ~/.codex/swarm-session.md otherwise points at a previous agent name).
@@ -902,7 +924,7 @@ async function main() {
         const subcommand = args[1];
         const slug = args[2];
         if (!subcommand) {
-          console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
+          console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
           process.exit(1);
         }
         const { db, self } = requireSelf(true);
@@ -1032,7 +1054,7 @@ async function main() {
           break;
         }
         if (!slug) {
-          console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
+          console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
           process.exit(1);
         }
         if (subcommand === 'start') {
@@ -1081,11 +1103,30 @@ async function main() {
             override: hasFlag('--override'),
             reason: getFlag('--reason'),
           });
-          console.log(`Task "${slug}" closed as ${task.disposition}. Branch ref kept; task worktree removed.`);
+          const verified = task.close_verification
+            ? ` (verified: ${task.close_verification.sourceSha} reachable from ${task.close_verification.targetRef})`
+            : '';
+          console.log(`Task "${slug}" disposition recorded: ${task.disposition}${verified}. Branch ref kept; task worktree removed.`);
+          break;
+        }
+        if (subcommand === 'reopen') {
+          const reason = getFlag('--reason');
+          if (!reason) {
+            console.error('Usage: swarm task reopen <slug> --reason <text> [--takeover]');
+            process.exit(1);
+          }
+          const result = await reopenTask(db, self.swarm_id, self.name, slug, {
+            reason,
+            takeover: hasFlag('--takeover'),
+          });
+          console.log(
+            `Task "${slug}" reopened by ${self.name} at lease epoch ${result.task.lease_epoch}; ` +
+            `prior disposition: ${result.priorDisposition ?? 'none'}.`
+          );
           break;
         }
         console.error(`Unknown task command: ${subcommand}`);
-        console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
+        console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
         process.exit(1);
         break;
       }
@@ -1487,7 +1528,7 @@ async function main() {
 
       case 'inbox': {
         const { db, self } = requireSelf();
-        const usage = 'Usage: swarm inbox [--peek|--unread|--recent [N]] [--kind <kind>]';
+        const usage = 'Usage: swarm inbox [--peek|--unread|--recent [N]] [--kind <kind>] [--wait <seconds>]';
         // --unread: common agent habit; same as default (show unread, advance cursor).
         // --peek: show without advancing.
         // --recent [N]: replay last N messages (default 10) IGNORING the read
@@ -1496,6 +1537,15 @@ async function main() {
         // the cursor (they'd skip past unfiltered messages that were never shown).
         const kind = requireValidKind(usage);
         const kindPrefix = (msgKind: string | null) => msgKind ? `[${msgKind}] ` : '';
+        const waitRaw = getFlag('--wait');
+        if (hasFlag('--wait') && (!waitRaw || !/^(?:0|[1-9]\d*)(?:\.\d+)?$/.test(waitRaw))) {
+          console.error(usage);
+          process.exit(1);
+        }
+        if (hasFlag('--recent') && hasFlag('--wait')) {
+          console.error(`${usage}\n--wait cannot be combined with --recent because recent is a historical replay.`);
+          process.exit(1);
+        }
         if (hasFlag('--recent')) {
           const limitRaw = getFlag('--recent');
           const limit = limitRaw && /^\d+$/.test(limitRaw) ? parseInt(limitRaw, 10) : 10;
@@ -1513,9 +1563,19 @@ async function main() {
           break;
         }
         const peek = hasFlag('--peek');
-        const messages = getInbox(db, self.swarm_id, self.name, peek || !!kind, kind);
+        const waitResult = waitRaw === undefined
+          ? null
+          : await waitForInbox(db, self.swarm_id, self.name, {
+              timeoutSeconds: Number(waitRaw),
+              peek,
+              kind,
+            });
+        const messages = waitResult?.messages
+          ?? getInbox(db, self.swarm_id, self.name, peek || !!kind, kind);
         if (messages.length === 0) {
-          if (kind) {
+          if (waitResult?.timedOut) {
+            console.log(`Inbox wait timed out after ${waitRaw} second(s); no new messages.`);
+          } else if (kind) {
             console.log(`No new "${kind}" messages (kind filter — cursor unchanged).`);
           } else {
             // Zero unread + recent traffic means delivery state or the legacy cursor

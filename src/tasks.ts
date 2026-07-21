@@ -73,6 +73,22 @@ export interface GitFacts {
   unpushed: string[];
 }
 
+export interface DefaultBranchTarget {
+  ref: string;
+  sha: string;
+  resolution: 'origin-head' | 'remote-head' | 'main' | 'master';
+}
+
+export interface MergedVerification {
+  sourceSha: string;
+  targetRef: string;
+  targetSha: string;
+}
+
+export interface CloseTaskResult extends Task {
+  close_verification?: MergedVerification;
+}
+
 interface AuthorityCheck {
   task?: Task;
   epoch?: number;
@@ -91,6 +107,17 @@ export interface StartTaskResult {
   task: Task;
   eventKind: 'started' | 'claimed';
   previousOwner: string | null;
+}
+
+export interface ReopenTaskOptions {
+  reason: string;
+  takeover?: boolean;
+}
+
+export interface ReopenTaskResult {
+  task: Task;
+  previousOwner: string | null;
+  priorDisposition: TaskDisposition | null;
 }
 
 export interface CheckpointResult {
@@ -167,6 +194,53 @@ function tryGit(cwd: string, args: string[]): string | null {
   } catch {
     return null;
   }
+}
+
+export type GitQueryRunner = (cwd: string, args: string[]) => string | null;
+
+function normalizeRemoteTrackingRef(ref: string): string | null {
+  const trimmed = ref.trim();
+  if (trimmed.startsWith('refs/remotes/')) return trimmed.slice('refs/remotes/'.length);
+  if (trimmed.startsWith('refs/heads/')) return `origin/${trimmed.slice('refs/heads/'.length)}`;
+  if (trimmed.startsWith('origin/')) return trimmed;
+  return null;
+}
+
+function resolveLocalTarget(
+  repoPath: string,
+  ref: string,
+  resolution: DefaultBranchTarget['resolution'],
+  git: GitQueryRunner
+): DefaultBranchTarget | null {
+  const sha = git(repoPath, ['rev-parse', '--verify', `${ref}^{commit}`])?.trim();
+  return sha ? { ref, sha, resolution } : null;
+}
+
+/** Resolve origin's default branch without guessing until both HEAD mechanisms fail. */
+export function resolveDefaultBranchTarget(
+  repoPath: string,
+  git: GitQueryRunner = tryGit
+): DefaultBranchTarget | null {
+  const localHead = git(repoPath, ['symbolic-ref', 'refs/remotes/origin/HEAD']);
+  const localHeadRef = localHead ? normalizeRemoteTrackingRef(localHead) : null;
+  if (localHeadRef) {
+    const target = resolveLocalTarget(repoPath, localHeadRef, 'origin-head', git);
+    if (target) return target;
+  }
+
+  const remoteHead = git(repoPath, ['ls-remote', '--symref', 'origin', 'HEAD']);
+  const remoteSymref = remoteHead
+    ?.split('\n')
+    .map(line => /^ref:\s+(refs\/heads\/[^\s]+)\s+HEAD$/.exec(line.trim()))
+    .find((match): match is RegExpExecArray => match !== null)?.[1];
+  const remoteHeadRef = remoteSymref ? normalizeRemoteTrackingRef(remoteSymref) : null;
+  if (remoteHeadRef) {
+    const target = resolveLocalTarget(repoPath, remoteHeadRef, 'remote-head', git);
+    if (target) return target;
+  }
+
+  return resolveLocalTarget(repoPath, 'origin/main', 'main', git)
+    ?? resolveLocalTarget(repoPath, 'origin/master', 'master', git);
 }
 
 function realOrResolved(value: string): string {
@@ -304,7 +378,7 @@ function latestActorEpoch(db: SwarmDb, task: Task, actor: string): number | null
   const row = db.prepare(`
     SELECT epoch FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND actor = ? COLLATE NOCASE
-      AND kind IN ('started', 'claimed')
+      AND kind IN ('started', 'claimed', 'reopened')
     ORDER BY id DESC LIMIT 1
   `).get(task.swarm_id, task.id, actor) as { epoch: number } | undefined;
   return row?.epoch ?? null;
@@ -312,9 +386,11 @@ function latestActorEpoch(db: SwarmDb, task: Task, actor: string): number | null
 
 function staleAuthorityMessage(task: Task, actor: string, verb: string, presentedEpoch: number | null): string {
   const owner = task.owner_agent ?? 'nobody';
-  const action = sameName(task.owner_agent, actor)
-    ? `Run "swarm task start ${task.id}" to refresh your lease before retrying.`
-    : `Run "swarm task start ${task.id} --takeover" to claim it before retrying.`;
+  const action = verb === 'reopen'
+    ? `Re-run "swarm task reopen ${task.id} --reason \"<text>\" --takeover" to claim a fresh epoch before retrying.`
+    : sameName(task.owner_agent, actor)
+      ? `Run "swarm task start ${task.id}" to refresh your lease before retrying.`
+      : `Run "swarm task start ${task.id} --takeover" to claim it before retrying.`;
   return `Refused stale task authority for "${task.id}" (${verb}): owner is "${owner}" at lease epoch ${task.lease_epoch}, but ${actor} holds ${presentedEpoch === null ? 'no task epoch' : `epoch ${presentedEpoch}`}. ${action}`;
 }
 
@@ -480,13 +556,94 @@ export async function startTask(
   return result;
 }
 
+export async function reopenTask(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  slug: string,
+  options: ReopenTaskOptions
+): Promise<ReopenTaskResult> {
+  validateTaskSlug(slug);
+  const reason = options.reason?.trim();
+  if (!reason) throw new Error(`Task reopen requires --reason "<text>" for "${slug}".`);
+
+  const prior = getTask(db, swarmId, slug);
+  if (!prior) throw new Error(`Task "${slug}" not found in this swarm.`);
+  if (!['done', 'abandoned'].includes(prior.state)) {
+    throw new Error(`Task "${slug}" is ${prior.state}; reopen only accepts done or abandoned tasks.`);
+  }
+  if (!options.takeover) requireAuthority(db, swarmId, slug, actor, 'reopen');
+
+  const result = withImmediateTransaction(db, () => {
+    const current = getTask(db, swarmId, slug);
+    if (!current) return { error: `Task "${slug}" not found in this swarm.` };
+    if (!['done', 'abandoned'].includes(current.state)) {
+      return { error: `Task "${slug}" is ${current.state}; reopen only accepts done or abandoned tasks.` };
+    }
+
+    if (!options.takeover) {
+      const presentedEpoch = latestActorEpoch(db, current, actor);
+      if (!sameName(current.owner_agent, actor) || presentedEpoch !== current.lease_epoch) {
+        insertEvent(db, current, 'refused_stale_epoch', actor, {
+          verb: 'reopen',
+          owner_agent: current.owner_agent,
+          current_epoch: current.lease_epoch,
+          presented_epoch: presentedEpoch,
+        });
+        return { error: staleAuthorityMessage(current, actor, 'reopen', presentedEpoch) };
+      }
+    }
+
+    const previousOwner = current.owner_agent;
+    const priorDisposition = current.disposition;
+    const timestamp = nowIso();
+    db.prepare(`
+      UPDATE tasks
+      SET state = 'active', owner_agent = ?, lease_epoch = ?, lease_expires_at = ?,
+          disposition = NULL, updated_at = ?
+      WHERE swarm_id = ? AND id = ?
+    `).run(actor, current.lease_epoch + 1, leaseExpiry(), timestamp, swarmId, slug);
+    const reopened = getTask(db, swarmId, slug);
+    if (!reopened) return { error: `Failed to reopen task "${slug}".` };
+    insertEvent(db, reopened, 'reopened', actor, {
+      reason,
+      prior_disposition: priorDisposition,
+      previous_owner: previousOwner,
+      takeover: options.takeover === true,
+    }, timestamp);
+    return { task: reopened, previousOwner, priorDisposition };
+  }) as ReopenTaskResult & { error?: string };
+
+  if (result.error || !result.task) throw new Error(result.error ?? `Failed to reopen task "${slug}".`);
+  if (options.takeover && result.previousOwner && !sameName(result.previousOwner, actor)) {
+    await sendMessage(
+      db,
+      swarmId,
+      actor,
+      result.previousOwner,
+      `Task ${slug} was reopened and taken over by ${actor} at lease epoch ${result.task.lease_epoch}. Your prior task authority is fenced; inspect the ledger before continuing.`,
+      undefined,
+      'handoff'
+    );
+  }
+  return result;
+}
+
 export function taskGitFacts(task: Task): GitFacts {
   if (!task.repo_path) {
     return { head: 'unknown', branch: task.branch ?? 'unknown', dirtyTracked: 0, untracked: 0, unpushed: [] };
   }
-  const cwd = task.worktree_path && fs.existsSync(task.worktree_path) ? task.worktree_path : task.repo_path;
-  const head = tryGit(cwd, ['rev-parse', 'HEAD']) ?? 'unknown';
-  const branch = tryGit(cwd, ['branch', '--show-current']) || task.branch || 'detached';
+  const hasTaskWorktree = !!task.worktree_path && fs.existsSync(task.worktree_path);
+  const cwd = hasTaskWorktree ? task.worktree_path! : task.repo_path;
+  // A reopened historical close may point at a worktree that was already
+  // removed. The durable task branch remains the source of truth; using the
+  // operator checkout's HEAD here could falsely verify an unrelated default-
+  // branch commit as the task commit.
+  const headRef = hasTaskWorktree ? 'HEAD' : task.branch ?? 'HEAD';
+  const head = tryGit(cwd, ['rev-parse', headRef]) ?? 'unknown';
+  const branch = hasTaskWorktree
+    ? tryGit(cwd, ['branch', '--show-current']) || task.branch || 'detached'
+    : task.branch || tryGit(cwd, ['branch', '--show-current']) || 'detached';
   const status = tryGit(cwd, ['status', '--porcelain']) ?? '';
   const lines = status ? status.split('\n').filter(Boolean) : [];
   const untracked = lines.filter(line => line.startsWith('??')).length;
@@ -642,6 +799,11 @@ export function claimCloseRequirements(claimKind: ClaimKind): string {
 interface GateFailure {
   gate: string;
   message: string;
+}
+
+interface GitGateReview {
+  failures: GateFailure[];
+  mergedVerification?: MergedVerification;
 }
 
 interface EvidenceReview {
@@ -813,15 +975,17 @@ async function reviewCloseEvidence(
   return { evidence, failures };
 }
 
-function gitGateFailures(
+function reviewGitGates(
   task: Task,
   facts: GitFacts,
+  claimKind: ClaimKind,
   disposition: TaskDisposition,
   preservedArchive: boolean,
   forcedDiscard: boolean
-): GateFailure[] {
-  if (!task.repo_path) return [];
+): GitGateReview {
+  if (!task.repo_path) return { failures: [] };
   const failures: GateFailure[] = [];
+  let mergedVerification: MergedVerification | undefined;
   if (!preservedArchive && !forcedDiscard &&
       (facts.unpushed.length > 0 || facts.dirtyTracked > 0 || facts.untracked > 0)) {
     if (facts.unpushed.length > 0) failures.push({ gate: 'git-unpushed', message: '' });
@@ -831,7 +995,35 @@ function gitGateFailures(
       `Cannot close task "${task.id}": unpushed commits: ${facts.unpushed.length}, dirty tracked files: ${facts.dirtyTracked}, untracked files: ${facts.untracked}. ` +
       'Push and clean the branch, create a verified rescue then use --disposition archive, or use --disposition discard --force-discard.';
   }
-  if (disposition === 'pr' || disposition === 'merged') {
+  if (claimKind === 'code-merged' && disposition === 'merged') {
+    if (!task.branch || facts.head === 'unknown') {
+      failures.push({
+        gate: 'git-default-branch-reachability',
+        message: `Cannot close task "${task.id}" as merged: no named source commit is recorded. Start it with an attached repository and named task branch, then merge it through the default branch.`,
+      });
+    } else {
+      const target = resolveDefaultBranchTarget(task.repo_path);
+      if (!target) {
+        failures.push({
+          gate: 'git-default-branch-reachability',
+          message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; default target ref and target SHA could not be resolved. ` +
+            'Set origin/HEAD or fetch origin/main or origin/master, then retry.',
+        });
+      } else if (tryGit(task.repo_path, ['merge-base', '--is-ancestor', facts.head, target.sha]) === null) {
+        failures.push({
+          gate: 'git-default-branch-reachability',
+          message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; target ref ${target.ref}; target SHA ${target.sha}. ` +
+            `The commit is not on the target branch. Merge and push it to ${target.ref}, then retry.`,
+        });
+      } else {
+        mergedVerification = {
+          sourceSha: facts.head,
+          targetRef: target.ref,
+          targetSha: target.sha,
+        };
+      }
+    }
+  } else if (disposition === 'pr' || disposition === 'merged') {
     if (!task.branch || facts.head === 'unknown') {
       failures.push({
         gate: 'git-remote-reachability',
@@ -847,7 +1039,7 @@ function gitGateFailures(
       }
     }
   }
-  return failures;
+  return { failures, mergedVerification };
 }
 
 function closeGrantCommand(op: 'merge' | 'override', slug: string): string {
@@ -888,7 +1080,7 @@ export async function closeTask(
   actor: string,
   slug: string,
   options: CloseTaskOptions
-): Promise<Task> {
+): Promise<CloseTaskResult> {
   validateTaskSlug(slug);
   if (!['pr', 'merged', 'archive', 'discard'].includes(options.disposition)) {
     throw new Error('Invalid disposition. Use pr, merged, archive, or discard.');
@@ -928,8 +1120,22 @@ export async function closeTask(
   const facts = taskGitFacts(task);
   const preservedArchive = options.disposition === 'archive' && hasVerifiedRescue(task);
   const forcedDiscard = options.disposition === 'discard' && options.forceDiscard === true;
-  const gitFailures = gitGateFailures(task, facts, options.disposition, preservedArchive, forcedDiscard);
-  const failures = [...evidenceReview.failures, ...gitFailures];
+  const gitReview = reviewGitGates(
+    task,
+    facts,
+    claimKind,
+    options.disposition,
+    preservedArchive,
+    forcedDiscard
+  );
+  const failures = [...evidenceReview.failures, ...gitReview.failures];
+  const defaultBranchFailure = gitReview.failures.find(
+    failure => failure.gate === 'git-default-branch-reachability'
+  );
+  // A merged disposition is a statement about the default branch, not a
+  // preservation convenience. Even an override must not remove the worktree
+  // or record merged until that concrete source→target comparison passes.
+  if (defaultBranchFailure) throw new Error(defaultBranchFailure.message);
   if (!options.override && failures.length > 0) {
     throw new Error(failures.find(failure => failure.message)?.message ?? `Cannot close task "${slug}": a close gate failed.`);
   }
@@ -1001,7 +1207,9 @@ export async function closeTask(
   }) as { task?: Task | null; error?: string };
 
   if (result.error || !result.task) throw new Error(result.error ?? `Failed to close task "${slug}".`);
-  return result.task;
+  return gitReview.mergedVerification
+    ? { ...result.task, close_verification: gitReview.mergedVerification }
+    : result.task;
 }
 
 function resolveRunTask(

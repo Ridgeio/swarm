@@ -106,6 +106,9 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
 
+`task close` only records a disposition; it never performs a merge. For a `code-merged` task, `--disposition merged` verifies that the task commit is reachable from origin's default branch (`origin/HEAD`, then `origin/main` or `origin/master`).
+With a local `file://` remote, the operator merges in the default-branch checkout and pushes that branch; fetch it in the task repository if needed, then retry close. Pushing only the feature branch is enough for `pr`, never for `merged`.
+
 Claim kinds are `code-merged`, `journey-works`, `deploy-healthy`, `analysis`, `decision`, and `probe`. Evidence uses repeatable `--evidence <kind>:<ref>` flags. `swarm run` executes an argv array without a shell, stores the full combined log under `~/.swarm/evidence/<swarm>/<task>/`, prints a bounded summary, and returns the child exit code. `--override --reason <text>` also requires a live matching `override` grant and records both grant use and the bypassed gates.
 
 ## Grants and escalations
@@ -164,6 +167,7 @@ Messaging:
         [--kind <kind>] [--supersedes <id>]
         [--interject|--now]
   swarm inbox [--peek|--unread|--recent [N]]  Read pending or historical messages
+        [--wait <seconds>]
         [--kind <kind>]
   swarm ack <msg-id...> | --all               Acknowledge pending deliveries
   swarm redeliver [--dry-run]                 Retry eligible push notifications
@@ -176,6 +180,8 @@ Task ledger:
         --not-established <text> [--evidence <kind>:<ref>]
         [--outcome inconclusive] [--force-discard]
         [--override --reason <text>]
+  swarm task reopen <slug> --reason <text>      Reactivate done/abandoned work
+        [--takeover]
   swarm run [--task <slug>] -- <cmd> [args...] Capture a full task evidence log
   swarm harness-review <task-slug>             Review a task's handoff loop
   swarm grant create --op <op> --resource <r>   Create an expiring scoped grant
@@ -212,7 +218,7 @@ Operator visibility:
 
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
-        [--headless] [--swarm <name>]
+        [--headless] [--push] [--force] [--force-surface] [--swarm <name>]
   swarm leave                                 Deregister from the current swarm
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read an agent's terminal screen

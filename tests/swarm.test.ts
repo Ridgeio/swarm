@@ -106,6 +106,37 @@ afterEach(() => {
 });
 
 describe('registry', () => {
+  test('cmux surface claims refuse different names, allow same-name rejoin, and require explicit takeover', () => {
+    const first = joinAgent(db, 'Alice', 'surface-shared', 'workspace-1', process.ppid, 'first');
+    assert.throws(
+      () => joinAgent(db, 'Bob', 'surface-shared', 'workspace-1', process.ppid),
+      (error: any) => {
+        assert.match(error.message, /already registered as agent "Alice"/);
+        assert.match(error.message, /Child or scripted processes should join with --headless/);
+        assert.match(error.message, /--force-surface/);
+        return true;
+      }
+    );
+    assert.strictEqual(getAgent(db, 'Alice')?.id, first.id, 'refusal preserves the current owner');
+
+    const sameName = joinAgent(db, 'aLiCe', 'surface-shared', 'workspace-1', process.ppid, 'refreshed');
+    assert.strictEqual(getAgent(db, 'Alice')?.id, sameName.id);
+    assert.strictEqual(getAgent(db, 'Alice')?.description, 'refreshed');
+    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM agents').get() as any).n, 1);
+
+    const takeover = joinAgentRaw(
+      db, SWARM_ID, 'Bob', 'surface-shared', 'workspace-1', process.ppid,
+      'replacement', 'cmux', undefined, null, undefined, { forceSurface: true }
+    );
+    assert.deepStrictEqual(takeover.surface_takeover, {
+      prior_name: 'aLiCe',
+      surface_id: 'surface-shared',
+    });
+    assert.strictEqual(getAgent(db, 'Alice'), null);
+    assert.strictEqual(getAgent(db, 'Bob')?.surface_id, 'surface-shared');
+    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM agents').get() as any).n, 1);
+  });
+
   test('join and list agents', () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
     joinAgent(db, 'Bob', 'surface-2', 'workspace-1', process.ppid);

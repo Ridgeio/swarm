@@ -32,6 +32,20 @@ export interface HookInboxEntry {
   unackedMinutes: number;
 }
 
+export interface InboxWaitOptions {
+  timeoutSeconds: number;
+  peek?: boolean;
+  kind?: string;
+  now?: () => number;
+  sleep?: (milliseconds: number) => Promise<void>;
+  pollIntervalMs?: number;
+}
+
+export interface InboxWaitResult {
+  messages: Message[];
+  timedOut: boolean;
+}
+
 // Allowed values for the optional message classification tag. Validated at the CLI
 // boundary (a typo'd kind would otherwise store an unfilterable message); storage
 // itself is a plain nullable TEXT column so builds with a different set stay readable.
@@ -281,6 +295,38 @@ export function getInbox(
   }
 
   return messages;
+}
+
+export async function waitForInbox(
+  db: SwarmDb,
+  swarmId: string,
+  agentName: string,
+  options: InboxWaitOptions
+): Promise<InboxWaitResult> {
+  if (!Number.isFinite(options.timeoutSeconds) || options.timeoutSeconds < 0) {
+    throw new Error('--wait seconds must be a non-negative number.');
+  }
+  const now = options.now ?? Date.now;
+  const pause = options.sleep ?? (milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds)));
+  const pollIntervalMs = options.pollIntervalMs ?? 2_000;
+  if (!Number.isFinite(pollIntervalMs) || pollIntervalMs <= 0) {
+    throw new Error('Inbox poll interval must be a positive number of milliseconds.');
+  }
+  const deadline = now() + options.timeoutSeconds * 1_000;
+
+  while (true) {
+    const messages = getInbox(
+      db,
+      swarmId,
+      agentName,
+      options.peek === true || options.kind !== undefined,
+      options.kind
+    );
+    if (messages.length > 0) return { messages, timedOut: false };
+    const remaining = deadline - now();
+    if (remaining <= 0) return { messages: [], timedOut: true };
+    await pause(Math.min(pollIntervalMs, remaining));
+  }
 }
 
 export function acknowledgeAllMessages(

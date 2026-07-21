@@ -6,8 +6,16 @@ import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
 import { DatabaseSync } from 'node:sqlite';
+import { collectBoardData } from '../src/board-data.js';
 import { getDbAt, type SwarmDb } from '../src/db.js';
-import { closeTask, startTask } from '../src/tasks.js';
+import {
+  closeTask,
+  reopenTask,
+  resolveDefaultBranchTarget,
+  startTask,
+  taskGitFacts,
+  type GitQueryRunner,
+} from '../src/tasks.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
 const TSX_IMPORT = import.meta.resolve('tsx');
@@ -205,6 +213,160 @@ describe('WI-3 task ledger CLI', () => {
       verified.close();
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('merged close refuses a feature-only push with source/target SHAs, then verifies the default branch before removing the worktree', () => {
+    const root = fs.mkdtempSync(path.join(suiteRoot, 'merged-default-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-merged-default-home-'));
+    try {
+      const { repo } = createPushedRepo(root);
+      joinAgent(home, 'Alice');
+      const started = runCli(home, [
+        'task', 'start', 'default-merged', '--title', 'Default branch merged', '--repo', repo,
+      ], 'Alice');
+      assert.strictEqual(started.status, 0, started.stderr || started.stdout);
+
+      let db = openDb(home);
+      const active = taskRow(db, 'default-merged');
+      db.close();
+      fs.appendFileSync(path.join(active.worktree_path, 'tracked.txt'), 'feature only\n');
+      git(active.worktree_path, ['add', 'tracked.txt']);
+      git(active.worktree_path, ['commit', '-m', 'feature-only commit']);
+      git(active.worktree_path, ['push', '-u', 'origin', active.branch]);
+      const sourceSha = git(active.worktree_path, ['rev-parse', 'HEAD']);
+      const originalTargetSha = git(repo, ['rev-parse', 'origin/main']);
+
+      const grant = runCli(home, [
+        'grant', 'create', '--op', 'merge', '--resource', 'default-merged', '--ttl', '2h', '--to', 'Alice',
+      ], 'Alice');
+      assert.strictEqual(grant.status, 0, grant.stderr || grant.stdout);
+
+      const refused = runCli(home, [
+        'task', 'close', 'default-merged', '--disposition', 'merged', '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(refused.status, 0);
+      assert.match(refused.stderr, new RegExp(`source SHA ${sourceSha}`));
+      assert.match(refused.stderr, /target ref origin\/main/);
+      assert.match(refused.stderr, new RegExp(`target SHA ${originalTargetSha}`));
+      assert.match(refused.stderr, /The commit is not on the target branch/);
+      assert.ok(fs.existsSync(active.worktree_path), 'failed verification must leave the worktree in place');
+      db = openDb(home);
+      assert.strictEqual(taskRow(db, 'default-merged').state, 'active');
+      db.close();
+
+      git(repo, ['merge', '--ff-only', active.branch]);
+      git(repo, ['push', 'origin', 'main']);
+      const targetSha = git(repo, ['rev-parse', 'origin/main']);
+      assert.strictEqual(targetSha, sourceSha);
+
+      const closed = runCli(home, [
+        'task', 'close', 'default-merged', '--disposition', 'merged', '--not-established', 'none',
+      ], 'Alice');
+      assert.strictEqual(closed.status, 0, closed.stderr || closed.stdout);
+      assert.match(
+        closed.stdout,
+        new RegExp(`disposition recorded: merged \\(verified: ${sourceSha} reachable from origin/main\\)`)
+      );
+      assert.ok(!fs.existsSync(active.worktree_path), 'worktree removal follows successful verification');
+      db = openDb(home);
+      assert.strictEqual(
+        taskGitFacts(taskRow(db, 'default-merged')).head,
+        sourceSha,
+        'a removed/reopened worktree still resolves the durable task branch as its source commit'
+      );
+      db.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('default-branch resolution uses origin/HEAD, remote HEAD, then main and master fallbacks', () => {
+    const sha = (digit: string) => digit.repeat(40);
+    const runner = (responses: Record<string, string | null>): GitQueryRunner => (_cwd, args) =>
+      responses[args.join(' ')] ?? null;
+
+    assert.deepStrictEqual(resolveDefaultBranchTarget('/repo', runner({
+      'symbolic-ref refs/remotes/origin/HEAD': 'refs/remotes/origin/trunk',
+      'rev-parse --verify origin/trunk^{commit}': sha('1'),
+    })), { ref: 'origin/trunk', sha: sha('1'), resolution: 'origin-head' });
+
+    assert.deepStrictEqual(resolveDefaultBranchTarget('/repo', runner({
+      'ls-remote --symref origin HEAD': `ref: refs/heads/release\tHEAD\n${sha('2')}\tHEAD`,
+      'rev-parse --verify origin/release^{commit}': sha('2'),
+    })), { ref: 'origin/release', sha: sha('2'), resolution: 'remote-head' });
+
+    assert.deepStrictEqual(resolveDefaultBranchTarget('/repo', runner({
+      'rev-parse --verify origin/main^{commit}': sha('3'),
+      'rev-parse --verify origin/master^{commit}': sha('4'),
+    })), { ref: 'origin/main', sha: sha('3'), resolution: 'main' });
+
+    assert.deepStrictEqual(resolveDefaultBranchTarget('/repo', runner({
+      'rev-parse --verify origin/master^{commit}': sha('4'),
+    })), { ref: 'origin/master', sha: sha('4'), resolution: 'master' });
+  });
+
+  test('task reopen is fenced, bumps the epoch, audits the repair, returns to the active board, and refuses double reopen', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-reopen-'));
+    const db = getDbAt(path.join(root, 'swarm.db'));
+    const report = path.join(root, 'report.md');
+    fs.writeFileSync(report, 'repair evidence\n');
+    try {
+      await startTask(db, 'default', 'Alice', 'repair-close', {
+        title: 'Repair a close', noWorktree: true, claimKind: 'analysis',
+      });
+      await closeTask(db, 'default', 'Alice', 'repair-close', {
+        disposition: 'archive', evidence: [`report:${report}`], notEstablished: 'runtime behavior',
+      });
+
+      await assert.rejects(
+        reopenTask(db, 'default', 'Bob', 'repair-close', { reason: 'false disposition' }),
+        /task reopen repair-close .* --takeover/
+      );
+      assert.strictEqual(taskRow(db, 'repair-close').state, 'done');
+
+      const reopened = await reopenTask(db, 'default', 'Alice', 'repair-close', {
+        reason: 'default branch verification was false',
+      });
+      assert.strictEqual(reopened.task.state, 'active');
+      assert.strictEqual(reopened.task.lease_epoch, 2);
+      assert.strictEqual(reopened.task.disposition, null);
+      assert.strictEqual(reopened.priorDisposition, 'archive');
+      const event = db.prepare(`
+        SELECT epoch, actor, data FROM task_events
+        WHERE task_id = 'repair-close' AND kind = 'reopened'
+      `).get() as { epoch: number; actor: string; data: string };
+      assert.strictEqual(event.epoch, 2);
+      assert.strictEqual(event.actor, 'Alice');
+      assert.deepStrictEqual(JSON.parse(event.data), {
+        reason: 'default branch verification was false',
+        prior_disposition: 'archive',
+        previous_owner: 'Alice',
+        takeover: false,
+      });
+      const boardTask = collectBoardData(db, 'default').tasks.find(task => task.id === 'repair-close');
+      assert.strictEqual(boardTask?.state, 'active');
+      assert.strictEqual(boardTask?.leaseEpoch, 2);
+      await assert.rejects(
+        reopenTask(db, 'default', 'Alice', 'repair-close', { reason: 'again' }),
+        /is active; reopen only accepts done or abandoned tasks/
+      );
+
+      await startTask(db, 'default', 'Alice', 'takeover-close', {
+        title: 'Take over a closed task', noWorktree: true, claimKind: 'analysis',
+      });
+      await closeTask(db, 'default', 'Alice', 'takeover-close', {
+        disposition: 'archive', evidence: [`report:${report}`], notEstablished: 'runtime behavior',
+      });
+      const taken = await reopenTask(db, 'default', 'Bob', 'takeover-close', {
+        reason: 'new owner will repair', takeover: true,
+      });
+      assert.strictEqual(taken.task.owner_agent, 'Bob');
+      assert.strictEqual(taken.task.lease_epoch, 2);
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 

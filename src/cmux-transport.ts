@@ -127,6 +127,9 @@ export class CmuxTransport implements Transport {
   }
 
   async isAlive(agent: TransportAgent): Promise<boolean> {
-    return isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    // The transport interface predates tri-state liveness. Treat an observer
+    // that cannot reach Cmux as non-dead; registry cleanup handles the explicit
+    // unknown state and must never turn observer blindness into a reap.
+    return isSurfaceAlive(agent.surface_id, agent.workspace_id) !== false;
   }
 }

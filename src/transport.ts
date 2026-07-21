@@ -51,6 +51,30 @@ const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe'
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_BACKOFF_BASE_S = 0.3;
 
+export type CmuxLivenessRunner = (
+  binary: string,
+  args: string[],
+  options: typeof STDIO_OPTS
+) => string | Buffer;
+
+export interface CmuxLivenessObserver {
+  /**
+   * Whether this process can reach the Cmux control socket. The result is
+   * memoized by the observer, so one CLI invocation performs at most one ping.
+   */
+  isCompetent(): boolean;
+  /** null means the observer is blind, not that the subject is dead. */
+  isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean | null;
+}
+
+export interface CmuxLivenessObserverOptions {
+  runner?: CmuxLivenessRunner;
+  resolveBinary?: () => string;
+  wait?: (seconds: number) => void;
+}
+
+export const CMUX_LIVENESS_UNKNOWN_MESSAGE = 'cmux unreachable from this process — liveness unknown';
+
 // A cmux send/read can fail two ways: the surface is genuinely gone, or the cmux
 // server dropped the connection under load ("Broken pipe", errno 32 / EPIPE /
 // connection reset). The latter is transient — the surface is alive, just busy —
@@ -348,23 +372,61 @@ export function readScreen(surfaceId: string, lines?: number, workspaceId?: stri
   }
 }
 
-export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean {
-  // Retry a few times with backoff. Critically: a TRANSIENT socket error (broken
-  // pipe from a busy surface) must NOT be read as "dead" — the surface is alive, just
-  // busy. Only a genuine non-transient failure (surface not found) counts as dead,
-  // so cleanupStale can never prune a live-but-busy agent.
-  for (let attempt = 0; attempt < 3; attempt++) {
+export function createCmuxLivenessObserver(
+  options: CmuxLivenessObserverOptions = {}
+): CmuxLivenessObserver {
+  const runner = options.runner ?? execFileSync;
+  const resolveBinary = options.resolveBinary ?? resolveCmux;
+  const wait = options.wait ?? sleep;
+  let competent: boolean | undefined;
+  let cmuxPath: string | undefined;
+
+  const isCompetent = (): boolean => {
+    if (competent !== undefined) return competent;
     try {
-      readScreen(surfaceId, 1, workspaceId);
-      return true;
-    } catch (err: any) {
-      if (isTransientCmuxError(err?.cause)) return true; // busy, not gone
-      if (attempt < 2) {
-        execFileSync('sleep', [String(0.3 * (attempt + 1))], STDIO_OPTS);
-      }
+      cmuxPath = resolveBinary();
+      runner(cmuxPath, ['ping'], STDIO_OPTS);
+      competent = true;
+    } catch {
+      competent = false;
     }
-  }
-  return false;
+    return competent;
+  };
+
+  return {
+    isCompetent,
+    isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean | null {
+      // Observer blindness is not evidence about any subject. In particular, do
+      // not even issue a surface-specific call until the process has proven it
+      // can reach the socket with the trivially true ping above.
+      if (!isCompetent()) return null;
+
+      const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          runner(cmuxPath!, ['read-screen', ...wsArgs, '--surface', surfaceId, '--lines', '1'], STDIO_OPTS);
+          return true;
+        } catch (err: any) {
+          // A busy socket is positive evidence that Cmux is present, while a
+          // non-transient subject-specific failure may mean the surface is gone.
+          if (isTransientCmuxError(err)) return true;
+          if (attempt < 2) wait(0.3 * (attempt + 1));
+        }
+      }
+      return false;
+    },
+  };
+}
+
+/** One competence probe per short-lived CLI process, shared by every subject. */
+export const processCmuxLivenessObserver = createCmuxLivenessObserver();
+
+export function isCmuxObserverCompetent(): boolean {
+  return processCmuxLivenessObserver.isCompetent();
+}
+
+export function isSurfaceAlive(surfaceId: string, workspaceId?: string | null): boolean | null {
+  return processCmuxLivenessObserver.isSurfaceAlive(surfaceId, workspaceId);
 }
 
 export function renameTab(surfaceId: string, name: string, workspaceId?: string | null): void {

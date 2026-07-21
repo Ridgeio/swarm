@@ -621,7 +621,7 @@ function hasVerifiedRescue(task: Task): boolean {
   return false;
 }
 
-const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = {
+export const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = {
   'code-merged': EVIDENCE_KINDS,
   'journey-works': ['journey'],
   'deploy-healthy': ['deploy-health'],
@@ -629,6 +629,15 @@ const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = {
   decision: ['decision', 'report'],
   probe: ['report'],
 };
+
+export function claimCloseRequirements(claimKind: ClaimKind): string {
+  // code-merged accepts optional typed evidence, but its required close proof is
+  // the Git gate set. Every evidence-bearing claim renders from the same map the
+  // close validator consumes, so help/output cannot drift from enforcement.
+  return claimKind === 'code-merged'
+    ? 'git gates only'
+    : CLAIM_EVIDENCE_KINDS[claimKind].join(', ');
+}
 
 interface GateFailure {
   gate: string;
@@ -854,7 +863,8 @@ function missingCloseGrantMessage(
     ? `task slug "${task.id}" or branch "${task.branch ?? 'none'}"`
     : `task slug "${task.id}"`;
   return `Refused task close for "${task.id}": ${actor} requires a live ${op} grant matching ${scope}. ` +
-    `Run exactly: ${closeGrantCommand(op, task.id)}. See docs/ROUTING.md for the grant/escalation decision path.`;
+    `Request authorization: swarm escalate ${task.id} --question "<one line>". ` +
+    `Operator remedy: ${closeGrantCommand(op, task.id)}. See docs/ROUTING.md for the grant/escalation decision path.`;
 }
 
 function requireCloseGrant(

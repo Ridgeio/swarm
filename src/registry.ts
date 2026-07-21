@@ -5,7 +5,10 @@ import fs from 'fs';
 import path from 'path';
 import os from 'os';
 import { DEFAULT_SWARM_ID, DEFAULT_SWARM_NAME, withImmediateTransaction } from './db.js';
-import { isSurfaceAlive } from './transport.js';
+import {
+  processCmuxLivenessObserver,
+  type CmuxLivenessObserver,
+} from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
 
@@ -447,6 +450,9 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
 
   const surfaceId = process.env.CMUX_SURFACE_ID;
   if (surfaceId) {
+    // A concrete registration for the current Cmux surface is authoritative.
+    // Child processes can stamp the shared TTY's headless marker, so that
+    // marker is only a fallback when this selected swarm has no surface row.
     const sql = resolvedSwarmId
       ? 'SELECT * FROM agents WHERE swarm_id = ? AND surface_id = ? ORDER BY joined_at DESC LIMIT 1'
       : 'SELECT * FROM agents WHERE surface_id = ? ORDER BY joined_at DESC LIMIT 1';
@@ -503,6 +509,22 @@ export function getSelf(db: SwarmDb, swarmId?: string): Agent | null {
   return resolveSelf(db, swarmId)?.agent ?? null;
 }
 
+export function getSurfaceMarkerConflictWarning(db: SwarmDb, swarmId: string): string | null {
+  const surfaceId = process.env.CMUX_SURFACE_ID;
+  if (!surfaceId) return null;
+  const bySurface = db.prepare(`
+    SELECT * FROM agents
+    WHERE swarm_id = ? AND surface_id = ? AND agent_type = 'cmux'
+    ORDER BY joined_at DESC
+    LIMIT 1
+  `).get(swarmId, surfaceId) as Agent | undefined;
+  const marker = readSessionMarker();
+  if (!bySurface || !marker || marker.agent_name.toLowerCase() === bySurface.name.toLowerCase()) {
+    return null;
+  }
+  return `session marker says ${marker.agent_name}; this surface is registered as ${bySurface.name} — child processes may have stamped the marker`;
+}
+
 function tokensMatch(expected: string, presented: string | null): boolean {
   if (!presented) return false;
   const expectedBytes = Buffer.from(expected, 'utf-8');
@@ -529,8 +551,12 @@ export function getAgent(db: SwarmDb, swarmId: string, name: string): Agent | nu
     .get(swarmId, name) as Agent | undefined ?? null;
 }
 
-export async function listAgents(db: SwarmDb, swarmId: string): Promise<Agent[]> {
-  await cleanupStale(db, swarmId);
+export async function listAgents(
+  db: SwarmDb,
+  swarmId: string,
+  cmuxObserver: CmuxLivenessObserver = processCmuxLivenessObserver
+): Promise<Agent[]> {
+  await cleanupStale(db, swarmId, cmuxObserver);
   return db.prepare('SELECT * FROM agents WHERE swarm_id = ? ORDER BY joined_at ASC').all(swarmId) as unknown as Agent[];
 }
 
@@ -571,11 +597,20 @@ export function updateHeartbeat(db: SwarmDb, swarmId: string, surfaceId: string)
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
-async function cleanupStale(db: SwarmDb, swarmId?: string): Promise<void> {
+async function cleanupStale(
+  db: SwarmDb,
+  swarmId?: string,
+  cmuxObserver: CmuxLivenessObserver = processCmuxLivenessObserver
+): Promise<void> {
   const agents = swarmId
     ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as unknown as Agent[]
     : db.prepare('SELECT * FROM agents').all() as unknown as Agent[];
   const now = Date.now();
+  // One cheap, memoized process-level competence check precedes every subject
+  // probe. If this observer cannot reach the socket, it contributes no liveness
+  // evidence and performs no strike/reap accounting for any subject.
+  const hasProbeableAgent = agents.some(agent => agent.agent_type !== 'headless');
+  if (hasProbeableAgent && !cmuxObserver.isCompetent()) return;
 
   const checks = agents.map(async (agent) => {
     if (agent.agent_type === 'headless') return; // no probeable surface; never auto-pruned
@@ -584,7 +619,8 @@ async function cleanupStale(db: SwarmDb, swarmId?: string): Promise<void> {
     // are only refreshed here, so bump them whenever the endpoint is reachable.
     const aliveNow = agent.agent_type === 'a2a'
       ? await isAgentAlive(agent)
-      : isSurfaceAlive(agent.surface_id, agent.workspace_id);
+      : cmuxObserver.isSurfaceAlive(agent.surface_id, agent.workspace_id);
+    if (aliveNow === null) return;
     if (aliveNow) {
       if (agent.agent_type === 'a2a') updateHeartbeat(db, agent.swarm_id, agent.surface_id);
       return;
@@ -599,7 +635,7 @@ async function cleanupStale(db: SwarmDb, swarmId?: string): Promise<void> {
 
     const stillDead = agent.agent_type === 'a2a'
       ? !(await isAgentAlive(agent))
-      : !isSurfaceAlive(agent.surface_id, agent.workspace_id);
+      : cmuxObserver.isSurfaceAlive(agent.surface_id, agent.workspace_id) === false;
     if (stillDead) {
       db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
     }
@@ -608,34 +644,49 @@ async function cleanupStale(db: SwarmDb, swarmId?: string): Promise<void> {
   await Promise.all(checks);
 }
 
-async function isConfirmedDead(agent: Agent): Promise<boolean> {
-  const probe = async (): Promise<boolean> =>
-    agent.agent_type === 'a2a'
-      ? await isAgentAlive(agent)
-      : isSurfaceAlive(agent.surface_id, agent.workspace_id);
-  if (await probe()) return false;
-  return !(await probe());
+async function isConfirmedDead(
+  agent: Agent,
+  cmuxObserver: CmuxLivenessObserver
+): Promise<boolean | null> {
+  if (!cmuxObserver.isCompetent()) return null;
+  const probe = async (): Promise<boolean | null> => agent.agent_type === 'a2a'
+    ? await isAgentAlive(agent)
+    : cmuxObserver.isSurfaceAlive(agent.surface_id, agent.workspace_id);
+  const initial = await probe();
+  if (initial === null) return null;
+  if (initial) return false;
+  const confirmed = await probe();
+  return confirmed === null ? null : !confirmed;
 }
 
-export async function reapIfDead(db: SwarmDb, swarmId: string, name: string): Promise<Agent | null> {
+export async function reapIfDead(
+  db: SwarmDb,
+  swarmId: string,
+  name: string,
+  cmuxObserver: CmuxLivenessObserver = processCmuxLivenessObserver
+): Promise<Agent | null> {
   const existing = getAgent(db, swarmId, name);
   if (!existing) return null;
   if (existing.agent_type === 'headless') return null;
-  if (await isConfirmedDead(existing)) {
+  if (await isConfirmedDead(existing, cmuxObserver)) {
     db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);
     return existing;
   }
   return null;
 }
 
-export async function reapAll(db: SwarmDb, swarmId?: string): Promise<Agent[]> {
+export async function reapAll(
+  db: SwarmDb,
+  swarmId?: string,
+  cmuxObserver: CmuxLivenessObserver = processCmuxLivenessObserver
+): Promise<Agent[]> {
   const agents = swarmId
     ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as unknown as Agent[]
     : db.prepare('SELECT * FROM agents').all() as unknown as Agent[];
   const reaped: Agent[] = [];
   for (const agent of agents) {
     if (agent.agent_type === 'headless') continue;
-    if (await isConfirmedDead(agent)) {
+    if (await isConfirmedDead(agent, cmuxObserver)) {
       db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
       reaped.push(agent);
     }

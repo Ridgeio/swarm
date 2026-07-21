@@ -173,7 +173,7 @@ describe('T2.1 typed grants', () => {
 });
 
 describe('T2.2 close chokepoints', () => {
-  test('merged code claim refuses with the exact create command, then records grant use on success', async () => {
+  test('merged code claim routes authorization through escalation and an operator remedy, then records grant use', async () => {
     const fixture = tempDb('swarm-t2-merge-');
     try {
       joinHeadlessAgent(fixture.db, 'default', 'Alice');
@@ -184,7 +184,11 @@ describe('T2.2 close chokepoints', () => {
         closeTask(fixture.db, 'default', 'Alice', 'merge-gated', {
           disposition: 'merged', notEstablished: 'none',
         }),
-        /Run exactly: swarm grant create --op merge --resource merge-gated --ttl 2h/
+        (error: any) => {
+          assert.match(error.message, /Request authorization: swarm escalate merge-gated --question "<one line>"/);
+          assert.match(error.message, /Operator remedy: swarm grant create --op merge --resource merge-gated --ttl 2h/);
+          return true;
+        }
       );
       const grant = createGrant(fixture.db, 'default', 'Lead', {
         op: 'merge', resource: 'merge-gated', ttl: '2h', grantedTo: 'Alice',
@@ -238,7 +242,11 @@ describe('T2.2 close chokepoints', () => {
           disposition: 'archive', override: true, reason: 'approved exception',
           notEstablished: 'runtime behavior',
         }),
-        /Run exactly: swarm grant create --op override --resource override-gated --ttl 2h/
+        (error: any) => {
+          assert.match(error.message, /Request authorization: swarm escalate override-gated --question "<one line>"/);
+          assert.match(error.message, /Operator remedy: swarm grant create --op override --resource override-gated --ttl 2h/);
+          return true;
+        }
       );
       const grant = createGrant(fixture.db, 'default', 'Lead', {
         op: 'override', resource: 'override-gated', ttl: '2h',

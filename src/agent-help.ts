@@ -1,3 +1,15 @@
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { CLAIM_EVIDENCE_KINDS, CLAIM_KINDS } from './tasks.js';
+
+const ROUTING_DOC_PATH = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'docs',
+  'ROUTING.md'
+);
+
 export const AGENT_HELP_GROUPS = [
   'identity',
   'messaging',
@@ -70,7 +82,16 @@ export function renderAgentHelp(): string {
   for (const group of AGENT_HELP_GROUPS) {
     lines.push(`[${group}]`);
     lines.push(...AGENT_HELP_ENTRIES.filter(entry => entry.group === group).map(entry => entry.line));
+    if (group === 'tasks+evidence') {
+      lines.push(...CLAIM_KINDS.map(claimKind => {
+        const required = claimKind === 'code-merged'
+          ? 'git gates only'
+          : CLAIM_EVIDENCE_KINDS[claimKind].join(', ');
+        return `claim ${claimKind} → ${required}`;
+      }));
+      lines.push('claim change: task start <slug> --claim <kind> [--takeover]');
+    }
   }
-  lines.push('docs/ROUTING.md');
+  if (fs.existsSync(ROUTING_DOC_PATH)) lines.push(ROUTING_DOC_PATH);
   return lines.join('\n');
 }

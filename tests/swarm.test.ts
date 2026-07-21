@@ -27,10 +27,19 @@ import {
   sendMessage as sendMessageRaw,
 } from '../src/mailbox.js';
 import type { SwarmDb } from '../src/db.js';
+import { createCmuxLivenessObserver } from '../src/transport.js';
 
 let db: SwarmDb;
 let dbPath: string;
 const SWARM_ID = DEFAULT_SWARM_ID;
+const competentGoneObserver = createCmuxLivenessObserver({
+  resolveBinary: () => '/fixture/cmux',
+  runner: (_binary, args) => {
+    if (args[0] === 'ping') return Buffer.from('pong');
+    throw { stderr: Buffer.from('Error: Surface not found: fixture') };
+  },
+  wait: () => {},
+});
 
 function joinAgent(testDb: SwarmDb, name: string, surfaceId: string, workspaceId: string | undefined, ppid: number, description?: string) {
   return joinAgentRaw(testDb, SWARM_ID, name, surfaceId, workspaceId, ppid, description);
@@ -57,7 +66,7 @@ function getAgent(testDb: SwarmDb, name: string) {
 }
 
 function listAgents(testDb: SwarmDb) {
-  return listAgentsRaw(testDb, SWARM_ID);
+  return listAgentsRaw(testDb, SWARM_ID, competentGoneObserver);
 }
 
 function updateStatus(testDb: SwarmDb, surfaceId: string, description: string) {
@@ -65,11 +74,11 @@ function updateStatus(testDb: SwarmDb, surfaceId: string, description: string) {
 }
 
 function reapIfDead(testDb: SwarmDb, name: string) {
-  return reapIfDeadRaw(testDb, SWARM_ID, name);
+  return reapIfDeadRaw(testDb, SWARM_ID, name, competentGoneObserver);
 }
 
 function reapAll(testDb: SwarmDb) {
-  return reapAllRaw(testDb, SWARM_ID);
+  return reapAllRaw(testDb, SWARM_ID, competentGoneObserver);
 }
 
 function forceReap(testDb: SwarmDb, name: string) {
@@ -158,7 +167,7 @@ describe('registry', () => {
 
   test('stale surface cleanup removes dead agents with stale heartbeat', async () => {
     // Two cmux agents with fake (unreachable) surfaces and heartbeats older than the
-    // 30min stale window. cmux is unavailable in tests, so both probe as dead.
+    // 30min stale window. A competent fixture observer sees both surfaces as gone.
     const staleTime = new Date(Date.now() - 35 * 60 * 1000).toISOString();
     db.prepare(`INSERT OR REPLACE INTO agents (id, swarm_id, name, description, surface_id, workspace_id, ppid, joined_at, last_heartbeat, agent_type, endpoint_url)
       VALUES ('g1', ?, 'GhostA', NULL, 'surface-ghost', 'workspace-1', 999999, ?, ?, 'cmux', NULL)`).run(SWARM_ID, staleTime, staleTime);
@@ -185,6 +194,40 @@ describe('registry', () => {
   test('empty DB returns empty list', async () => {
     const agents = await listAgents(db);
     assert.strictEqual(agents.length, 0);
+  });
+
+  test('an observer that cannot reach cmux never mutates liveness state or reaps, and pings once', async () => {
+    const calls: string[][] = [];
+    const blindObserver = createCmuxLivenessObserver({
+      resolveBinary: () => '/fixture/cmux',
+      runner: (_binary, args) => {
+        calls.push(args);
+        throw { stderr: Buffer.from('Failed to connect to socket: operation not permitted') };
+      },
+      wait: () => {},
+    });
+    const staleTime = new Date(Date.now() - 35 * 60 * 1000).toISOString();
+    for (const [id, name, surface] of [
+      ['blind-a', 'BlindA', 'surface-blind-a'],
+      ['blind-b', 'BlindB', 'surface-blind-b'],
+    ]) {
+      db.prepare(`INSERT INTO agents (
+        id, swarm_id, name, description, surface_id, workspace_id, ppid,
+        joined_at, last_heartbeat, agent_type, endpoint_url
+      ) VALUES (?, ?, ?, NULL, ?, 'workspace-1', 999999, ?, ?, 'cmux', NULL)`)
+        .run(id, SWARM_ID, name, surface, staleTime, staleTime);
+    }
+    const before = db.prepare('SELECT id, last_heartbeat FROM agents ORDER BY id').all();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      assert.strictEqual((await listAgentsRaw(db, SWARM_ID, blindObserver)).length, 2);
+    }
+    assert.deepStrictEqual(await reapAllRaw(db, SWARM_ID, blindObserver), []);
+    assert.strictEqual(await reapIfDeadRaw(db, SWARM_ID, 'BlindA', blindObserver), null);
+
+    const after = db.prepare('SELECT id, last_heartbeat FROM agents ORDER BY id').all();
+    assert.deepStrictEqual(after, before);
+    assert.deepStrictEqual(calls, [['ping']], 'competence is memoized once, not probed per agent');
   });
 
   test('joinA2AAgent creates agent with a2a type', () => {
@@ -217,7 +260,7 @@ describe('registry', () => {
 
 describe('reap', () => {
   test('reapIfDead removes a cmux agent with a dead surface', async () => {
-    // In the test environment cmux is unavailable, so isSurfaceAlive fails.
+    // A competent observer confirms this fixture surface is genuinely gone.
     joinAgent(db, 'Ghost', 'surface-fake', 'workspace-1', process.ppid);
     const reaped = await reapIfDead(db, 'Ghost');
     assert.ok(reaped, 'expected agent to be reaped');

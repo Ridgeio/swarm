@@ -1,7 +1,7 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert';
-import { execFileSync } from 'child_process';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
+import { spawnSync } from 'child_process';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
@@ -37,18 +37,32 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
       }
     }
   }
-  try {
-    const stdout = execFileSync('node', ['--import', 'tsx', INDEX, ...args], {
-      encoding: 'utf-8', env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    return { stdout, stderr: '', status: 0 };
-  } catch (err: any) {
-    return {
-      stdout: err.stdout?.toString() ?? '',
-      stderr: err.stderr?.toString() ?? '',
-      status: typeof err.status === 'number' ? err.status : 1,
-    };
-  }
+  const result = spawnSync('node', ['--import', 'tsx', INDEX, ...args], {
+    encoding: 'utf-8', env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    status: result.status ?? 1,
+  };
+}
+
+function fakeTtyPath(root: string, tty: string = 'ttys999'): string {
+  const bin = join(root, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const ps = join(bin, 'ps');
+  writeFileSync(ps, `#!/bin/sh\nprintf '%s\\n' '${tty}'\n`, { mode: 0o755 });
+  chmodSync(ps, 0o755);
+  return `${bin}:${process.env.PATH ?? ''}`;
+}
+
+function fakeUnavailableCmuxPath(root: string): string {
+  const bin = join(root, 'bin');
+  mkdirSync(bin, { recursive: true });
+  const cmux = join(bin, 'cmux');
+  writeFileSync(cmux, `#!/bin/sh\nprintf '%s\\n' "$*" >> "$SWARM_TEST_CMUX_LOG"\nexit 1\n`, { mode: 0o755 });
+  chmodSync(cmux, 0o755);
+  return `${bin}:${process.env.PATH ?? ''}`;
 }
 
 describe('cli integration', () => {
@@ -112,6 +126,104 @@ describe('cli integration', () => {
     const who = runCli(home, ['whoami'], { CMUX_SURFACE_ID: 'surf-hidden', SWARM_AGENT_NAME: 'Hax' });
     assert.strictEqual(who.status, 0, who.stderr || who.stdout);
     assert.match(who.stdout, /Type: headless/);
+  });
+
+  test('registered surface identity wins a conflicting headless marker and join warns', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'swarm-identity-precedence-'));
+    const fixtureHome = join(fixture, 'home');
+    const fixturePath = fakeTtyPath(fixture);
+    try {
+      const surfaceJoin = runCli(fixtureHome, ['join', 'SurfaceY'], {
+        PATH: fixturePath,
+        CMUX_SURFACE_ID: 'surface-y',
+        CMUX_WORKSPACE_ID: 'workspace-y',
+      });
+      assert.strictEqual(surfaceJoin.status, 0, surfaceJoin.stderr || surfaceJoin.stdout);
+
+      const childJoin = runCli(fixtureHome, ['join', 'MarkerX', '--headless'], {
+        PATH: fixturePath,
+        CMUX_SURFACE_ID: 'surface-y',
+      });
+      assert.strictEqual(childJoin.status, 0, childJoin.stderr || childJoin.stdout);
+
+      const who = runCli(fixtureHome, ['whoami'], {
+        PATH: fixturePath,
+        CMUX_SURFACE_ID: 'surface-y',
+      });
+      assert.strictEqual(who.status, 0, who.stderr || who.stdout);
+      assert.match(who.stdout, /Name: SurfaceY/);
+      assert.match(who.stdout, /Type: cmux/);
+
+      const rejoin = runCli(fixtureHome, ['join', 'SurfaceY'], {
+        PATH: fixturePath,
+        CMUX_SURFACE_ID: 'surface-y',
+        CMUX_WORKSPACE_ID: 'workspace-y',
+      });
+      assert.strictEqual(rejoin.status, 0, rejoin.stderr || rejoin.stdout);
+      assert.match(
+        rejoin.stderr,
+        /session marker says MarkerX; this surface is registered as SurfaceY — child processes may have stamped the marker/
+      );
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test('a marker-only headless session still resolves when no surface registration exists', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'swarm-marker-only-'));
+    const fixtureHome = join(fixture, 'home');
+    const fixturePath = fakeTtyPath(fixture, 'ttys998');
+    try {
+      const joined = runCli(fixtureHome, ['join', 'MarkerOnly', '--headless'], { PATH: fixturePath });
+      assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
+      const who = runCli(fixtureHome, ['whoami'], { PATH: fixturePath });
+      assert.strictEqual(who.status, 0, who.stderr || who.stdout);
+      assert.match(who.stdout, /Name: MarkerOnly/);
+      assert.match(who.stdout, /Type: headless/);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
+  });
+
+  test('repeated members calls from a cmux-blind process preserve stale registrations and report unknown', () => {
+    const fixture = mkdtempSync(join(tmpdir(), 'swarm-members-blind-'));
+    const fixtureHome = join(fixture, 'home');
+    const fixturePath = fakeUnavailableCmuxPath(fixture);
+    const cmuxLog = join(fixture, 'cmux.log');
+    const common = { PATH: fixturePath, SWARM_TEST_CMUX_LOG: cmuxLog };
+    try {
+      for (const [name, surface] of [['BlindA', 'surface-blind-a'], ['BlindB', 'surface-blind-b']]) {
+        const joined = runCli(fixtureHome, ['join', name], {
+          ...common,
+          CMUX_SURFACE_ID: surface,
+          CMUX_WORKSPACE_ID: 'workspace-blind',
+        });
+        assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
+      }
+      const sqlite = new DatabaseSync(join(fixtureHome, '.swarm', 'swarm.db'));
+      sqlite.prepare("UPDATE agents SET last_heartbeat = ? WHERE agent_type = 'cmux'")
+        .run(new Date(Date.now() - 60 * 60 * 1000).toISOString());
+      sqlite.close();
+      writeFileSync(cmuxLog, '');
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const members = runCli(fixtureHome, ['members'], {
+          ...common,
+          CMUX_SURFACE_ID: 'surface-blind-a',
+        });
+        assert.strictEqual(members.status, 0, members.stderr || members.stdout);
+        assert.match(members.stdout, /BlindA/);
+        assert.match(members.stdout, /BlindB/);
+        assert.match(members.stderr, /cmux unreachable from this process — liveness unknown/);
+      }
+
+      const after = new DatabaseSync(join(fixtureHome, '.swarm', 'swarm.db'), { readOnly: true });
+      assert.strictEqual((after.prepare("SELECT count(*) AS n FROM agents WHERE agent_type = 'cmux'").get() as any).n, 2);
+      after.close();
+      assert.deepStrictEqual(readFileSync(cmuxLog, 'utf-8').trim().split('\n'), ['ping', 'ping']);
+    } finally {
+      rmSync(fixture, { recursive: true, force: true });
+    }
   });
 
   test('rename-workspace resolves a Surface id to the agent\'s Workspace id', () => {

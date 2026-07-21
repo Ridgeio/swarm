@@ -4,6 +4,14 @@ Operational notes for diagnosing and recovering the swarm CLI when it breaks. Ma
 
 ---
 
+## Restrictive agent sandboxes
+
+Some agent sandboxes allow source-file writes but deny writes under `.git`. In those environments, task branch/worktree creation and commits cannot succeed. Start the assignment with `swarm task start <slug> --no-worktree` (or give the agent a sandbox profile that permits Git metadata writes). A no-worktree task cannot later use task- or agent-associated rescue; preserve an ad-hoc tree explicitly with `swarm rescue --worktree <path>`.
+
+If the sandbox cannot reach the Cmux socket, Swarm reports `cmux unreachable from this process — liveness unknown`. That observer does not add liveness strikes or reap registrations. Run liveness/reap checks from a process that can successfully run `cmux ping`; do not treat a sandboxed observer's socket denial as evidence that an agent surface is dead.
+
+---
+
 ## node:sqlite runtime floor
 
 Swarm uses Node's built-in `node:sqlite` module and requires Node 24 or newer, as declared by `package.json` `engines.node`. If a host must be downgraded below that floor, recover by reverting the node:sqlite migration commit with `git revert <T5-commit>` before running Swarm there.

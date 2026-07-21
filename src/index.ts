@@ -14,6 +14,7 @@ import {
   getAuthenticatedSelf,
   getOrCreateSwarm,
   getSelf,
+  getSurfaceMarkerConflictWarning,
   getSwarm,
   getSwarmById,
   joinA2AAgent,
@@ -45,7 +46,20 @@ import {
 } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
 import { redeliverPending, runRedeliverWorker, spawnRedeliverWorker, hasPendingRedeliveries } from './redeliver.js';
-import { readScreen, identify, spawnSurfaceInWorkspace, spawnWorkspace, renameTab, moveSurface, listWorkspaces, renameWorkspace, sendToSurface, sleep } from './transport.js';
+import {
+  CMUX_LIVENESS_UNKNOWN_MESSAGE,
+  identify,
+  isCmuxObserverCompetent,
+  listWorkspaces,
+  moveSurface,
+  readScreen,
+  renameTab,
+  renameWorkspace,
+  sendToSurface,
+  sleep,
+  spawnSurfaceInWorkspace,
+  spawnWorkspace,
+} from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
 import { ensureCodexTrust } from './codex-trust.js';
@@ -54,6 +68,7 @@ import { assertNameNotReserved, assertNotModelName } from './reserved-names.js';
 import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 import {
   checkpointTask,
+  claimCloseRequirements,
   closeTask,
   effectiveClaimKind,
   getTask,
@@ -561,6 +576,14 @@ async function main() {
           ? getOrCreateSwarm(db, explicitSwarmName, getFlag('--root'))
           : resolveSelectedSwarm(db, true);
 
+        const identityWarning = getSurfaceMarkerConflictWarning(db, swarm.id);
+        if (identityWarning) console.warn(`Warning: ${identityWarning}.`);
+
+        const priorRegistration = getAgent(db, swarm.id, name);
+        if (priorRegistration && priorRegistration.agent_type !== 'headless' && !isCmuxObserverCompetent()) {
+          console.warn(CMUX_LIVENESS_UNKNOWN_MESSAGE);
+        }
+
         const reaped = await reapIfDead(db, swarm.id, name);
         if (reaped) {
           console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
@@ -664,6 +687,10 @@ async function main() {
 
         const db = getDb();
         const swarm = resolveSelectedSwarm(db, true);
+        const priorRegistration = getAgent(db, swarm.id, name);
+        if (priorRegistration && priorRegistration.agent_type !== 'headless' && !isCmuxObserverCompetent()) {
+          console.warn(CMUX_LIVENESS_UNKNOWN_MESSAGE);
+        }
         const reaped = await reapIfDead(db, swarm.id, name);
         if (reaped) {
           console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
@@ -1020,6 +1047,12 @@ async function main() {
           console.log(`Task "${slug}" ${verb} by ${self.name} at lease epoch ${result.task.lease_epoch}.`);
           if (result.task.branch) console.log(`Branch: ${result.task.branch}`);
           if (result.task.worktree_path) console.log(`Worktree: ${result.task.worktree_path}`);
+          const claimKind = effectiveClaimKind(result.task);
+          console.log(`claim: ${claimKind} — close requires: ${claimCloseRequirements(claimKind)}`);
+          console.log(`change claim: re-run 'swarm task start ${slug} --claim <kind>' (add --takeover if another agent owns it).`);
+          if (hasFlag('--no-worktree')) {
+            console.log("note: no worktree recorded — 'swarm rescue --task/--agent' will refuse for this task; use 'swarm rescue --worktree <path>' for ad-hoc trees.");
+          }
           break;
         }
         if (subcommand === 'checkpoint') {
@@ -1531,6 +1564,9 @@ async function main() {
           }
           console.log(`\n${agents.length} agent(s)`);
         }
+        if (agents.some(agent => agent.agent_type !== 'headless') && !isCmuxObserverCompetent()) {
+          console.warn(CMUX_LIVENESS_UNKNOWN_MESSAGE);
+        }
         break;
       }
 
@@ -1913,6 +1949,11 @@ async function main() {
               process.exit(1);
             }
           } else {
+            const target = getAgent(db, swarm.id, name);
+            if (target && target.agent_type !== 'headless' && !isCmuxObserverCompetent()) {
+              console.log(CMUX_LIVENESS_UNKNOWN_MESSAGE);
+              break;
+            }
             const removed = await reapIfDead(db, swarm.id, name);
             if (removed) {
               console.log(`Reaped "${removed.name}" (${removed.agent_type}) from swarm "${swarm.name}" — surface confirmed dead.`);
@@ -1930,10 +1971,14 @@ async function main() {
             }
           }
         } else {
+          const targets = listAgentsSync(db, swarm?.id);
+          const cmuxUnknown = targets.some(agent => agent.agent_type !== 'headless') &&
+            !isCmuxObserverCompetent();
           const removed = await reapAll(db, swarm?.id);
-          if (removed.length === 0) {
+          if (cmuxUnknown) console.log(CMUX_LIVENESS_UNKNOWN_MESSAGE);
+          if (removed.length === 0 && !cmuxUnknown) {
             console.log('No dead agents found.');
-          } else {
+          } else if (removed.length > 0) {
             console.log(`Reaped ${removed.length} agent(s):`);
             for (const a of removed) console.log(`  ${a.name} (${a.agent_type})${swarm ? '' : ` from ${getSwarmById(db, a.swarm_id)?.name ?? a.swarm_id}`}`);
           }

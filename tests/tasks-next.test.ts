@@ -118,6 +118,41 @@ describe('WI-3 task ledger CLI', () => {
     fs.rmSync(suiteRoot, { recursive: true, force: true });
   });
 
+  test('task start teaches default and explicit claim contracts plus the no-worktree rescue tradeoff', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-start-teach-'));
+    try {
+      joinAgent(home, 'Alice');
+      const defaultClaim = runCli(home, [
+        'task', 'start', 'default-claim', '--title', 'Default claim', '--no-worktree',
+      ], 'Alice');
+      assert.strictEqual(defaultClaim.status, 0, defaultClaim.stderr || defaultClaim.stdout);
+      assert.match(defaultClaim.stdout, /^claim: analysis — close requires: report$/m);
+      assert.match(defaultClaim.stdout, /change claim: re-run 'swarm task start default-claim --claim <kind>'/);
+      assert.match(
+        defaultClaim.stdout,
+        /^note: no worktree recorded — 'swarm rescue --task\/--agent' will refuse for this task; use 'swarm rescue --worktree <path>' for ad-hoc trees\.$/m
+      );
+
+      const explicitClaim = runCli(home, [
+        'task', 'start', 'explicit-claim', '--title', 'Explicit claim', '--no-worktree', '--claim', 'journey-works',
+      ], 'Alice');
+      assert.strictEqual(explicitClaim.status, 0, explicitClaim.stderr || explicitClaim.stdout);
+      assert.match(explicitClaim.stdout, /^claim: journey-works — close requires: journey$/m);
+
+      joinAgent(home, 'Bob');
+      const changedAtTakeover = runCli(home, [
+        'task', 'start', 'explicit-claim', '--takeover', '--no-worktree', '--claim', 'probe',
+      ], 'Bob');
+      assert.strictEqual(changedAtTakeover.status, 0, changedAtTakeover.stderr || changedAtTakeover.stdout);
+      assert.match(changedAtTakeover.stdout, /^claim: probe — close requires: report$/m);
+      const db = openDb(home);
+      assert.strictEqual(taskRow(db, 'explicit-claim').claim_kind, 'probe');
+      db.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('start → checkpoint → close uses a named canonical worktree and remote evidence', () => {
     const root = fs.mkdtempSync(path.join(suiteRoot, 'happy-'));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-home-'));

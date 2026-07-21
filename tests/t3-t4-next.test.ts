@@ -13,6 +13,7 @@ import { getDbAt, getDbReadOnly } from '../src/db.js';
 import { harnessReviewTask } from '../src/harness-review.js';
 import { runJanitorTick } from '../src/janitor.js';
 import { joinAgent, type HostAgentKind, type WorkerVersionRunner } from '../src/registry.js';
+import { CLAIM_KINDS } from '../src/tasks.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
 const INDEX_SOURCE = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
@@ -338,8 +339,15 @@ describe('T4 observer hardening and agent surfaces', () => {
 
     const rendered = renderAgentHelp();
     const lines = rendered.split('\n');
-    assert.ok(lines.every(line => line.length <= 60), `overlong line: ${lines.find(line => line.length > 60)}`);
-    assert.strictEqual(lines.at(-1), 'docs/ROUTING.md');
+    assert.ok(lines.slice(0, -1).every(line => line.length <= 60), `overlong line: ${lines.find(line => line.length > 60)}`);
+    const footer = lines.at(-1)!;
+    assert.ok(path.isAbsolute(footer), footer);
+    assert.ok(fs.existsSync(footer), footer);
+    assert.strictEqual(path.basename(footer), 'ROUTING.md');
+    for (const claimKind of CLAIM_KINDS) {
+      const claimLine = new RegExp(`^claim ${claimKind} → `, 'gm');
+      assert.strictEqual(rendered.match(claimLine)?.length ?? 0, 1, claimKind);
+    }
     for (const entry of AGENT_HELP_ENTRIES) {
       assert.strictEqual(lines.filter(line => line === entry.line).length, 1, entry.command);
     }

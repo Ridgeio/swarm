@@ -53,6 +53,7 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
     CODEX_MANAGED_BY_NPM: '',
     CLAUDE_CODE: '',
     GROK_AGENT: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
     ...env,
   };
   fs.mkdirSync(childEnv.TMPDIR, { recursive: true });

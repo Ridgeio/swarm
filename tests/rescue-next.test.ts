@@ -22,6 +22,7 @@ function runCli(home: string, args: string[], agent?: string): CliResult {
     CMUX_SURFACE_ID: '',
     CMUX_WORKSPACE_ID: '',
     TERM_PROGRAM: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
   };
   try {
     const stdout = execFileSync('node', ['--import', 'tsx', INDEX, ...args], {

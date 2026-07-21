@@ -11,13 +11,29 @@ import { AGENT_HELP_ENTRIES, CANONICAL_CLI_COMMANDS, renderAgentHelp } from '../
 import { collectBoardData } from '../src/board-data.js';
 import { getDbAt, getDbReadOnly } from '../src/db.js';
 import { harnessReviewTask } from '../src/harness-review.js';
-import { runJanitorTick } from '../src/janitor.js';
+import {
+  runJanitorTick as runJanitorTickRaw,
+  type JanitorTickOptions,
+  type JanitorTickResult,
+  type SwarmVersionGitRunner,
+} from '../src/janitor.js';
 import { joinAgent, type HostAgentKind, type WorkerVersionRunner } from '../src/registry.js';
 import { CLAIM_KINDS } from '../src/tasks.js';
+import { REPO_DIR } from '../src/version.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
 const INDEX_SOURCE = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
 const NOW = Date.parse('2026-07-20T18:00:00.000Z');
+const VERSION_SHA = 'a'.repeat(40);
+const VERSION_RUNNER: SwarmVersionGitRunner = (_binary, args) =>
+  args[0] === 'ls-remote' ? `${VERSION_SHA}\trefs/heads/master\n` : `${VERSION_SHA}\n`;
+
+function runJanitorTick(
+  db: SwarmDb,
+  options: JanitorTickOptions = {}
+): JanitorTickResult {
+  return runJanitorTickRaw(db, { versionRunner: VERSION_RUNNER, ...options });
+}
 
 interface CliResult { stdout: string; stderr: string; status: number }
 
@@ -38,6 +54,7 @@ function runCli(home: string, args: string[]): CliResult {
     CLAUDE_CODE: '',
     GROK_AGENT: '',
     GEMINI_CLI: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
   };
   try {
     const stdout = execFileSync('node', ['--import', 'tsx', INDEX, ...args], {
@@ -79,6 +96,21 @@ function tableChecksums(db: SwarmDb): Map<string, string> {
     const rows = db.prepare(`SELECT * FROM "${escaped}" ORDER BY rowid`).all();
     return [name, createHash('sha256').update(JSON.stringify(rows)).digest('hex')];
   }));
+}
+
+function treeMetadata(root: string): string[] {
+  const rows: string[] = [];
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute);
+      const stat = fs.lstatSync(absolute);
+      rows.push(`${relative}\0${entry.isDirectory() ? 'd' : entry.isSymbolicLink() ? 'l' : 'f'}\0${stat.size}\0${stat.mtimeMs}`);
+      if (entry.isDirectory()) visit(absolute);
+    }
+  };
+  visit(root);
+  return rows.sort();
 }
 
 function insertTask(db: SwarmDb, slug: string): void {
@@ -315,13 +347,18 @@ describe('T4 observer hardening and agent surfaces', () => {
     try {
       insertTask(db, 'scope-fixture');
       const before = tableChecksums(db);
-      runJanitorTick(db, {
+      const gitDir = execFileSync('git', ['-C', REPO_DIR, 'rev-parse', '--absolute-git-dir'], {
+        encoding: 'utf-8',
+      }).trim();
+      const beforeGit = treeMetadata(gitDir);
+      runJanitorTickRaw(db, {
         homeDir: home,
         tempScanPaths: [],
         controlsFilePath: path.join(root, 'missing-controls.md'),
         now: NOW,
       });
       assert.deepStrictEqual(tableChecksums(db), before);
+      assert.deepStrictEqual(treeMetadata(gitDir), beforeGit, 'observe tick must not modify the swarm repo .git');
     } finally {
       db.close();
       fs.rmSync(root, { recursive: true, force: true });

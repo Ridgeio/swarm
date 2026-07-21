@@ -65,6 +65,7 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
 
   { command: 'grant', group: 'grants+escalation', line: 'grant — create, list, or revoke authority' },
   { command: 'escalate', group: 'grants+escalation', line: 'escalate — create a decision packet' },
+  { command: 'review', group: 'grants+escalation', line: 'review — route a cross-family gate review' },
 
   { command: 'board', group: 'board', line: 'board — render fleet state or graph' },
   { command: 'stats', group: 'board', line: 'stats — show fleet metrics' },

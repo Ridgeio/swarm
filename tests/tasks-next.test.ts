@@ -52,6 +52,7 @@ function runCli(home: string, args: string[], agent?: string, cwd?: string): Cli
     CODEX_MANAGED_BY_NPM: '',
     CLAUDE_CODE: '',
     GROK_AGENT: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
   };
   try {
     const stdout = execFileSync('node', ['--import', TSX_IMPORT, INDEX, ...args], {

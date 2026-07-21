@@ -124,6 +124,8 @@ swarm escalate my-task --question "May this branch merge?" --to Lead
 
 Escalation packets are written under `~/.swarm/briefs/escalations/`; the mailbox carries only the packet path. Future production and spending commands must enforce the same live, matching `prod` or `spend` grant check; no such command exists yet. See [docs/ROUTING.md](docs/ROUTING.md) for when to grant or escalate, and keep credentials out of notes, packets, and evidence as required by [docs/credentials.md](docs/credentials.md).
 
+Use `swarm review <task-slug>` to route gate review to a live reviewer from a different model family; same-family exceptions require `--same-family-ok --reason "<text>"` and are audited.
+
 Trust model: on this trusted, single-operator machine, grants and session tokens add records, expiry, scope, and audit; they do not create cryptographic separation from a malicious local process. Local joins mint a session token and identity-resolving mutation verbs verify the matching session marker. Legacy NULL-token rows remain usable until rejoin. A2A identity remains endpoint-based.
 
 The operating principles are in [docs/philosophy.md](docs/philosophy.md), the ledger contracts are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md), and the claim/evidence contracts are in [docs/design/SWARM-NEXT-V2.md](docs/design/SWARM-NEXT-V2.md).
@@ -190,6 +192,8 @@ Task ledger:
   swarm grant revoke <id>                       Revoke a grant
   swarm escalate <slug> [--question <text>]     Write and send an escalation packet
         [--to <agent>]
+  swarm review <slug> [--to <agent>]            Route a cross-family gate review
+        [--same-family-ok --reason <text>]
   swarm task list                              List the durable task ledger
   swarm task show <slug>                       Show task facts, events, and decisions
   swarm handoff <slug> --to <agent>            Transfer with a fresh checkpoint brief

@@ -22,6 +22,7 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
     // Start each call from a clean identity so nothing leaks in from the test runner.
     SWARM_ID: '', SWARM_NAME: '', SWARM_AGENT_NAME: '', SWARM_SESSION_TOKEN: '',
     CMUX_SURFACE_ID: '', CMUX_WORKSPACE_ID: '', TERM_PROGRAM: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
     ...env,
   };
   if (childEnv.SWARM_AGENT_NAME && !Object.prototype.hasOwnProperty.call(env, 'SWARM_SESSION_TOKEN')) {

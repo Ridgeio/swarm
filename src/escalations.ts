@@ -54,7 +54,7 @@ function eventData(raw: string | null): Record<string, unknown> | null {
   }
 }
 
-function latestCheckpoint(
+export function latestCheckpoint(
   db: SwarmDb,
   task: Task
 ): { path: string | null; body: string | null } {
@@ -108,7 +108,7 @@ function resolveQuestion(task: Task, explicit: string | undefined, checkpointBod
   return question;
 }
 
-function evidenceLines(db: SwarmDb, task: Task): string[] {
+export function evidenceLines(db: SwarmDb, task: Task): string[] {
   const rows = db.prepare(`
     SELECT id, kind, data, created_at
     FROM task_events

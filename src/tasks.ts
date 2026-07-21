@@ -419,7 +419,7 @@ function checkAuthority(
   }) as AuthorityCheck;
 }
 
-function requireAuthority(
+export function requireTaskAuthority(
   db: SwarmDb,
   swarmId: string,
   slug: string,
@@ -572,7 +572,7 @@ export async function reopenTask(
   if (!['done', 'abandoned'].includes(prior.state)) {
     throw new Error(`Task "${slug}" is ${prior.state}; reopen only accepts done or abandoned tasks.`);
   }
-  if (!options.takeover) requireAuthority(db, swarmId, slug, actor, 'reopen');
+  if (!options.takeover) requireTaskAuthority(db, swarmId, slug, actor, 'reopen');
 
   const result = withImmediateTransaction(db, () => {
     const current = getTask(db, swarmId, slug);
@@ -710,7 +710,7 @@ export function checkpointTask(
   notes?: string
 ): CheckpointResult {
   validateTaskSlug(slug);
-  const authority = requireAuthority(db, swarmId, slug, actor, 'checkpoint');
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'checkpoint');
   const task = authority.task;
   const dir = checkpointDir(task);
   fs.mkdirSync(dir, { recursive: true });
@@ -1102,7 +1102,7 @@ export async function closeTask(
     throw new Error('--reason requires --override.');
   }
 
-  const authority = requireAuthority(db, swarmId, slug, actor, 'close');
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'close');
   const task = authority.task;
   const claimKind = effectiveClaimKind(task);
   if (options.override) requireCloseGrant(db, task, actor, 'override');
@@ -1355,7 +1355,7 @@ export async function handoffTask(
   if (!target) throw new Error(`Agent "${targetName}" not found in this swarm.`);
   if (sameName(target.name, actor)) throw new Error('Cannot hand a task off to yourself.');
 
-  const authority = requireAuthority(db, swarmId, slug, actor, 'handoff');
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'handoff');
   const task = authority.task;
   const checkpoint = latestCheckpoint(db, task);
   if (!checkpoint || !fs.existsSync(checkpoint.path)) {

@@ -3,15 +3,58 @@ import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import { REPO_DIR } from './version.js';
 
-const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const MODULE_ROOT = REPO_DIR;
 const DEFAULT_CONTROLS_PATH = path.join(MODULE_ROOT, 'docs', 'controls.md');
 const WORKER_REQUALIFICATION_RUNBOOK = 'docs/runbooks/requalify-worker.md';
+const SWARM_VERSION_CACHE_KEY = 'swarm_version_check';
 
 export const JANITOR_TICK_STALENESS_MS = 10 * 60 * 1000;
 export const JANITOR_HEARTBEAT_STALE_MS = 30 * 60 * 1000;
 export const JANITOR_LOCK_STALE_MS = 10 * 60 * 1000;
+export const SWARM_VERSION_CACHE_STALE_MS = 6 * 60 * 60 * 1000;
+
+export type SwarmVersionStatus = 'current' | 'update-available' | 'unknown';
+
+export interface SwarmVersionCache {
+  local_sha: string | null;
+  remote_sha: string | null;
+  checked_at: string;
+  status: SwarmVersionStatus;
+}
+
+export interface SwarmVersionGitOptions {
+  cwd: string;
+  encoding: 'utf-8';
+  timeout: number;
+  env: NodeJS.ProcessEnv;
+  stdio: ['ignore', 'pipe', 'pipe'];
+}
+
+export type SwarmVersionGitRunner = (
+  binary: 'git',
+  args: string[],
+  options: SwarmVersionGitOptions
+) => string | Buffer;
+
+export interface SwarmVersionCheckOptions {
+  now?: number;
+  repoDir?: string;
+  runner?: SwarmVersionGitRunner;
+}
+
+export interface JoinUpdateAwarenessOptions {
+  now?: number;
+  repoDir?: string;
+  spawnTick?: () => void;
+  print?: (line: string) => void;
+}
+
+export interface JoinUpdateAwarenessResult {
+  banner: string | null;
+  spawned: boolean;
+}
 
 export interface JanitorCounters {
   worktrees: number;
@@ -72,6 +115,9 @@ export interface JanitorTickOptions extends JanitorPathsOptions {
   lockStaleMs?: number;
   /** Registry fixture override; production resolves docs/controls.md from the package root. */
   controlsFilePath?: string;
+  /** Injectable read-only Git runner and repo path for the update-awareness step. */
+  versionRunner?: SwarmVersionGitRunner;
+  versionRepoDir?: string;
 }
 
 export interface JanitorTickResult {
@@ -641,6 +687,104 @@ function persistTick(
   });
 }
 
+const defaultSwarmVersionGitRunner: SwarmVersionGitRunner = (binary, args, options) =>
+  execFileSync(binary, args, options);
+
+/**
+ * Compare this checkout to origin/master without updating refs, FETCH_HEAD, or
+ * any other repository state. The result is always cached, including failures.
+ */
+export function checkSwarmVersion(
+  db: SwarmDb,
+  options: SwarmVersionCheckOptions = {}
+): SwarmVersionCache {
+  const checkedAt = new Date(options.now ?? Date.now()).toISOString();
+  const runner = options.runner ?? defaultSwarmVersionGitRunner;
+  const run = (args: string[]): string => String(runner('git', args, {
+    cwd: path.resolve(options.repoDir ?? REPO_DIR),
+    encoding: 'utf-8',
+    timeout: 5_000,
+    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  })).trim();
+
+  let localSha: string | null = null;
+  let remoteSha: string | null = null;
+  let status: SwarmVersionStatus = 'unknown';
+  try {
+    localSha = run(['rev-parse', 'HEAD']);
+    const remote = run(['ls-remote', 'origin', 'master']);
+    remoteSha = remote.split(/\s+/, 1)[0] || null;
+    if (!localSha || !remoteSha) throw new Error('missing local or remote SHA');
+    status = localSha === remoteSha ? 'current' : 'update-available';
+  } catch {
+    status = 'unknown';
+  }
+
+  const cache: SwarmVersionCache = {
+    local_sha: localSha,
+    remote_sha: remoteSha,
+    checked_at: checkedAt,
+    status,
+  };
+  db.prepare(`
+    INSERT INTO janitor_kv (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `).run(SWARM_VERSION_CACHE_KEY, JSON.stringify(cache), checkedAt);
+  return cache;
+}
+
+export function getSwarmVersionCache(db: SwarmDb): SwarmVersionCache | null {
+  const row = db.prepare('SELECT value FROM janitor_kv WHERE key = ?')
+    .get(SWARM_VERSION_CACHE_KEY) as { value: string } | undefined;
+  if (!row) return null;
+  try {
+    const parsed = JSON.parse(row.value) as Partial<SwarmVersionCache>;
+    if (
+      (parsed.local_sha !== null && typeof parsed.local_sha !== 'string') ||
+      (parsed.remote_sha !== null && typeof parsed.remote_sha !== 'string') ||
+      typeof parsed.checked_at !== 'string' ||
+      !['current', 'update-available', 'unknown'].includes(String(parsed.status))
+    ) return null;
+    return parsed as SwarmVersionCache;
+  } catch {
+    return null;
+  }
+}
+
+export function formatSwarmUpdateBanner(
+  cache: SwarmVersionCache | null,
+  repoDir: string = REPO_DIR
+): string | null {
+  if (cache?.status !== 'update-available') return null;
+  return `swarm update available — cd ${path.resolve(repoDir)} && git pull && npm install && npm run build`;
+}
+
+export function shouldRefreshSwarmVersion(
+  cache: SwarmVersionCache | null,
+  now: number = Date.now()
+): boolean {
+  if (!cache) return true;
+  const checkedAt = new Date(cache.checked_at).getTime();
+  return !Number.isFinite(checkedAt) || now - checkedAt > SWARM_VERSION_CACHE_STALE_MS;
+}
+
+/** Print cached update advice and asynchronously refresh absent/stale caches. */
+export function handleJoinUpdateAwareness(
+  db: SwarmDb,
+  options: JoinUpdateAwarenessOptions = {}
+): JoinUpdateAwarenessResult {
+  const cache = getSwarmVersionCache(db);
+  const banner = formatSwarmUpdateBanner(cache, options.repoDir ?? REPO_DIR);
+  if (banner) (options.print ?? console.log)(banner);
+  const spawned = shouldRefreshSwarmVersion(cache, options.now ?? Date.now());
+  if (spawned) (options.spawnTick ?? spawnJanitorTick)();
+  return { banner, spawned };
+}
+
 /** Recompute the complete observe-only census. No probe writes outside ~/.swarm. */
 export function runJanitorTick(
   db: SwarmDb,
@@ -652,6 +796,11 @@ export function runJanitorTick(
   const started = performance.now();
   try {
     const tickAt = new Date(options.now ?? Date.now()).toISOString();
+    checkSwarmVersion(db, {
+      now: options.now,
+      repoDir: options.versionRepoDir,
+      runner: options.versionRunner,
+    });
     const roots = loadOrSeedJanitorRoots(db, options);
     const repos = discoverRepositories(roots);
     const findings = new Map<string, Finding>();
@@ -725,6 +874,10 @@ export function shouldSpawnJanitorTick(status: JanitorStatus | null, now: number
 
 /** Fire-and-forget an observe-only janitor tick (no-op if spawn fails). */
 export function spawnJanitorTick(): void {
+  // Node's test runner marks test workers with this internal context. Tests use
+  // the injected spawn seam above; suppressing real detached children prevents
+  // them from racing temporary-home cleanup after CLI integration assertions.
+  if (process.env.NODE_TEST_CONTEXT || process.env.SWARM_TEST_DISABLE_BACKGROUND === '1') return;
   try {
     const child = spawn(
       process.execPath,

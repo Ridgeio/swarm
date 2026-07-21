@@ -87,7 +87,10 @@ import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './resc
 import {
   addJanitorRoot,
   formatJanitorHookLine,
+  formatSwarmUpdateBanner,
   getJanitorStatus,
+  getSwarmVersionCache,
+  handleJoinUpdateAwareness,
   installJanitorLaunchAgent,
   readJanitorRoots,
   removeJanitorRoot,
@@ -117,6 +120,7 @@ import {
 } from './board-server.js';
 import { createGrant, listGrants, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
+import { requestTaskReview } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
 import { renderAgentHelp } from './agent-help.js';
 
@@ -350,6 +354,8 @@ Task Ledger:
   swarm grant revoke <id>                          Revoke a grant
   swarm escalate <slug> [--question <text>]        Write and send a decision-ready packet
     [--to <agent>]
+  swarm review <slug> [--to <agent>]               Route an inverted-family review request
+    [--same-family-ok --reason <text>]
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
   swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
@@ -506,11 +512,13 @@ function printHookContext(): void {
   const taskSection = taskLines.length ? `\n${taskLines.join('\n')}` : '';
   const janitorStatus = getJanitorStatus(db);
   const janitorSection = janitorStatus ? `\n${formatJanitorHookLine(janitorStatus)}` : '';
+  const updateBanner = formatSwarmUpdateBanner(getSwarmVersionCache(db));
+  const updateSection = updateBanner ? `\n${updateBanner}` : '';
 
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | inbox [--wait N] | members | status --set "<desc>" | task start/checkpoint/close | board --tab${readCommand} | help --agent (full map)
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${updateSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
@@ -643,6 +651,7 @@ async function main() {
             console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (surface: ${agent.surface_id})${hostLabel}`);
           }
         }
+        handleJoinUpdateAwareness(db);
         break;
       }
 
@@ -1214,6 +1223,26 @@ async function main() {
         } else {
           console.log(`No active recipient found. Deliver this path manually: ${result.briefPath}`);
         }
+        break;
+      }
+
+      case 'review': {
+        const slug = args[1];
+        if (!slug) {
+          console.error('Usage: swarm review <slug> [--to <agent>] [--same-family-ok --reason <text>]');
+          process.exit(1);
+        }
+        const { db, self } = requireSelf(true);
+        const result = await requestTaskReview(db, self.swarm_id, self.name, slug, {
+          to: getFlag('--to'),
+          sameFamilyOk: hasFlag('--same-family-ok'),
+          reason: getFlag('--reason'),
+        });
+        console.log(`Review brief: ${result.briefPath}`);
+        console.log(
+          `Pointer sent to ${result.reviewer} (${result.reviewerFamily}); ` +
+          `task "${slug}" is awaiting_review.`
+        );
         break;
       }
 

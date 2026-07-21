@@ -5,7 +5,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath, pathToFileURL } from 'url';
-import { getDbAt } from '../src/db.js';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 import {
   acquireJanitorLock,
   addJanitorRoot,
@@ -16,15 +16,28 @@ import {
   JANITOR_TICK_STALENESS_MS,
   readJanitorRoots,
   removeJanitorRoot,
-  runJanitorTick,
+  runJanitorTick as runJanitorTickRaw,
   shouldSpawnJanitorTick,
   uninstallJanitorLaunchAgent,
   type JanitorCounters,
   type JanitorStatus,
+  type JanitorTickOptions,
+  type JanitorTickResult,
+  type SwarmVersionGitRunner,
 } from '../src/janitor.js';
 import { formatFleetStats, getFleetStats } from '../src/stats.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+const VERSION_SHA = 'a'.repeat(40);
+const VERSION_RUNNER: SwarmVersionGitRunner = (_binary, args) =>
+  args[0] === 'ls-remote' ? `${VERSION_SHA}\trefs/heads/master\n` : `${VERSION_SHA}\n`;
+
+function runJanitorTick(
+  db: SwarmDb,
+  options: JanitorTickOptions = {}
+): JanitorTickResult {
+  return runJanitorTickRaw(db, { versionRunner: VERSION_RUNNER, ...options });
+}
 
 interface CliResult { stdout: string; stderr: string; status: number }
 
@@ -47,6 +60,7 @@ function runCli(home: string, args: string[], envOverrides: Record<string, strin
     CODEX_MANAGED_BY_NPM: '',
     CLAUDE_CODE: '',
     GROK_AGENT: '',
+    SWARM_TEST_DISABLE_BACKGROUND: '1',
     ...envOverrides,
   };
   try {

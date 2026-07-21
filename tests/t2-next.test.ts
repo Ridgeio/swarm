@@ -561,3 +561,24 @@ describe('T2.5 board projection', () => {
     }
   });
 });
+
+describe('escalation self-routing guard', () => {
+  test('solo-agent escalation prints manual path instead of self-delivering; --to self refused', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-esc-'));
+    try {
+      fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+      const db = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+      joinHeadlessAgent(db, 'default', 'Solo', undefined, { hostAgent: 'claude-code' });
+      startTask(db, 'default', 'Solo', 'solo-esc', { title: 'T', noWorktree: true, claim: 'decision' });
+      const result = await escalateTask(db, 'default', 'Solo', 'solo-esc', { question: 'ship it?', homeDir: home });
+      assert.strictEqual(result.recipient, null, 'no self-delivery: recipient must be null when alone');
+      assert.ok(fs.existsSync(result.briefPath), 'packet still written for manual delivery');
+      await assert.rejects(
+        () => escalateTask(db, 'default', 'Solo', 'solo-esc', { question: 'again?', to: 'Solo', homeDir: home }),
+        /Refusing to escalate to yourself/
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});

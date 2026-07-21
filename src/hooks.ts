@@ -19,6 +19,11 @@ export function detectHost(): HostAgent | null {
     return 'codex';
   }
   if (process.env.CLAUDE_CODE) return 'claude-code';
+  // Cmux labels the launch kind for every agent it starts; Bash subshells of a
+  // Claude Code session carry this even when CLAUDE_CODE itself is not exported
+  // (field finding: both program Leads joined with NULL host without it).
+  if (process.env.CMUX_AGENT_LAUNCH_KIND === 'claude') return 'claude-code';
+  if (process.env.CMUX_AGENT_LAUNCH_KIND === 'codex') return 'codex';
   // Grok sets GROK_AGENT (often "1") in interactive sessions; Cmux labels launch kind.
   if (process.env.CMUX_AGENT_LAUNCH_KIND === 'grok' || process.env.GROK_AGENT) {
     return 'grok';

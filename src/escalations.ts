@@ -224,10 +224,20 @@ export async function escalateTask(
   if (options.to) {
     const target = getAgent(db, swarmId, options.to);
     if (!target) throw new Error(`Agent "${options.to}" not found in this swarm. Run "swarm members" and retry --to.`);
+    if (target.name.toLowerCase() === actor.toLowerCase()) {
+      throw new Error(
+        `Refusing to escalate to yourself ("${actor}") — an escalation requests an OPERATOR decision. ` +
+        `With no other agent live, omit --to: the packet path prints for manual delivery to your operator.`
+      );
+    }
     recipient = target.name;
   } else {
     const agents = await listAgents(db, swarmId);
-    recipient = agents[0]?.name ?? null;
+    // Never route an escalation to its own sender: in a fresh one-agent swarm
+    // the old first-joined fallback picked the escalator itself, ghost-delivering
+    // (pushed to the terminal but inbox-filtered as an own-message, unackable).
+    // No other agent live -> the manual-delivery path below.
+    recipient = agents.find(agent => agent.name.toLowerCase() !== actor.toLowerCase())?.name ?? null;
   }
 
   const now = options.now ?? new Date();

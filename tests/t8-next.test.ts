@@ -109,6 +109,34 @@ describe('T8 CLI cmux layout discipline', () => {
     }
   });
 
+  test('spawned workers get permission-skip flags by default; --interactive-permissions omits them', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-spawn-perms-'));
+    const fixture = fakeCmux(root);
+    try {
+      for (const [agent, expected] of [['codex', '--yolo'], ['grok', '--always-approve'], ['gemini', '--yolo'], ['claude', '--dangerously-skip-permissions']] as const) {
+        const result = runCli(path.join(root, 'home'), [
+          'spawn', '--agent', agent, '--terminal', 'cmux',
+        ], { PATH: fixture.pathValue, SWARM_T8_CMUX_LOG: fixture.log });
+        assert.strictEqual(result.status, 0, `${agent}: ${result.stderr || result.stdout}`);
+        // TUI sends chunk the typed command at 60 chars; reassemble the chunk
+        // payloads (dropping each line's send-prefix) before asserting, or a
+        // flag split across chunks can never match.
+        const payloads = fs.readFileSync(fixture.log, 'utf-8').split('\n')
+          .map(line => line.match(/^send .*?--surface \S+ (.*)$/)?.[1] ?? '')
+          .join('');
+        assert.ok(payloads.includes(expected), `${agent} spawn must carry ${expected}`);
+      }
+      fs.writeFileSync(fixture.log, '');
+      const safe = runCli(path.join(root, 'home'), [
+        'spawn', '--agent', 'codex', '--terminal', 'cmux', '--interactive-permissions',
+      ], { PATH: fixture.pathValue, SWARM_T8_CMUX_LOG: fixture.log });
+      assert.strictEqual(safe.status, 0, safe.stderr || safe.stdout);
+      assert.ok(!fs.readFileSync(fixture.log, 'utf-8').includes('--yolo'), 'opt-out must omit --yolo');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('spawn default remains a surface in the caller workspace', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-spawn-tab-'));
     const fixture = fakeCmux(root);

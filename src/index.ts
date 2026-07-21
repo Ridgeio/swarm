@@ -393,10 +393,13 @@ Status:
                                                      ack ratio, per-agent traffic, top pairs
 
 Local Agents:
-  swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
+  swarm spawn [--cwd <path>]                       Spawn an agent in a new tab (permission
+    [--interactive-permissions]                      dialogs SKIPPED by default — unattended
+                                                     workers can't click "allow"; this flag
+                                                     restores dialogs)
     [--agent claude|codex|grok] [--name <name>]
     [--split [left|right|up|down] | --new-workspace <name>]
-    [--terminal auto|cmux|warp]                      (default: auto; --autonomous adds
+    [--terminal auto|cmux|warp]                      (default: auto; permissive adds
                                                       --dangerously-skip-permissions for claude,
                                                       --yolo for codex, --always-approve for grok)
 
@@ -1794,7 +1797,11 @@ async function main() {
         }
         const name = getFlag('--name');
         const cwd = getFlag('--cwd') || process.cwd();
-        const autonomous = hasFlag('--autonomous');
+        // Spawned swarm workers run WITHOUT permission dialogs by DEFAULT (Tom,
+        // 2026-07-21): an unattended agent cannot click "allow", so a dialog is a
+        // stall, not a safeguard, on this trusted machine. --interactive-permissions
+        // opts back into dialogs; --autonomous is retained as a compat no-op.
+        const permissive = !hasFlag('--interactive-permissions');
         const agentFlag = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
         const terminalFlag = (getFlag('--terminal') || 'auto').toLowerCase();
         let selectedTerminal: 'cmux' | 'warp';
@@ -1818,7 +1825,7 @@ async function main() {
         // Agents that receive join instructions as their initial prompt (no post-spawn /join-swarm).
         let joinViaPrompt = false;
         if (agentFlag === 'claude') {
-          agentCmd = autonomous ? 'claude --dangerously-skip-permissions' : 'claude';
+          agentCmd = permissive ? 'claude --dangerously-skip-permissions' : 'claude';
           agentLabel = 'Claude Code';
         } else if (agentFlag === 'codex') {
           // Pre-trust the cwd in ~/.codex/config.toml so spawned codex
@@ -1836,7 +1843,7 @@ async function main() {
           // Codex doesn't have a /join-swarm slash command; pass the join
           // instructions as Codex's initial prompt instead of relying on
           // a post-spawn keystroke.
-          const perms = autonomous ? ' --yolo' : '';
+          const perms = permissive ? ' --yolo' : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
           const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
@@ -1850,7 +1857,7 @@ async function main() {
           // same reliability pattern as Codex. Skills install provides /join-swarm
           // for interactive use, but spawn shouldn't depend on TUI boot timing.
           const absoluteCwd = path.resolve(cwd);
-          const perms = autonomous ? ' --always-approve' : '';
+          const perms = permissive ? ' --always-approve' : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
           const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
@@ -1859,8 +1866,21 @@ async function main() {
           agentCmd = `grok --cwd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
           agentLabel = 'Grok CLI';
           joinViaPrompt = true;
+        } else if (agentFlag === 'gemini' || agentFlag === 'agy') {
+          // Gemini CLI: -i runs the prompt then stays interactive; --yolo skips
+          // approval dialogs (unattended workers cannot click "allow").
+          const absoluteCwd = path.resolve(cwd);
+          const perms = permissive ? ' --yolo' : '';
+          const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
+          const swarmFlag = `--swarm ${swarm.name}`;
+          const joinInstruction = name
+            ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
+            : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
+          agentCmd = `gemini${perms} -i ${shellQuote(joinInstruction)}`;
+          agentLabel = 'Gemini CLI';
+          joinViaPrompt = true;
         } else {
-          console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex, grok.`);
+          console.error(`Unknown --agent "${agentFlag}". Supported: claude, codex, grok, gemini.`);
           process.exit(1);
         }
 

@@ -23,6 +23,7 @@ Containers carry meaning — don't create them casually:
 - **Swarmmates join as tabs** (new surfaces) in the program workspace — switching to the workspace shows the whole fleet.
 - **Seeing two+ things at once = a tiled split in the current workspace**, not a new workspace: the board beside your work, watching another agent, comparing outputs. 2–3 panes max; past that, tabs. (`swarm board --tab` splits beside you by default; `--own-workspace` is for the program-workspace setup.)
 - **Scripted/short-lived children get no surface at all** — join `--headless`.
+- **Spawned workers run permission-dialog-free by default** (`--dangerously-skip-permissions` / `--yolo` / `--always-approve` per CLI — an unattended agent cannot click "allow", so dialogs are stalls, not safeguards, on this trusted machine). `swarm spawn --interactive-permissions` opts back in for supervised sessions.
 
 ## Fleet size
 

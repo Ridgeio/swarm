@@ -377,10 +377,13 @@ describe('T4 observer hardening and agent surfaces', () => {
     const rendered = renderAgentHelp();
     const lines = rendered.split('\n');
     const closeTeaching = 'close records a disposition; it never performs a merge — landing happens via your operator/gates';
+    const boardTeaching = 'board — render fleet state or graph (splits beside you; --own-workspace for program setup)';
     assert.ok(rendered.includes(closeTeaching));
+    assert.ok(rendered.includes(boardTeaching));
+    assert.ok(rendered.includes('spawn --split | --new-workspace <name>'));
     assert.ok(
-      lines.slice(0, -1).filter(line => line !== closeTeaching).every(line => line.length <= 60),
-      `overlong line: ${lines.find(line => line.length > 60 && line !== closeTeaching)}`
+      lines.slice(0, -1).filter(line => line !== closeTeaching && line !== boardTeaching).every(line => line.length <= 60),
+      `overlong line: ${lines.find(line => line.length > 60 && line !== closeTeaching && line !== boardTeaching)}`
     );
     const footer = lines.at(-1)!;
     assert.ok(path.isAbsolute(footer), footer);

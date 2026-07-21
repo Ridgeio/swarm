@@ -3,7 +3,12 @@ import assert from 'node:assert';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isTransientCmuxError, sendToSurface } from '../src/transport.js';
+import {
+  isTransientCmuxError,
+  sendToSurface,
+  spawnBrowserPaneInWorkspace,
+  spawnSplitInWorkspace,
+} from '../src/transport.js';
 import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, isCodexScreenIdle, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
 
 // The transient/gone classification decides whether a failed cmux send is retried
@@ -49,6 +54,71 @@ describe('isTransientCmuxError', () => {
     assert.strictEqual(isTransientCmuxError(null), false);
     assert.strictEqual(isTransientCmuxError(undefined), false);
     assert.strictEqual(isTransientCmuxError({}), false);
+  });
+});
+
+describe('T8 spawnSplitInWorkspace', () => {
+  test('diffs pane surfaces, plumbs direction/workspace, and sends into the new split', () => {
+    const calls: string[][] = [];
+    let listCount = 0;
+    const result = spawnSplitInWorkspace(
+      '/tmp/swarm project',
+      'echo ready',
+      'left',
+      'workspace:9',
+      {
+        resolveBinary: () => '/fixture/cmux',
+        wait: () => {},
+        runner: (_binary, args) => {
+          calls.push(args);
+          if (args[0] === 'list-pane-surfaces') {
+            listCount += 1;
+            return listCount === 1 ? 'surface:1\n' : 'surface:1\nsurface:2\n';
+          }
+          if (args[0] === 'new-split') return 'OK workspace:9';
+          return '';
+        },
+      }
+    );
+
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:9', surfaceRef: 'surface:2' });
+    assert.ok(calls.some(args => args.join('\0') === [
+      'new-split', 'left', '--workspace', 'workspace:9',
+    ].join('\0')));
+    assert.ok(calls.some(args => args.join('\0') === [
+      'send', '--workspace', 'workspace:9', '--surface', 'surface:2',
+      "cd '/tmp/swarm project' && echo ready",
+    ].join('\0')));
+    assert.ok(calls.some(args => args.join('\0') === [
+      'send-key', '--workspace', 'workspace:9', '--surface', 'surface:2', 'Enter',
+    ].join('\0')));
+  });
+
+  test('browser panes use new-pane with type, direction, URL, and workspace targeting', () => {
+    const calls: string[][] = [];
+    let listCount = 0;
+    const result = spawnBrowserPaneInWorkspace(
+      'file:///tmp/swarm%20graph.html',
+      'down',
+      'workspace:9',
+      {
+        resolveBinary: () => '/fixture/cmux',
+        runner: (_binary, args) => {
+          calls.push(args);
+          if (args[0] === 'list-pane-surfaces') {
+            listCount += 1;
+            return listCount === 1 ? 'surface:1\n' : 'surface:1\nsurface:4\n';
+          }
+          if (args[0] === 'new-pane') return 'OK workspace:9';
+          return '';
+        },
+      }
+    );
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:9', surfaceRef: 'surface:4' });
+    assert.ok(calls.some(args => args.join('\0') === [
+      'new-pane', '--type', 'browser', '--direction', 'down',
+      '--workspace', 'workspace:9', '--url', 'file:///tmp/swarm%20graph.html',
+    ].join('\0')));
   });
 });
 

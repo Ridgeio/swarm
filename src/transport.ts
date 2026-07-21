@@ -51,11 +51,21 @@ const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe'
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_BACKOFF_BASE_S = 0.3;
 
-export type CmuxLivenessRunner = (
+export type CmuxRunner = (
   binary: string,
   args: string[],
   options: typeof STDIO_OPTS
 ) => string | Buffer;
+
+export type CmuxLivenessRunner = CmuxRunner;
+
+export type CmuxSplitDirection = 'left' | 'right' | 'up' | 'down';
+
+export interface CmuxCommandOptions {
+  runner?: CmuxRunner;
+  resolveBinary?: () => string;
+  wait?: (seconds: number) => void;
+}
 
 export interface CmuxLivenessObserver {
   /**
@@ -105,17 +115,22 @@ function shellQuote(value: string): string {
 // File-based lock to prevent concurrent sends to the same surface from interleaving chunks.
 // Uses mkdir atomicity: mkdir fails if the dir already exists, providing a cross-process mutex.
 const LOCK_DIR = path.join(os.homedir(), '.swarm', 'locks');
+const FALLBACK_LOCK_DIR = path.join(os.tmpdir(), `swarm-${process.getuid?.() ?? process.pid}`, 'locks');
 const LOCK_TIMEOUT_MS = 15_000;
 const LOCK_POLL_MS = 50;
 const LOCK_STALE_MS = 30_000; // Force-break locks older than this (dead process)
 
-function lockPathForSurface(surfaceId: string): string {
-  return path.join(LOCK_DIR, `surface-${surfaceId.replace(/[^a-zA-Z0-9-]/g, '_')}.lock`);
+function lockPathForSurface(surfaceId: string, lockDir: string = LOCK_DIR): string {
+  return path.join(lockDir, `surface-${surfaceId.replace(/[^a-zA-Z0-9-]/g, '_')}.lock`);
 }
 
-function acquireSurfaceLock(surfaceId: string): string {
-  fs.mkdirSync(LOCK_DIR, { recursive: true });
-  const lockPath = lockPathForSurface(surfaceId);
+function acquireSurfaceLockFrom(surfaceId: string, lockDir: string, allowFallback: boolean): string {
+  try {
+    fs.mkdirSync(lockDir, { recursive: true });
+  } catch {
+    return allowFallback ? acquireSurfaceLockFrom(surfaceId, FALLBACK_LOCK_DIR, false) : '';
+  }
+  const lockPath = lockPathForSurface(surfaceId, lockDir);
   const deadline = Date.now() + LOCK_TIMEOUT_MS;
 
   while (Date.now() < deadline) {
@@ -123,9 +138,13 @@ function acquireSurfaceLock(surfaceId: string): string {
       // mkdir is atomic — fails if already exists
       fs.mkdirSync(lockPath);
       // Write our PID so stale locks can be detected
-      fs.writeFileSync(path.join(lockPath, 'pid'), String(process.pid));
+      // The marker is diagnostic only; the mkdir itself already owns the lock.
+      try { fs.writeFileSync(path.join(lockPath, 'pid'), String(process.pid)); } catch {}
       return lockPath;
-    } catch {
+    } catch (error: any) {
+      if (error?.code !== 'EEXIST') {
+        return allowFallback ? acquireSurfaceLockFrom(surfaceId, FALLBACK_LOCK_DIR, false) : '';
+      }
       // Lock exists — check if stale
       try {
         const stat = fs.statSync(lockPath);
@@ -146,12 +165,16 @@ function acquireSurfaceLock(surfaceId: string): string {
   return '';
 }
 
+function acquireSurfaceLock(surfaceId: string): string {
+  return acquireSurfaceLockFrom(surfaceId, LOCK_DIR, true);
+}
+
 function releaseSurfaceLock(lockPath: string): void {
   if (!lockPath) return;
   try { fs.rmSync(lockPath, { recursive: true, force: true }); } catch {}
 }
 
-export interface SendToSurfaceOptions {
+export interface SendToSurfaceOptions extends CmuxCommandOptions {
   /**
    * How many times to press Enter after typing. Grok's TUI queues interjected
    * input on a single Enter and only submits on the second; Claude/Codex submit
@@ -214,7 +237,9 @@ export function sendToSurface(
   workspaceId?: string | null,
   options?: SendToSurfaceOptions
 ): boolean {
-  const cmux = resolveCmux();
+  const runner = options?.runner ?? execFileSync;
+  const cmux = (options?.resolveBinary ?? resolveCmux)();
+  const wait = options?.wait ?? sleep;
   const safe = sanitize(text);
   const enterCount = Math.max(1, options?.enterCount ?? 1);
   const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
@@ -226,10 +251,18 @@ export function sendToSurface(
       if (!lockPath) return false;
       try {
         const lines = options.screenGuardLines ?? 30;
-        const first = readScreen(surfaceId, lines, workspaceId);
+        const first = runner(
+          cmux,
+          ['read-screen', ...wsArgs, '--surface', surfaceId, '--lines', String(lines)],
+          STDIO_OPTS
+        ).toString();
         if (!options.screenGuard(first)) return false;
-        sleep(options.confirmDelaySeconds ?? 0.25);
-        const second = readScreen(surfaceId, lines, workspaceId);
+        wait(options.confirmDelaySeconds ?? 0.25);
+        const second = runner(
+          cmux,
+          ['read-screen', ...wsArgs, '--surface', surfaceId, '--lines', String(lines)],
+          STDIO_OPTS
+        ).toString();
         if (!options.screenGuard(second)) return false;
       } catch {
         // A guard is advisory wake-up logic. If the screen cannot be proven
@@ -245,25 +278,25 @@ export function sendToSurface(
         // duplicate or garble it in the recipient's prompt buffer (field-observed
         // "…STREAM…STREAM" duplication). ctrl+u clears the current line.
         if (attempt > 0) {
-          try { execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'ctrl+u'], STDIO_OPTS); } catch {}
+          try { runner(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'ctrl+u'], STDIO_OPTS); } catch {}
         }
         // Chunk long text to avoid Claude Code paste-bracket detection. (Message
         // delivery caps payloads to a single chunk upstream — see cmux-transport's
         // nudge — so multi-chunk sends here are spawn commands to fresh surfaces.)
         if (safe.length <= CHUNK_SIZE) {
-          execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
+          runner(cmux, ['send', ...wsArgs, '--surface', surfaceId, safe], STDIO_OPTS);
         } else {
           for (let i = 0; i < safe.length; i += CHUNK_SIZE) {
             const chunk = safe.slice(i, i + CHUNK_SIZE);
-            execFileSync(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
-            sleep(0.015);
+            runner(cmux, ['send', ...wsArgs, '--surface', surfaceId, chunk], STDIO_OPTS);
+            wait(0.015);
           }
         }
         // Let input settle before submitting
-        sleep(0.1);
+        wait(0.1);
         for (let e = 0; e < enterCount; e++) {
-          execFileSync(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
-          if (e + 1 < enterCount) sleep(0.05);
+          runner(cmux, ['send-key', ...wsArgs, '--surface', surfaceId, 'Enter'], STDIO_OPTS);
+          if (e + 1 < enterCount) wait(0.05);
         }
         return true; // success
       } catch (err: any) {
@@ -277,7 +310,7 @@ export function sendToSurface(
         if (!lastAttempt && (transient || attempt === 0)) {
           // Escalating backoff: 0.3, 0.6, 1.2, 2.4s. Rides out brief contention
           // spikes without hammering a sustained-busy surface (the hook covers that).
-          sleep(SEND_BACKOFF_BASE_S * Math.pow(2, attempt));
+          wait(SEND_BACKOFF_BASE_S * Math.pow(2, attempt));
           continue;
         }
         throw new SurfaceGoneError(surfaceId);
@@ -354,6 +387,91 @@ export function spawnSurfaceInWorkspace(
   const startCommand = `cd ${shellQuote(cwd)} && ${command}`;
   sendToSurface(surfaceRef, startCommand, workspaceRef);
   return { workspaceRef, surfaceRef };
+}
+
+function cmuxRefs(output: string, kind: 'surface' | 'workspace'): string[] {
+  const matches = output.match(new RegExp(`${kind}[:=][A-Za-z0-9._-]+`, 'g')) ?? [];
+  return [...new Set(matches.map(ref => ref.replace('=', ':')))];
+}
+
+function listPaneSurfaceRefs(
+  cmux: string,
+  runner: CmuxRunner,
+  workspaceId?: string | null
+): string[] {
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  try {
+    return cmuxRefs(
+      runner(cmux, ['list-pane-surfaces', ...wsArgs], STDIO_OPTS).toString(),
+      'surface'
+    );
+  } catch {
+    // Discovery is best-effort: newer cmux builds name the created surface in
+    // new-split/new-pane output, so a failed list need not waste that result.
+    return [];
+  }
+}
+
+function createdPaneRefs(
+  before: string[],
+  after: string[],
+  createOutput: string,
+  workspaceId?: string | null
+): { workspaceRef: string | null; surfaceRef: string } | null {
+  const prior = new Set(before);
+  const added = after.filter(ref => !prior.has(ref));
+  const outputSurface = cmuxRefs(createOutput, 'surface')[0];
+  const surfaceRef = added.length === 1 ? added[0] : outputSurface;
+  if (!surfaceRef) return null;
+  const workspaceRef = cmuxRefs(createOutput, 'workspace')[0] ?? workspaceId ?? null;
+  return { workspaceRef, surfaceRef };
+}
+
+/** Create a tiled terminal beside the caller and start the command in it. */
+export function spawnSplitInWorkspace(
+  cwd: string,
+  command: string,
+  direction: CmuxSplitDirection = 'right',
+  workspaceId?: string | null,
+  options: CmuxCommandOptions = {}
+): { workspaceRef: string | null; surfaceRef: string } | null {
+  const runner = options.runner ?? execFileSync;
+  const resolveBinary = options.resolveBinary ?? resolveCmux;
+  const cmux = resolveBinary();
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  const before = listPaneSurfaceRefs(cmux, runner, workspaceId);
+  const createOutput = runner(cmux, ['new-split', direction, ...wsArgs], STDIO_OPTS).toString().trim();
+  const after = listPaneSurfaceRefs(cmux, runner, workspaceId);
+  const result = createdPaneRefs(before, after, createOutput, workspaceId);
+  if (!result) return null;
+
+  sendToSurface(
+    result.surfaceRef,
+    `cd ${shellQuote(cwd)} && ${command}`,
+    result.workspaceRef,
+    { runner, resolveBinary: () => cmux, wait: options.wait }
+  );
+  return result;
+}
+
+/** Create an in-workspace browser pane for simultaneous graph visibility. */
+export function spawnBrowserPaneInWorkspace(
+  url: string,
+  direction: CmuxSplitDirection = 'right',
+  workspaceId?: string | null,
+  options: CmuxCommandOptions = {}
+): { workspaceRef: string | null; surfaceRef: string } | null {
+  const runner = options.runner ?? execFileSync;
+  const cmux = (options.resolveBinary ?? resolveCmux)();
+  const wsArgs = workspaceId ? ['--workspace', workspaceId] : [];
+  const before = listPaneSurfaceRefs(cmux, runner, workspaceId);
+  const createOutput = runner(
+    cmux,
+    ['new-pane', '--type', 'browser', '--direction', direction, ...wsArgs, '--url', url],
+    STDIO_OPTS
+  ).toString().trim();
+  const after = listPaneSurfaceRefs(cmux, runner, workspaceId);
+  return createdPaneRefs(before, after, createOutput, workspaceId);
 }
 
 export function readScreen(surfaceId: string, lines?: number, workspaceId?: string | null): string {

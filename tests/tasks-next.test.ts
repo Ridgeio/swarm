@@ -472,6 +472,53 @@ describe('WI-3 task ledger CLI', () => {
     }
   });
 
+  test('T8 forced discard bypasses analysis evidence while plain discard still refuses', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-discard-'));
+    try {
+      joinAgent(home, 'Alice');
+      const started = runCli(home, [
+        'task', 'start', 'void-analysis', '--title', 'Void analysis', '--no-worktree',
+      ], 'Alice');
+      assert.strictEqual(started.status, 0, started.stderr || started.stdout);
+
+      const missingCeiling = runCli(home, [
+        'task', 'close', 'void-analysis', '--disposition', 'discard', '--force-discard',
+      ], 'Alice');
+      assert.notStrictEqual(missingCeiling.status, 0);
+      assert.match(missingCeiling.stderr, /requires --not-established/);
+
+      const refused = runCli(home, [
+        'task', 'close', 'void-analysis', '--disposition', 'discard',
+        '--not-established', 'analysis intentionally voided',
+      ], 'Alice');
+      assert.notStrictEqual(refused.status, 0);
+      assert.match(refused.stderr, /requires both --disposition discard and --force-discard/);
+
+      const discarded = runCli(home, [
+        'task', 'close', 'void-analysis', '--disposition', 'discard', '--force-discard',
+        '--not-established', 'analysis intentionally voided',
+      ], 'Alice');
+      assert.strictEqual(discarded.status, 0, discarded.stderr || discarded.stdout);
+
+      const db = openDb(home);
+      assert.strictEqual(taskRow(db, 'void-analysis').state, 'done');
+      const forceEvent = db.prepare(
+        "SELECT data FROM task_events WHERE task_id = 'void-analysis' AND kind = 'force_discard'"
+      ).get() as { data: string };
+      assert.deepStrictEqual(JSON.parse(forceEvent.data), {
+        unpushed: 0,
+        dirty_tracked: 0,
+        untracked: 0,
+      });
+      assert.strictEqual((db.prepare(
+        "SELECT count(*) AS n FROM task_events WHERE task_id = 'void-analysis' AND kind = 'close_evidence'"
+      ).get() as { n: number }).n, 0);
+      db.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('a verified task rescue permits archive close with dirty state and removes the preserved worktree', () => {
     const root = fs.mkdtempSync(path.join(suiteRoot, 'archive-'));
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-archive-'));

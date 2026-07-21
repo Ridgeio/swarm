@@ -1109,17 +1109,22 @@ export async function closeTask(
   if (claimKind === 'code-merged' && options.disposition === 'merged') {
     requireCloseGrant(db, task, actor, 'merge');
   }
-  const evidenceReview = await reviewCloseEvidence(
-    db,
-    task,
-    claimKind,
-    options.evidence ?? [],
-    options.outcome,
-    options.deployHealthCheck ?? defaultDeployHealthCheck
-  );
+  const forcedDiscard = options.disposition === 'discard' && options.forceDiscard === true;
+  // A forced discard declares the work void. Requiring claim-shaped proof for
+  // voided work creates evidence theater, so the audited discard bypasses the
+  // entire evidence matrix just as it already bypasses preservation/git gates.
+  const evidenceReview: EvidenceReview = forcedDiscard
+    ? { evidence: [], failures: [] }
+    : await reviewCloseEvidence(
+      db,
+      task,
+      claimKind,
+      options.evidence ?? [],
+      options.outcome,
+      options.deployHealthCheck ?? defaultDeployHealthCheck
+    );
   const facts = taskGitFacts(task);
   const preservedArchive = options.disposition === 'archive' && hasVerifiedRescue(task);
-  const forcedDiscard = options.disposition === 'discard' && options.forceDiscard === true;
   const gitReview = reviewGitGates(
     task,
     facts,

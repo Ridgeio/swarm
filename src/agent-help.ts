@@ -42,7 +42,7 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'status', group: 'identity', line: 'status — read or set agent status' },
   { command: 'whoami', group: 'identity', line: 'whoami — show current identity' },
   { command: 'version', group: 'identity', line: 'version [--check] — build SHA; --check compares to origin' },
-  { command: 'spawn', group: 'identity', line: 'spawn — open a local worker session' },
+  { command: 'spawn', group: 'identity', line: 'spawn --split | --new-workspace <name> — local worker' },
   { command: 'read', group: 'identity', line: 'read — inspect a local agent screen' },
   { command: 'rename', group: 'identity', line: 'rename — rename an agent tab' },
   { command: 'move', group: 'identity', line: 'move — move an agent tab' },
@@ -67,7 +67,7 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'escalate', group: 'grants+escalation', line: 'escalate — create a decision packet' },
   { command: 'review', group: 'grants+escalation', line: 'review — route a cross-family gate review' },
 
-  { command: 'board', group: 'board', line: 'board — render fleet state or graph' },
+  { command: 'board', group: 'board', line: 'board — render fleet state or graph (splits beside you; --own-workspace for program setup)' },
   { command: 'stats', group: 'board', line: 'stats — show fleet metrics' },
 
   { command: 'janitor', group: 'janitor', line: 'janitor — census debris and controls' },

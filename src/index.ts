@@ -59,8 +59,10 @@ import {
   renameWorkspace,
   sendToSurface,
   sleep,
+  spawnSplitInWorkspace,
   spawnSurfaceInWorkspace,
   spawnWorkspace,
+  type CmuxSplitDirection,
 } from './transport.js';
 import { installHook, removeHook, detectHost } from './hooks.js';
 import { registerSurface, removeSurface, loadSurface as loadSurfaceForHook } from './applescript-transport.js';
@@ -376,9 +378,10 @@ Janitor (observe-only in v1):
 
 Status:
   swarm version [--check]                          Show build (and compare to origin/master)
-  swarm board [--watch [N]] [--tab]               Render fleet state or open it in a cmux workspace
+  swarm board [--watch [N]] [--tab]               Render fleet state or split it beside you
+    [--own-workspace]                                (--own-workspace creates the named program workspace)
   swarm board --graph [--out <path>] [--open]     Write and print a Mermaid workflow graph
-    [--watch [N]] [--tab]                           (--tab prefers a cmux browser, then system browser)
+    [--watch [N]] [--tab]                           (--tab: browser pane, workspace fallback, then open)
   swarm board --serve [--port N]                  Serve the live graph on loopback (default 7787)
     [--tab | --open | --print-url]                   (foreground; Ctrl-C stops)
   swarm members                                    List agents in the current swarm
@@ -391,6 +394,7 @@ Status:
 Local Agents:
   swarm spawn [--cwd <path>] [--autonomous]        Spawn an agent in a new tab
     [--agent claude|codex|grok] [--name <name>]
+    [--split [left|right|up|down] | --new-workspace <name>]
     [--terminal auto|cmux|warp]                      (default: auto; --autonomous adds
                                                       --dangerously-skip-permissions for claude,
                                                       --yolo for codex, --always-approve for grok)
@@ -1440,6 +1444,7 @@ async function main() {
         const graphMode = hasFlag('--graph');
         const serveMode = hasFlag('--serve');
         const tabMode = hasFlag('--tab');
+        const ownWorkspaceMode = hasFlag('--own-workspace');
         const serveOpenModes = ['--tab', '--open', '--print-url'].filter(flag => hasFlag(flag));
         const boardServeUsage = 'Usage: swarm board --serve [--port N] [--tab | --open | --print-url]';
         if (serveMode && (graphMode || hasFlag('--watch') || hasFlag('--out'))) {
@@ -1449,6 +1454,10 @@ async function main() {
         if (serveMode && serveOpenModes.length > 1) {
           console.error(`${serveOpenModes.join(', ')} are mutually exclusive.`);
           console.error(boardServeUsage);
+          process.exit(1);
+        }
+        if (ownWorkspaceMode && (!tabMode || graphMode || serveMode)) {
+          console.error('--own-workspace requires "swarm board --tab" for the terminal board.');
           process.exit(1);
         }
         const rawServePort = getFlag('--port');
@@ -1478,7 +1487,11 @@ async function main() {
         }
 
         if (tabMode && !graphMode && !serveMode) {
-          spawnBoardTab({ cwd: process.cwd(), watchSeconds: intervalSeconds });
+          spawnBoardTab({
+            cwd: process.cwd(),
+            watchSeconds: intervalSeconds,
+            ownWorkspace: ownWorkspaceMode,
+          });
           break;
         }
 
@@ -1742,8 +1755,26 @@ async function main() {
           printHelp();
           break;
         }
-        const db = getDb();
-        const swarm = resolveSelectedSwarm(db, true);
+        const splitIndex = args.indexOf('--split');
+        const splitValue = splitIndex === -1 ? undefined : args[splitIndex + 1];
+        const splitDirection = splitValue === undefined || splitValue.startsWith('--')
+          ? 'right'
+          : splitValue.toLowerCase();
+        const splitDirections: readonly CmuxSplitDirection[] = ['left', 'right', 'up', 'down'];
+        if (splitIndex !== -1 && !splitDirections.includes(splitDirection as CmuxSplitDirection)) {
+          console.error(`Invalid --split direction "${splitValue}". Use left, right, up, or down.`);
+          process.exit(1);
+        }
+        const newWorkspaceRequested = hasFlag('--new-workspace');
+        const newWorkspaceName = getFlag('--new-workspace');
+        if (newWorkspaceRequested && (!newWorkspaceName || newWorkspaceName.startsWith('--') || !newWorkspaceName.trim())) {
+          console.error('--new-workspace requires a name. Use --new-workspace <name>; workspaces are named program contexts.');
+          process.exit(1);
+        }
+        if (splitIndex !== -1 && newWorkspaceRequested) {
+          console.error('--split and --new-workspace <name> are mutually exclusive.');
+          process.exit(1);
+        }
         const name = getFlag('--name');
         const cwd = getFlag('--cwd') || process.cwd();
         const autonomous = hasFlag('--autonomous');
@@ -1758,6 +1789,12 @@ async function main() {
           console.error(`Unknown --terminal "${terminalFlag}". Supported: auto, cmux, warp.`);
           process.exit(1);
         }
+        if (selectedTerminal === 'warp' && (splitIndex !== -1 || newWorkspaceRequested)) {
+          console.error('--split and --new-workspace are cmux layout options; use --terminal cmux.');
+          process.exit(1);
+        }
+        const db = getDb();
+        const swarm = resolveSelectedSwarm(db, true);
 
         let agentCmd: string;
         let agentLabel: string;
@@ -1889,29 +1926,42 @@ async function main() {
 
         const { workspaceId } = identify();
         let result: { workspaceRef: string | null; surfaceRef: string } | null = null;
-        let spawnedInCurrentWorkspace = false;
+        let location = 'new tab';
 
-        if (workspaceId) {
+        if (newWorkspaceRequested) {
+          try {
+            result = spawnWorkspace(cwd, agentCmd, newWorkspaceName!.trim());
+            location = `named workspace "${newWorkspaceName!.trim()}"`;
+          } catch {
+            result = null;
+          }
+        } else if (splitIndex !== -1) {
+          try {
+            result = spawnSplitInWorkspace(
+              cwd,
+              agentCmd,
+              splitDirection as CmuxSplitDirection,
+              workspaceId
+            );
+            location = `${splitDirection} split`;
+          } catch {
+            result = null;
+          }
+        } else {
           try {
             result = spawnSurfaceInWorkspace(cwd, agentCmd, workspaceId);
-            spawnedInCurrentWorkspace = !!result;
           } catch {
             result = null;
           }
         }
 
         if (!result) {
-          result = spawnWorkspace(cwd, agentCmd);
-        }
-
-        if (!result) {
-          console.error(`Failed to spawn ${agentLabel} session`);
+          console.error(`Failed to spawn ${agentLabel} session. Run from a cmux workspace or use --new-workspace <name> to create a named program context.`);
           process.exit(1);
         }
 
         const joinArg = name || '';
         const swarmArg = `--swarm ${swarm.name}`;
-        const location = spawnedInCurrentWorkspace ? 'new tab' : 'new workspace';
         console.log(`Spawned new ${agentLabel} session in ${cwd} (${location}: ${result.workspaceRef ?? 'current workspace'}, ${result.surfaceRef})`);
 
         if (joinViaPrompt) {

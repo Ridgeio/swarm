@@ -13,7 +13,12 @@ import {
   type BoardTaskData,
 } from './board-data.js';
 import { JANITOR_HEARTBEAT_STALE_MS } from './janitor.js';
-import { spawnBrowserWorkspace, spawnWorkspace } from './transport.js';
+import {
+  spawnBrowserPaneInWorkspace,
+  spawnBrowserWorkspace,
+  spawnSplitInWorkspace,
+  spawnWorkspace,
+} from './transport.js';
 import { fileURLToPath, pathToFileURL } from 'url';
 
 export const BOARD_DEFAULT_WATCH_SECONDS = 5;
@@ -43,7 +48,9 @@ export interface BoardWatchOptions {
 export interface BoardTabOptions {
   cwd?: string;
   watchSeconds?: number;
-  spawn?: typeof spawnWorkspace;
+  ownWorkspace?: boolean;
+  spawnSplit?: typeof spawnSplitInWorkspace;
+  spawnOwnWorkspace?: typeof spawnWorkspace;
   write?: (value: string) => void;
   writeError?: (value: string) => void;
   exit?: (code: number) => void;
@@ -68,7 +75,8 @@ export interface BoardGraphWatchOptions {
 
 export interface BoardGraphTabOptions {
   cwd?: string;
-  spawn?: typeof spawnBrowserWorkspace;
+  spawnPane?: typeof spawnBrowserPaneInWorkspace;
+  spawnWorkspace?: typeof spawnBrowserWorkspace;
   open?: (filePath: string) => boolean;
   writeError?: (value: string) => void;
 }
@@ -177,22 +185,23 @@ export async function watchBoard(options: BoardWatchOptions): Promise<number> {
   return renderCount;
 }
 
-/** Spawn the terminal board in a named cmux workspace and leave its watch loop there. */
+/** Split the terminal board beside the caller, or create its explicit program workspace. */
 export function spawnBoardTab(
   options: BoardTabOptions = {}
-): { workspaceRef: string; surfaceRef: string } | null {
+): { workspaceRef: string | null; surfaceRef: string } | null {
   const watchSeconds = options.watchSeconds ?? BOARD_DEFAULT_WATCH_SECONDS;
-  const spawn = options.spawn ?? spawnWorkspace;
+  const spawnSplit = options.spawnSplit ?? spawnSplitInWorkspace;
+  const spawnOwnWorkspace = options.spawnOwnWorkspace ?? spawnWorkspace;
   const write = options.write ?? (value => console.log(value));
   const writeError = options.writeError ?? (value => console.error(value));
   const exit = options.exit ?? (code => process.exit(code));
 
   try {
-    const result = spawn(
-      options.cwd ?? process.cwd(),
-      `swarm board --watch ${watchSeconds}`,
-      'swarm board'
-    );
+    const cwd = options.cwd ?? process.cwd();
+    const command = `swarm board --watch ${watchSeconds}`;
+    const result = options.ownWorkspace
+      ? spawnOwnWorkspace(cwd, command, 'swarm board')
+      : spawnSplit(cwd, command, 'right');
     if (!result) throw new Error('cmux did not return a workspace and surface');
     write(`Opened swarm board: ${result.workspaceRef} ${result.surfaceRef}`);
     return result;
@@ -500,23 +509,28 @@ export function openBoardGraphFile(filePath: string): boolean {
   }
 }
 
-/** Prefer a cmux browser surface; when unavailable, use the best-effort macOS opener. */
+/** Prefer a same-workspace browser pane, then a browser workspace, then macOS open. */
 export function openBoardGraphTab(
   filePath: string,
   options: BoardGraphTabOptions = {}
-): { workspaceRef: string; surfaceRef: string } | null {
-  const spawn = options.spawn ?? spawnBrowserWorkspace;
+): { workspaceRef: string | null; surfaceRef: string } | null {
+  const spawnPane = options.spawnPane ?? spawnBrowserPaneInWorkspace;
+  const spawnWorkspace = options.spawnWorkspace ?? spawnBrowserWorkspace;
   const open = options.open ?? openBoardGraphFile;
   const writeError = options.writeError ?? (value => console.error(value));
+  const cwd = options.cwd ?? process.cwd();
+  const url = pathToFileURL(path.resolve(filePath)).href;
   try {
-    const result = spawn(
-      options.cwd ?? process.cwd(),
-      pathToFileURL(path.resolve(filePath)).href,
-      'swarm graph'
-    );
+    const result = spawnPane(url, 'right');
     if (result) return result;
   } catch {
-    // The documented fallback below keeps graph output useful without cmux.
+    // Older cmux versions may not support browser panes; try the old path.
+  }
+  try {
+    const result = spawnWorkspace(cwd, url, 'swarm graph');
+    if (result) return result;
+  } catch {
+    // The documented system-browser fallback keeps graph output useful.
   }
   if (!open(filePath)) {
     writeError(`Could not open graph automatically; open ${path.resolve(filePath)} in a browser.`);

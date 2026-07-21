@@ -314,15 +314,15 @@ describe('WI-7 swarm board', () => {
   });
 });
 
-describe('WI-7b board cmux tab', () => {
-  test('spawns the exact watch command with a round-tripped interval and workspace title', () => {
-    let invocation: { cwd: string; command: string; title?: string } | null = null;
+describe('T8 board cmux layout', () => {
+  test('board tab defaults to a right split with the round-tripped watch command', () => {
+    let invocation: { cwd: string; command: string; direction?: string } | null = null;
     const output: string[] = [];
     const result = spawnBoardTab({
       cwd: '/tmp/swarm board cwd',
       watchSeconds: 17,
-      spawn: (cwd, command, title) => {
-        invocation = { cwd, command, title };
+      spawnSplit: (cwd, command, direction) => {
+        invocation = { cwd, command, direction };
         return { workspaceRef: 'workspace:7', surfaceRef: 'surface:8' };
       },
       write: value => { output.push(value); },
@@ -331,17 +331,37 @@ describe('WI-7b board cmux tab', () => {
     assert.deepStrictEqual(invocation, {
       cwd: '/tmp/swarm board cwd',
       command: 'swarm board --watch 17',
-      title: 'swarm board',
+      direction: 'right',
     });
     assert.deepStrictEqual(result, { workspaceRef: 'workspace:7', surfaceRef: 'surface:8' });
     assert.deepStrictEqual(output, ['Opened swarm board: workspace:7 surface:8']);
+  });
+
+  test('--own-workspace preserves the named workspace setup path', () => {
+    let invocation: { cwd: string; command: string; title?: string } | null = null;
+    const result = spawnBoardTab({
+      cwd: '/tmp/program',
+      ownWorkspace: true,
+      spawnSplit: () => { throw new Error('split path must not run'); },
+      spawnOwnWorkspace: (cwd, command, title) => {
+        invocation = { cwd, command, title };
+        return { workspaceRef: 'workspace:10', surfaceRef: 'surface:11' };
+      },
+      write: () => {},
+    });
+    assert.deepStrictEqual(invocation, {
+      cwd: '/tmp/program',
+      command: 'swarm board --watch 5',
+      title: 'swarm board',
+    });
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:10', surfaceRef: 'surface:11' });
   });
 
   test('cmux absence exits 1 with the exact guidance message instead of throwing', () => {
     const errors: string[] = [];
     let exitCode: number | null = null;
     const result = spawnBoardTab({
-      spawn: () => { throw new Error('cmux not found'); },
+      spawnSplit: () => { throw new Error('cmux not found'); },
       writeError: value => { errors.push(value); },
       exit: code => { exitCode = code; },
     });
@@ -519,7 +539,8 @@ describe('WI-7c board Mermaid graph', () => {
     const opened: string[] = [];
     const errors: string[] = [];
     const result = openBoardGraphTab('/tmp/swarm graph.html', {
-      spawn: () => { throw new Error('no cmux'); },
+      spawnPane: () => { throw new Error('no browser pane'); },
+      spawnWorkspace: () => { throw new Error('no browser workspace'); },
       open: filePath => { opened.push(filePath); return true; },
       writeError: value => { errors.push(value); },
     });
@@ -528,22 +549,40 @@ describe('WI-7c board Mermaid graph', () => {
     assert.deepStrictEqual(errors, ['cmux browser unavailable; opened the graph with the system browser instead.']);
   });
 
-  test('graph tab passes an encoded file URL and the required workspace title to cmux', () => {
-    let invocation: { cwd: string; url: string; title: string } | null = null;
+  test('graph tab passes an encoded file URL to a right browser pane first', () => {
+    let invocation: { url: string; direction: string } | null = null;
     const result = openBoardGraphTab('/tmp/swarm graph.html', {
       cwd: '/tmp/project',
-      spawn: (cwd, url, title) => {
-        invocation = { cwd, url, title };
+      spawnPane: (url, direction) => {
+        invocation = { url, direction };
         return { workspaceRef: 'workspace:3', surfaceRef: 'surface:4' };
       },
+      spawnWorkspace: () => { throw new Error('workspace fallback should not run'); },
       open: () => { throw new Error('fallback should not run'); },
     });
     assert.deepStrictEqual(invocation, {
-      cwd: '/tmp/project',
       url: 'file:///tmp/swarm%20graph.html',
-      title: 'swarm graph',
+      direction: 'right',
     });
     assert.deepStrictEqual(result, { workspaceRef: 'workspace:3', surfaceRef: 'surface:4' });
+  });
+
+  test('graph tab falls back from browser pane to browser workspace before open', () => {
+    const calls: string[] = [];
+    const result = openBoardGraphTab('/tmp/swarm graph.html', {
+      cwd: '/tmp/project',
+      spawnPane: () => { calls.push('pane'); return null; },
+      spawnWorkspace: (cwd, url, title) => {
+        calls.push(`workspace:${cwd}:${url}:${title}`);
+        return { workspaceRef: 'workspace:5', surfaceRef: 'surface:6' };
+      },
+      open: () => { calls.push('open'); return true; },
+    });
+    assert.deepStrictEqual(calls, [
+      'pane',
+      'workspace:/tmp/project:file:///tmp/swarm%20graph.html:swarm graph',
+    ]);
+    assert.deepStrictEqual(result, { workspaceRef: 'workspace:5', surfaceRef: 'surface:6' });
   });
 
   test('CLI writes HTML, prints raw Mermaid to stdout and the path to stderr without DB writes', () => {

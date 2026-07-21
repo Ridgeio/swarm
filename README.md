@@ -212,11 +212,12 @@ Recovery and hygiene:
   swarm janitor install|uninstall              Manage the launchd schedule
 
 Operator visibility:
-  swarm board [--watch [N]] [--tab]            Render fleet state or open a live cmux workspace
+  swarm board [--watch [N]] [--tab]            Render fleet state or split it beside you
+        [--own-workspace]                        Create the named board program workspace instead
   swarm board --graph [--out <path>] [--open]  Write and print a Mermaid workflow graph
   swarm board --serve [--port N] [--tab|--open|--print-url]
                                                 Serve the live graph on 127.0.0.1
-        [--watch [N]] [--tab]                    (--tab prefers cmux browser, then system browser)
+        [--watch [N]] [--tab]                    (--tab: browser pane, workspace fallback, then open)
   swarm stats [--hours <N>]                    Show messaging and debris metrics
   swarm help --agent                           Show the compact agent command catalog
 
@@ -240,6 +241,7 @@ Shared:
 Spawning:
   swarm spawn [--cwd <path>] [--autonomous]   Spawn Claude/Codex/Grok in a new tab
     [--agent claude|codex|grok] [--name <n>]
+    [--split [left|right|up|down] | --new-workspace <name>]
                                               (auto-joins the swarm after boot)
 
 Workspace management:
@@ -281,11 +283,12 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Install or remove scheduling | `swarm janitor install` or `swarm janitor uninstall` |
 | Render once | `swarm board` |
 | Keep a live board | `swarm board --watch 5` |
-| Open a live cmux board workspace | `swarm board --tab --watch 5` |
+| Split a live board beside your work | `swarm board --tab --watch 5` |
+| Create the board's named program workspace | `swarm board --tab --own-workspace` |
 | Generate the workflow graph | `swarm board --graph --out ~/.swarm/board.html --open` |
 | Keep the graph live in cmux | `swarm board --graph --tab --watch 5` |
 
-Graph mode writes HTML to `~/.swarm/board.html` by default, prints raw Mermaid to stdout, and prints the file path to stderr. `--graph --tab` prefers a cmux browser workspace pointed at the generated `file://` URL; if cmux/browser creation is unavailable it falls back to the macOS system browser. Mermaid is vendored for offline use, and the raw diagram source remains as a fallback.
+Graph mode writes HTML to `~/.swarm/board.html` by default, prints raw Mermaid to stdout, and prints the file path to stderr. `--graph --tab` prefers a browser pane in the current cmux workspace, then the existing browser-workspace path, and finally the macOS system browser. Mermaid is vendored for offline use, and the raw diagram source remains as a fallback.
 
 ```bash
 swarm board --serve
@@ -355,11 +358,13 @@ swarm broadcast "status check — what's everyone working on?"
 A lead agent can spin up new Claude Code, Codex, or Grok sessions directly. By default, `swarm spawn` opens Warp tabs when run inside Warp and Cmux surfaces otherwise:
 ```bash
 swarm spawn --cwd /path/to/project --swarm ridge --autonomous
+swarm spawn --split right --agent codex --cwd /path/to/project --swarm ridge
+swarm spawn --new-workspace ridge --name Lead --cwd /path/to/project --swarm ridge
 swarm spawn --agent grok --name Brillo --cwd /path/to/project --swarm ridge
 swarm spawn --terminal warp --name DevA --cwd /path/to/project --swarm ridge
 ```
 
-In Cmux, this opens a new tab in the current workspace, launches the agent, and auto-sends `/join-swarm --swarm ridge` after boot (Claude). If `swarm spawn` is run outside a Cmux workspace, it falls back to creating a new workspace. In Warp, it opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex/Grok agents receive join instructions as their initial prompt. The `--autonomous` flag enables `--dangerously-skip-permissions` for Claude, `--yolo` for Codex, and `--always-approve` for Grok.
+In Cmux, the default opens a new tab in the current workspace. `--split [direction]` tiles the worker beside the caller (right by default), while `--new-workspace <name>` creates an explicitly named program context; a bare `--new-workspace` is refused. The agent launches there and Claude receives `/join-swarm --swarm ridge` after boot. In Warp, the default opens a new tab via Warp's URL scheme; named Claude agents join before launch, and Codex/Grok agents receive join instructions as their initial prompt. The cmux layout flags require `--terminal cmux`. The `--autonomous` flag enables `--dangerously-skip-permissions` for Claude, `--yolo` for Codex, and `--always-approve` for Grok.
 
 ### Organizing workspaces
 

@@ -20,7 +20,26 @@ export interface Swarm {
   last_active_at: string;
 }
 
-export type HostAgentKind = 'claude-code' | 'codex' | 'grok';
+export type HostAgentKind = 'claude-code' | 'codex' | 'grok' | 'gemini';
+
+export interface WorkerVersionRunOptions {
+  encoding: 'utf-8';
+  timeout: number;
+  stdio: ['ignore', 'pipe', 'pipe'];
+}
+
+export type WorkerVersionRunner = (
+  binary: string,
+  args: string[],
+  options: WorkerVersionRunOptions
+) => string | Buffer;
+
+const WORKER_BINARIES: Record<HostAgentKind, string> = {
+  'claude-code': 'claude',
+  codex: 'codex',
+  grok: 'grok',
+  gemini: 'gemini',
+};
 
 export interface Agent {
   id: string;
@@ -29,8 +48,9 @@ export interface Agent {
   description: string | null;
   agent_type: AgentType;
   endpoint_url: string | null;
-  /** Host harness that owns this terminal (claude-code | codex | grok). */
+  /** Host harness that owns this terminal. */
   host_agent: HostAgentKind | null;
+  worker_version: string | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -59,6 +79,24 @@ interface ResolvedSelf {
  */
 export interface HeadlessSessionOptions {
   trackSession?: boolean;
+}
+
+export function captureWorkerVersion(
+  host: HostAgentKind | null,
+  runner: WorkerVersionRunner = execFileSync
+): string | null {
+  if (!host) return null;
+  try {
+    const output = runner(WORKER_BINARIES[host], ['--version'], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const firstLine = String(output).split(/\r?\n/, 1)[0];
+    return firstLine.length > 0 ? firstLine : null;
+  } catch {
+    return null;
+  }
 }
 
 function nowIso(): string {
@@ -255,12 +293,16 @@ export function joinAgent(
   description?: string,
   agentType: AgentType = 'cmux',
   endpointUrl?: string,
-  hostAgent?: HostAgentKind | null
+  hostAgent?: HostAgentKind | null,
+  versionRunner?: WorkerVersionRunner
 ): Agent {
   const id = randomUUID();
   const sessionToken = agentType === 'a2a' ? null : randomBytes(16).toString('hex');
   const now = nowIso();
   const host = hostAgent ?? null;
+  const workerVersion = agentType === 'a2a'
+    ? null
+    : captureWorkerVersion(host, versionRunner);
 
   const tx = db.transaction(() => {
     const existing = getAgent(db, swarmId, name);
@@ -276,10 +318,14 @@ export function joinAgent(
     db.prepare(`
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
+        worker_version
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid, now, now, agentType, endpointUrl ?? null, host, sessionToken);
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid,
+      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion
+    );
 
     db.prepare(`
       INSERT OR IGNORE INTO inbox_cursors (swarm_id, agent_name, last_read_id)
@@ -300,6 +346,7 @@ export function joinAgent(
     agent_type: agentType,
     endpoint_url: endpointUrl ?? null,
     host_agent: host,
+    worker_version: workerVersion,
     surface_id: surfaceId,
     workspace_id: workspaceId ?? null,
     ppid,
@@ -345,7 +392,10 @@ export function joinHeadlessAgent(
   swarmId: string,
   name: string,
   description?: string,
-  options: HeadlessSessionOptions & { hostAgent?: HostAgentKind | null } = {}
+  options: HeadlessSessionOptions & {
+    hostAgent?: HostAgentKind | null;
+    versionRunner?: WorkerVersionRunner;
+  } = {}
 ): Agent {
   if (options.trackSession) {
     // This TTY previously joined under a different identity — reap it so a
@@ -364,7 +414,7 @@ export function joinHeadlessAgent(
   const syntheticSurfaceId = `headless:${swarmId}:${name}`;
   const agent = joinAgent(
     db, swarmId, name, syntheticSurfaceId, undefined, process.ppid,
-    description, 'headless', undefined, options.hostAgent
+    description, 'headless', undefined, options.hostAgent, options.versionRunner
   );
   if (options.trackSession) {
     if (!agent.session_token) throw new Error(`Failed to mint a session token for headless agent "${name}".`);

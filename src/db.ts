@@ -44,6 +44,9 @@ function ensureLegacyAgentColumns(db: Database.Database): void {
   if (!columns.has('session_token')) {
     db.exec('ALTER TABLE agents ADD COLUMN session_token TEXT');
   }
+  if (!columns.has('worker_version')) {
+    db.exec('ALTER TABLE agents ADD COLUMN worker_version TEXT');
+  }
 }
 
 function createSwarmsTable(db: Database.Database): void {
@@ -81,6 +84,7 @@ function createCurrentTables(db: Database.Database): void {
       endpoint_url TEXT,
       host_agent TEXT,
       session_token TEXT,
+      worker_version TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       UNIQUE (swarm_id, name)
     );
@@ -194,6 +198,12 @@ function createCurrentTables(db: Database.Database): void {
       tick_at TEXT NOT NULL,
       counters TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS janitor_kv (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 }
 
@@ -229,6 +239,7 @@ function migrateAgents(db: Database.Database): void {
         endpoint_url TEXT,
         host_agent TEXT,
         session_token TEXT,
+        worker_version TEXT,
         FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
         UNIQUE (swarm_id, name)
       );
@@ -239,11 +250,13 @@ function migrateAgents(db: Database.Database): void {
       -- the NOCASE unique constraint and leave the migration permanently failing.
       INSERT INTO agents_new (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
+        worker_version
       )
       SELECT
         id, '${DEFAULT_SWARM_ID}', name, description, surface_id, workspace_id, ppid,
-        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token
+        joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
+        worker_version
       FROM agents a
       WHERE NOT EXISTS (
         SELECT 1 FROM agents b
@@ -373,6 +386,14 @@ function ensureAgentSessionTokenColumn(db: Database.Database): void {
   }
 }
 
+function ensureAgentWorkerVersionColumn(db: Database.Database): void {
+  if (!tableExists(db, 'agents')) return;
+  const columns = tableColumns(db, 'agents');
+  if (!columns.has('worker_version')) {
+    db.exec('ALTER TABLE agents ADD COLUMN worker_version TEXT');
+  }
+}
+
 function migrate(db: Database.Database): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -383,6 +404,7 @@ function migrate(db: Database.Database): void {
   ensureMessageSupersededByColumn(db);
   ensureTaskClaimKindColumn(db);
   ensureAgentSessionTokenColumn(db);
+  ensureAgentWorkerVersionColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);
@@ -426,9 +448,9 @@ export function getDbAt(dbPath: string): Database.Database {
  * journal settings. Read-only commands such as `swarm board` use this path so
  * observing the fleet cannot itself become fleet activity.
  */
-export function getDbReadOnly(): Database.Database | null {
-  if (!fs.existsSync(DB_PATH)) return null;
-  const readDb = new Database(DB_PATH, { readonly: true, fileMustExist: true });
+export function getDbReadOnly(dbPath: string = DB_PATH): Database.Database | null {
+  if (!fs.existsSync(dbPath)) return null;
+  const readDb = new Database(dbPath, { readonly: true, fileMustExist: true });
   readDb.pragma('busy_timeout = 5000');
   readDb.pragma('query_only = ON');
   return readDb;

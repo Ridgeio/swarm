@@ -3,7 +3,7 @@ import path from 'path';
 import os from 'os';
 import { fileURLToPath } from 'url';
 
-export type HostAgent = 'claude-code' | 'codex' | 'grok';
+export type HostAgent = 'claude-code' | 'codex' | 'grok' | 'gemini';
 
 const SWARM_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const HOOK_SCRIPT = path.join(SWARM_DIR, 'hooks', 'swarm-awareness-headless.sh');
@@ -23,15 +23,20 @@ export function detectHost(): HostAgent | null {
   if (process.env.CMUX_AGENT_LAUNCH_KIND === 'grok' || process.env.GROK_AGENT) {
     return 'grok';
   }
+  if (process.env.CMUX_AGENT_LAUNCH_KIND === 'gemini' || process.env.GEMINI_CLI) {
+    return 'gemini';
+  }
 
   const hasCodexConfig = fs.existsSync(path.join(getCodexHome(), 'config.toml'));
   const hasClaudeConfig = fs.existsSync(path.join(os.homedir(), '.claude', 'settings.json'));
   const hasGrokConfig = fs.existsSync(path.join(getGrokHome(), 'config.toml'));
+  const hasGeminiConfig = fs.existsSync(path.join(os.homedir(), '.gemini', 'settings.json'));
 
   const matches: HostAgent[] = [];
   if (hasCodexConfig) matches.push('codex');
   if (hasClaudeConfig) matches.push('claude-code');
   if (hasGrokConfig) matches.push('grok');
+  if (hasGeminiConfig) matches.push('gemini');
 
   // Only fall back to config when a single host is unambiguous.
   return matches.length === 1 ? matches[0] : null;
@@ -54,6 +59,9 @@ export function installHook(host: HostAgent, agentName: string, swarmId: string,
     case 'grok':
       installGrokHook();
       break;
+    case 'gemini':
+      // Gemini currently consumes the installed skills without a prompt hook.
+      break;
   }
 }
 
@@ -70,6 +78,8 @@ export function removeHook(host: HostAgent, agentName: string, swarmId?: string)
       break;
     case 'grok':
       // Durable global hook stays installed (same model as Claude Code installer hook).
+      break;
+    case 'gemini':
       break;
   }
 }

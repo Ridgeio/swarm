@@ -815,6 +815,32 @@ export function collectBoardData(
         lastSeenAt: row.last_seen_at,
         detail: parseJsonValue(row.detail),
       }));
+      for (const finding of findings.filter(item => item.state === 'hold')) {
+        const detail = finding.detail && typeof finding.detail === 'object' && !Array.isArray(finding.detail)
+          ? finding.detail as Record<string, unknown>
+          : {};
+        if (finding.kind === 'worker-epoch-change') {
+          needsYou.push({
+            kind: finding.kind,
+            label: `worker epoch ${String(detail.host ?? 'unknown')} changed ` +
+              `${String(detail.from ?? 'unknown')} → ${String(detail.to ?? 'unknown')} — ` +
+              `requalify via ${String(detail.runbook ?? 'docs/runbooks/requalify-worker.md')}`,
+            refId: finding.path,
+          });
+        } else if (finding.kind === 'control-retest-due') {
+          needsYou.push({
+            kind: finding.kind,
+            label: `control ${String(detail.id ?? finding.path)} retest due ${String(detail.retest_by ?? 'unknown')}`,
+            refId: finding.path,
+          });
+        } else if (finding.kind === 'controls-file-invalid') {
+          needsYou.push({
+            kind: finding.kind,
+            label: `controls registry invalid — ${finding.path}`,
+            refId: finding.path,
+          });
+        }
+      }
     } catch {
       addUnavailable(unavailable, 'janitor_findings');
       findings = [];

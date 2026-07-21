@@ -5,6 +5,10 @@ import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+const MODULE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const DEFAULT_CONTROLS_PATH = path.join(MODULE_ROOT, 'docs', 'controls.md');
+const WORKER_REQUALIFICATION_RUNBOOK = 'docs/runbooks/requalify-worker.md';
+
 export const JANITOR_TICK_STALENESS_MS = 10 * 60 * 1000;
 export const JANITOR_HEARTBEAT_STALE_MS = 30 * 60 * 1000;
 export const JANITOR_LOCK_STALE_MS = 10 * 60 * 1000;
@@ -33,7 +37,10 @@ export type JanitorFindingKind =
   | 'gone-upstream-branches'
   | 'unpushed-commits'
   | 'temp-stray-worktree'
-  | 'junk-dir';
+  | 'junk-dir'
+  | 'worker-epoch-change'
+  | 'control-retest-due'
+  | 'controls-file-invalid';
 
 interface Finding {
   kind: JanitorFindingKind;
@@ -63,6 +70,8 @@ export interface JanitorTickOptions extends JanitorPathsOptions {
   /** Injectable wall clock for deterministic finding/status ages in tests. */
   now?: number;
   lockStaleMs?: number;
+  /** Registry fixture override; production resolves docs/controls.md from the package root. */
+  controlsFilePath?: string;
 }
 
 export interface JanitorTickResult {
@@ -81,6 +90,9 @@ export interface JanitorInstallOptions extends JanitorPathsOptions {
 }
 
 const BUILD_OUTPUT_NAMES = new Set(['node_modules', '.astro', 'dist', 'build', '.next', '.cache']);
+const CONTROL_HEADER = '| id | mechanism | guards-against | retest-by | retirement condition |';
+const CONTROL_DIVIDER = '| --- | --- | --- | --- | --- |';
+const CONTROL_ROW = /^\| ([a-z0-9]+(?:-[a-z0-9]+)*) \| ([^|\r\n]+) \| ([^|\r\n]+) \| (\d{4}-\d{2}-\d{2}) \| ([^|\r\n]+) \|$/;
 
 function janitorSwarmDir(options: JanitorPathsOptions = {}): string {
   return path.join(options.homeDir ?? os.homedir(), '.swarm');
@@ -268,6 +280,92 @@ function parseStatusCounts(output: string): { dirty: number; untracked: number }
 
 function addFinding(findings: Map<string, Finding>, finding: Finding): void {
   findings.set(`${finding.kind}\0${finding.path}`, finding);
+}
+
+function validIsoDate(value: string): boolean {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return Number.isFinite(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+function scanControls(
+  controlsPath: string,
+  today: string,
+  findings: Map<string, Finding>
+): void {
+  if (!fs.existsSync(controlsPath)) return;
+
+  let contents: string;
+  try {
+    contents = fs.readFileSync(controlsPath, 'utf-8');
+  } catch {
+    return;
+  }
+
+  const invalidLines: number[] = [];
+  for (const [index, line] of contents.split(/\r?\n/).entries()) {
+    if (!line.startsWith('|')) continue;
+    if (line === CONTROL_HEADER || line === CONTROL_DIVIDER) continue;
+    const match = CONTROL_ROW.exec(line);
+    if (!match || !validIsoDate(match[4])) {
+      invalidLines.push(index + 1);
+      continue;
+    }
+    const [, id, , , retestBy] = match;
+    if (retestBy < today) {
+      addFinding(findings, {
+        kind: 'control-retest-due',
+        path: `control:${id}`,
+        detail: { id, retest_by: retestBy },
+      });
+    }
+  }
+
+  if (invalidLines.length > 0) {
+    addFinding(findings, {
+      kind: 'controls-file-invalid',
+      path: controlsPath,
+      detail: { path: controlsPath, lines: invalidLines },
+    });
+  }
+}
+
+function scanWorkerEpochs(
+  db: Database.Database,
+  findings: Map<string, Finding>,
+  kvUpdates: Map<string, string>
+): void {
+  const rows = db.prepare(`
+    SELECT id, host_agent, worker_version, joined_at
+    FROM agents
+    WHERE host_agent IS NOT NULL AND worker_version IS NOT NULL
+    ORDER BY joined_at ASC, id ASC
+  `).all() as Array<{
+    id: string;
+    host_agent: string;
+    worker_version: string;
+    joined_at: string;
+  }>;
+  const latest = new Map<string, string>();
+  for (const row of rows) latest.set(row.host_agent, row.worker_version);
+
+  const readPrior = db.prepare('SELECT value FROM janitor_kv WHERE key = ?');
+  for (const [host, version] of latest) {
+    const key = `worker-version:${host}`;
+    const prior = readPrior.get(key) as { value: string } | undefined;
+    if (prior && prior.value !== version) {
+      addFinding(findings, {
+        kind: 'worker-epoch-change',
+        path: `worker:${host}`,
+        detail: {
+          host,
+          from: prior.value,
+          to: version,
+          runbook: WORKER_REQUALIFICATION_RUNBOOK,
+        },
+      });
+    }
+    if (!prior || prior.value !== version) kvUpdates.set(key, version);
+  }
 }
 
 function repoDisplayPath(repo: RepoRecord, worktrees: WorktreeRecord[]): string {
@@ -488,7 +586,8 @@ function persistTick(
   db: Database.Database,
   tickAt: string,
   counters: JanitorCounters,
-  findings: Map<string, Finding>
+  findings: Map<string, Finding>,
+  kvUpdates: Map<string, string>
 ): void {
   const upsertFinding = db.prepare(`
     INSERT INTO janitor_findings (first_seen_at, last_seen_at, kind, path, detail, state)
@@ -502,6 +601,13 @@ function persistTick(
     .all() as Array<{ id: number; kind: string; path: string }>;
   const observed = new Set(findings.keys());
   const clearFinding = db.prepare("UPDATE janitor_findings SET state = 'cleared' WHERE id = ?");
+  const upsertKv = db.prepare(`
+    INSERT INTO janitor_kv (key, value, updated_at)
+    VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET
+      value = excluded.value,
+      updated_at = excluded.updated_at
+  `);
   const countersJson = JSON.stringify(counters);
 
   db.transaction(() => {
@@ -515,10 +621,13 @@ function persistTick(
       );
     }
     for (const row of heldRows) {
-      if (!observed.has(`${row.kind}\0${row.path}`) && !fs.existsSync(row.path)) {
+      if (observed.has(`${row.kind}\0${row.path}`)) continue;
+      if (row.kind === 'worker-epoch-change') continue;
+      if (row.kind === 'control-retest-due' || row.kind === 'controls-file-invalid' || !fs.existsSync(row.path)) {
         clearFinding.run(row.id);
       }
     }
+    for (const [key, value] of kvUpdates) upsertKv.run(key, value, tickAt);
     db.prepare(`
       INSERT INTO janitor_status (id, last_tick_at, last_duration_ms, counters)
       VALUES (1, ?, ?, ?)
@@ -546,13 +655,20 @@ export function runJanitorTick(
     const roots = loadOrSeedJanitorRoots(db, options);
     const repos = discoverRepositories(roots);
     const findings = new Map<string, Finding>();
+    const kvUpdates = new Map<string, string>();
     const counters = emptyCounters();
 
+    scanWorkerEpochs(db, findings, kvUpdates);
+    scanControls(
+      options.controlsFilePath ?? DEFAULT_CONTROLS_PATH,
+      tickAt.slice(0, 10),
+      findings
+    );
     scanRepositories(repos, findings, counters);
     scanTempWorktrees(options.tempScanPaths ?? defaultTempScanPaths(), repos, findings, counters);
     scanJunkDirectories(roots, findings, counters);
     counters.tickMs = Math.max(0, Math.round(performance.now() - started));
-    persistTick(db, tickAt, counters, findings);
+    persistTick(db, tickAt, counters, findings, kvUpdates);
     return { ran: true, lockedOut: false, counters, findings: findings.size };
   } finally {
     releaseLock();
@@ -629,8 +745,7 @@ function xmlEscape(value: string): string {
 }
 
 function builtEntrypoint(): string {
-  const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-  return path.join(repoRoot, 'dist', 'index.js');
+  return path.join(MODULE_ROOT, 'dist', 'index.js');
 }
 
 export function janitorLaunchAgentPath(options: JanitorInstallOptions = {}): string {

@@ -125,6 +125,14 @@ Trust model: on this trusted, single-operator machine, grants and session tokens
 
 The operating principles are in [docs/philosophy.md](docs/philosophy.md), the ledger contracts are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md), and the claim/evidence contracts are in [docs/design/SWARM-NEXT-V2.md](docs/design/SWARM-NEXT-V2.md).
 
+### Agent-facing command catalog
+
+Run `swarm help --agent` for the compact, lifecycle-grouped command map. The catalog stays intentionally terse and points agents to [docs/ROUTING.md](docs/ROUTING.md) for doctrine.
+
+### Harness reviews
+
+Run `swarm harness-review <task-slug>` to render the full task timeline, checkpoints, and evidence into a dated review brief. Fill every `<FILL>` section before rerunning; completion directs the intervention into a due-dated EXP entry.
+
 ## Skills
 
 | Command | What it does |
@@ -169,6 +177,7 @@ Task ledger:
         [--outcome inconclusive] [--force-discard]
         [--override --reason <text>]
   swarm run [--task <slug>] -- <cmd> [args...] Capture a full task evidence log
+  swarm harness-review <task-slug>             Review a task's handoff loop
   swarm grant create --op <op> --resource <r>   Create an expiring scoped grant
         --ttl <30m|2h|1d> [--to <agent>] [--note <text>]
   swarm grant list [--live]                     List grants
@@ -199,6 +208,7 @@ Operator visibility:
                                                 Serve the live graph on 127.0.0.1
         [--watch [N]] [--tab]                    (--tab prefers cmux browser, then system browser)
   swarm stats [--hours <N>]                    Show messaging and debris metrics
+  swarm help --agent                           Show the compact agent command catalog
 
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent

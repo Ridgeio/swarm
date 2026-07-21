@@ -99,6 +99,8 @@ import {
 } from './board-server.js';
 import { createGrant, listGrants, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
+import { harnessReviewTask } from './harness-review.js';
+import { renderAgentHelp } from './agent-help.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -198,6 +200,32 @@ function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = fa
   if (cwdSwarm) return cwdSwarm;
 
   return getOrCreateSwarm(db);
+}
+
+function resolveSelectedSwarmReadOnly(db: NonNullable<ReturnType<typeof getDbReadOnly>>): Swarm {
+  if (explicitSwarmName) {
+    const swarm = getSwarm(db, explicitSwarmName);
+    if (swarm) return swarm;
+    throw new Error(`Swarm "${explicitSwarmName}" not found.`);
+  }
+  if (process.env.SWARM_ID) {
+    const swarm = getSwarmById(db, process.env.SWARM_ID);
+    if (swarm) return swarm;
+  }
+  if (process.env.SWARM_NAME) {
+    const swarm = getSwarm(db, process.env.SWARM_NAME);
+    if (swarm) return swarm;
+  }
+  const self = getSelf(db);
+  if (self) {
+    const swarm = getSwarmById(db, self.swarm_id);
+    if (swarm) return swarm;
+  }
+  const cwdSwarm = findSwarmForCwd(db);
+  if (cwdSwarm) return cwdSwarm;
+  const fallback = getSwarmById(db, DEFAULT_SWARM_ID);
+  if (fallback) return fallback;
+  throw new Error('No swarm database state found. Run "swarm create <name>" first.');
 }
 
 function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
@@ -304,6 +332,7 @@ Task Ledger:
   swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
   swarm decision <text> [--task <slug>]            Record a durable decision
     [--supersedes <decision-id>]
+  swarm harness-review <slug>                      Review the full task handoff timeline
   swarm rescue --worktree <path> | --task <slug>   Create and verify preservation artifacts
     | --agent <name>
   swarm rescue --list                              List rescue manifests and verification state
@@ -346,7 +375,8 @@ Cmux-only:
 Admin:
   swarm reap [--name <agent>] [--force] [--all]    Prune dead agents after liveness probe
   swarm reset [--all]                              Clear current swarm, or all swarms
-  swarm help                                       Show this help`);
+  swarm help                                       Show this help
+  swarm help --agent                               Show the compact agent catalog`);
 }
 
 function safeOscTitlePart(value: string): string {
@@ -1140,6 +1170,34 @@ async function main() {
         break;
       }
 
+      case 'harness-review': {
+        const slug = args[1];
+        if (!slug) {
+          console.error('Usage: swarm harness-review <task-slug>');
+          process.exit(1);
+        }
+        const db = getDbReadOnly();
+        if (!db) throw new Error('No swarm database found. Run "swarm create <name>" first.');
+        try {
+          const swarm = resolveSelectedSwarmReadOnly(db);
+          const result = harnessReviewTask(db, swarm.id, slug);
+          console.log(result.rendered.trimEnd());
+          console.log(`Harness review: ${result.briefPath}`);
+          if (!result.complete) {
+            console.error(
+              `Harness review is incomplete. Edit every <FILL> marker, then re-run ` +
+              `"swarm harness-review ${slug}".`
+            );
+            process.exitCode = 2;
+          } else {
+            console.log('file the intervention as an EXP entry with a due date');
+          }
+        } finally {
+          db.close();
+        }
+        break;
+      }
+
       case 'handoff': {
         const slug = args[1];
         const target = getFlag('--to');
@@ -1501,13 +1559,18 @@ async function main() {
       }
 
       case 'stats': {
-        const db = getDb();
-        const swarm = resolveSelectedSwarm(db);
-        const hoursRaw = getFlag('--hours');
-        const hours = hoursRaw && /^\d+$/.test(hoursRaw) ? parseInt(hoursRaw, 10) : 24;
-        const activeAgents = listAgentsSync(db, swarm.id).map((a) => a.name);
-        const stats = getFleetStats(db, swarm.id, hours, activeAgents);
-        console.log(formatFleetStats(stats));
+        const db = getDbReadOnly();
+        if (!db) throw new Error('No swarm database found. Run "swarm create <name>" first.');
+        try {
+          const swarm = resolveSelectedSwarmReadOnly(db);
+          const hoursRaw = getFlag('--hours');
+          const hours = hoursRaw && /^\d+$/.test(hoursRaw) ? parseInt(hoursRaw, 10) : 24;
+          const activeAgents = listAgentsSync(db, swarm.id).map((a) => a.name);
+          const stats = getFleetStats(db, swarm.id, hours, activeAgents);
+          console.log(formatFleetStats(stats));
+        } finally {
+          db.close();
+        }
         break;
       }
 
@@ -1931,7 +1994,8 @@ async function main() {
       case '--help':
       case '-h':
       case undefined:
-        printHelp();
+        if (hasFlag('--agent')) console.log(renderAgentHelp());
+        else printHelp();
         break;
 
       default:

@@ -28,17 +28,18 @@ Tasks are durable, fenced leases backed by append-only task events and checkpoin
 - `src/transport-router.ts` — Dispatcher that routes to the correct transport by agent type
 - `src/transport.ts` — Low-level Cmux utilities (send, read-screen, binary resolution)
 - `src/db.ts` — SQLite init with WAL mode, schema migrations
-- `src/registry.ts` — Agent CRUD, A2A registration, async stale cleanup
+- `src/registry.ts` — Agent CRUD, worker-version capture, A2A registration, async stale cleanup
 - `src/mailbox.ts` — Pull/ack delivery rows, supersession, inbox reads, and cursor compatibility
 - `src/tasks.ts` — Fenced task epochs, checkpoints, evidence-gated close, handoff, and decisions
+- `src/harness-review.ts` — Gated task-timeline review briefs for harness interventions
 - `src/rescue.ts` — Verified preservation artifacts and manifests
-- `src/janitor.ts` — Observe-only debris census, heartbeat, hook piggyback, and launchd management
+- `src/janitor.ts` — Observe-only debris, worker-epoch, and control-retirement census
 - `src/board.ts` — Read-only fleet board/watch loop plus Mermaid graph and fallback-safe HTML output
 - `src/board-data.ts` — Shared read-only projection for text and served boards, including task history and debris trends
 - `src/board-server.ts` + `web/` — Token/Host-guarded loopback graph, dashboard, timeline, inspector, and registry-resolved cmux focus action
 - `src/index.ts` — CLI entry point (async main)
 
-Core tables are `swarms`, `agents`, `messages`, `message_deliveries`, `inbox_cursors`, `tasks`, `task_events`, `decisions`, `janitor_status`, `janitor_findings`, and `janitor_snapshots`.
+Core tables are `swarms`, `agents`, `messages`, `message_deliveries`, `inbox_cursors`, `tasks`, `task_events`, `decisions`, `janitor_status`, `janitor_findings`, `janitor_snapshots`, and `janitor_kv`.
 
 ## Security Notes
 

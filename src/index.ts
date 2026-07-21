@@ -108,6 +108,7 @@ import {
   openBoardGraphFile,
   openBoardGraphTab,
   renderBoard,
+  resolveBoardWidth,
   spawnBoardTab,
   watchBoard,
   watchBoardGraph,
@@ -378,7 +379,7 @@ Janitor (observe-only in v1):
 
 Status:
   swarm version [--check]                          Show build (and compare to origin/master)
-  swarm board [--watch [N]] [--tab]               Render fleet state or split it beside you
+  swarm board [--watch [N]] [--tab] [--width N]   Render fleet state or split it beside you
     [--own-workspace]                                (--own-workspace creates the named program workspace)
   swarm board --graph [--out <path>] [--open]     Write and print a Mermaid workflow graph
     [--watch [N]] [--tab]                           (--tab: browser pane, workspace fallback, then open)
@@ -1445,6 +1446,16 @@ async function main() {
         const serveMode = hasFlag('--serve');
         const tabMode = hasFlag('--tab');
         const ownWorkspaceMode = hasFlag('--own-workspace');
+        const rawWidth = getFlag('--width');
+        const boardWidth = rawWidth === undefined ? undefined : Number(rawWidth);
+        if (hasFlag('--width') && (
+          !rawWidth || !/^\d+$/.test(rawWidth) ||
+          !Number.isSafeInteger(boardWidth) || boardWidth! <= 0
+        )) {
+          console.error('Board width must be a positive integer number of columns (example: swarm board --width 80).');
+          console.error('Usage: swarm board [--watch [N]] [--tab] [--width N]');
+          process.exit(1);
+        }
         const serveOpenModes = ['--tab', '--open', '--print-url'].filter(flag => hasFlag(flag));
         const boardServeUsage = 'Usage: swarm board --serve [--port N] [--tab | --open | --print-url]';
         if (serveMode && (graphMode || hasFlag('--watch') || hasFlag('--out'))) {
@@ -1490,6 +1501,7 @@ async function main() {
           spawnBoardTab({
             cwd: process.cwd(),
             watchSeconds: intervalSeconds,
+            width: boardWidth,
             ownWorkspace: ownWorkspaceMode,
           });
           break;
@@ -1520,7 +1532,8 @@ async function main() {
           if (swarm) swarmId = swarm.id;
         }
 
-        const snapshot = () => renderBoard(db, swarmId);
+        const snapshot = (width: number = resolveBoardWidth({ width: boardWidth })) =>
+          renderBoard(db, swarmId, { width });
         try {
           if (serveMode) {
             const running = await startBoardServer({ db, swarmId, port: servePort });
@@ -1562,7 +1575,11 @@ async function main() {
           } else if (watchIndex === -1) {
             console.log(snapshot());
           } else {
-            await watchBoard({ render: snapshot, intervalMs: intervalSeconds * 1_000 });
+            await watchBoard({
+              render: snapshot,
+              width: boardWidth,
+              intervalMs: intervalSeconds * 1_000,
+            });
           }
         } finally {
           db?.close();

@@ -256,8 +256,12 @@ export function boardAgeLabel(
   return age === null ? 'none' : `${age}m`;
 }
 
+function flattenLine(value: string): string {
+  return value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
 function oneLine(value: string, limit: number = 100): string {
-  const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const flattened = flattenLine(value);
   if (flattened.length <= limit) return flattened;
   return `${flattened.slice(0, Math.max(0, limit - 1))}\u2026`;
 }
@@ -679,7 +683,7 @@ export function collectBoardData(
   }
 
   const needsYou: BoardNeedData[] = [];
-  if (available('messages', 'message_deliveries')) {
+  if (available('messages', 'message_deliveries', 'agents')) {
     try {
       const deliveries = database!.prepare(`
         SELECT m.id, m.kind, m.from_agent, m.body, COALESCE(d.recipient, m.to_agent) AS recipient
@@ -688,12 +692,15 @@ export function collectBoardData(
           ON m.id = d.message_id AND m.swarm_id = d.swarm_id
         WHERE m.swarm_id = ?
           AND COALESCE(d.recipient, m.to_agent) IS NOT NULL
+          AND COALESCE(d.recipient, m.to_agent) COLLATE NOCASE IN (
+            SELECT name FROM agents WHERE swarm_id = ?
+          )
           AND d.acked_at IS NULL
           AND COALESCE(d.status, 'pending') <> 'acked'
           AND m.superseded_by IS NULL
           AND m.kind IN (${URGENT_MESSAGE_KINDS.map(() => '?').join(', ')})
         ORDER BY m.id ASC, d.recipient COLLATE NOCASE ASC
-      `).all(swarmId, ...URGENT_MESSAGE_KINDS) as Array<{
+      `).all(swarmId, swarmId, ...URGENT_MESSAGE_KINDS) as Array<{
         id: number;
         kind: string;
         from_agent: string;
@@ -704,12 +711,12 @@ export function collectBoardData(
         needsYou.push({
           kind: delivery.kind,
           label: `message #${delivery.id} [${delivery.kind}] for ${delivery.recipient} from ${delivery.from_agent} \u2014 ` +
-            oneLine(delivery.body, 70),
+            flattenLine(delivery.body),
           refId: String(delivery.id),
         });
       }
     } catch {
-      addUnavailable(unavailable, 'messages', 'message_deliveries');
+      addUnavailable(unavailable, 'messages', 'message_deliveries', 'agents');
     }
   }
 

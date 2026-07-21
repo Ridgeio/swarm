@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { DatabaseSync } from 'node:sqlite';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawnSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -12,6 +12,7 @@ import {
   buildBoardMermaid,
   openBoardGraphTab,
   renderBoard,
+  resolveBoardWidth,
   spawnBoardTab,
   watchBoard,
   watchBoardGraph,
@@ -180,7 +181,8 @@ describe('WI-7 swarm board', () => {
   test('renders NEEDS YOU, TASKS, FLEET, and DEBRIS + QUOTA in urgency order', () => {
     const fixture = createFixture(true);
     try {
-      const output = renderBoard(fixture.db, 'default', { now: NOW });
+      // T9 EXACT-STRING UPDATE: keep the pre-responsive contiguous row assertions in wide mode.
+      const output = renderBoard(fixture.db, 'default', { now: NOW, width: 120 });
       const headings = ['NEEDS YOU', 'TASKS', 'FLEET', 'DEBRIS + QUOTA'];
       assert.deepStrictEqual(
         headings.map(heading => output.indexOf(heading)),
@@ -314,6 +316,131 @@ describe('WI-7 swarm board', () => {
   });
 });
 
+describe('T9 responsive text board', () => {
+  test('width 60 uses narrow mode, obeys the ruler, and clamps a long triage row to two lines', () => {
+    const fixture = createFixture(true);
+    try {
+      fixture.db.prepare("UPDATE messages SET body = ? WHERE kind = 'gate'").run(
+        'approve the release after every operator confirms the deployment checklist and verifies ' +
+        'the rollback instructions across all environments before unseen-tail-marker'
+      );
+      const output = renderBoard(fixture.db, 'default', { now: NOW, width: 60 });
+      const lines = output.split('\n');
+
+      assert.ok(lines.every(line => line.length <= 60), lines.map(line => `${line.length}: ${line}`).join('\n'));
+      assert.match(output, /^== NEEDS YOU ==$/m);
+      assert.doesNotMatch(output, /[\u2500-\u257f]/, 'narrow mode must emit zero box-drawing characters');
+
+      const messageLine = lines.findIndex(line => line.includes('message #'));
+      assert.notStrictEqual(messageLine, -1);
+      assert.match(lines[messageLine + 1], /…$/);
+      assert.match(lines[messageLine + 2], /task review-task awaits review/);
+      assert.doesNotMatch(output, /unseen-tail-marker/);
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('width 120 stays boxed, wraps long tokens without truncating them, and obeys the ruler', () => {
+    const fixture = createFixture(true);
+    const longToken = `feature/${'X'.repeat(150)}`;
+    try {
+      fixture.db.prepare("UPDATE tasks SET branch = ? WHERE id = 'stale-task'").run(longToken);
+      fixture.db.prepare("UPDATE messages SET body = ? WHERE kind = 'gate'").run(
+        `approve the release ${'after validation '.repeat(20)}message-tail`
+      );
+      const output = renderBoard(fixture.db, 'default', { now: NOW, width: 120 });
+      const lines = output.split('\n');
+      const tasks = output.slice(output.indexOf('┌─ TASKS '), output.indexOf('┌─ FLEET '));
+
+      assert.ok(lines.every(line => line.length <= 120), lines.map(line => `${line.length}: ${line}`).join('\n'));
+      assert.match(output, /^┌─ NEEDS YOU /m);
+      assert.match(output, /└─+┘/m);
+      assert.strictEqual((tasks.match(/X/g) ?? []).length, 150, 'hard-broken token must remain complete');
+      assert.doesNotMatch(tasks, /…/, 'non-triage rows wrap without truncation');
+
+      const messageLine = lines.findIndex(line => line.includes('message #'));
+      assert.notStrictEqual(messageLine, -1);
+      assert.match(lines[messageLine + 1], /… │$/);
+      assert.doesNotMatch(output, /message-tail/);
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
+
+  test('width precedence is explicit option, COLUMNS, live stdout source, then 80', () => {
+    assert.strictEqual(resolveBoardWidth({
+      width: 120,
+      env: { COLUMNS: '90' },
+      widthSource: () => 70,
+    }), 120);
+    assert.strictEqual(resolveBoardWidth({ env: { COLUMNS: '90' }, widthSource: () => 70 }), 90);
+    assert.strictEqual(resolveBoardWidth({ env: {}, widthSource: () => 70 }), 70);
+    assert.strictEqual(resolveBoardWidth({ env: {}, widthSource: () => undefined }), 80);
+  });
+
+  test('watch mode re-reads its injected width source for every render', async () => {
+    const availableWidths = [60, 120];
+    const renderedWidths: number[] = [];
+    const count = await watchBoard({
+      render: width => {
+        renderedWidths.push(width);
+        return `width ${width}`;
+      },
+      env: {},
+      widthSource: () => availableWidths.shift(),
+      clear: () => {},
+      write: () => {},
+      wait: async () => {},
+      shouldContinue: renders => renders < 2,
+    });
+    assert.strictEqual(count, 2);
+    assert.deepStrictEqual(renderedWidths, [60, 120]);
+  });
+
+  test('CLI --width overrides COLUMNS and rejects non-numeric values actionably', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-width-cli-'));
+    const swarmDir = path.join(home, '.swarm');
+    fs.mkdirSync(swarmDir);
+    getDbAt(path.join(swarmDir, 'swarm.db')).close();
+    const env = {
+      ...process.env,
+      HOME: home,
+      COLUMNS: '60',
+      SWARM_ID: '',
+      SWARM_NAME: '',
+      SWARM_AGENT_NAME: '',
+      CMUX_SURFACE_ID: '',
+    };
+    try {
+      const narrow = spawnSync('node', ['--import', 'tsx', INDEX, 'board'], {
+        encoding: 'utf-8', env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.strictEqual(narrow.status, 0, narrow.stderr);
+      assert.match(narrow.stdout, /^== NEEDS YOU ==$/m);
+
+      const explicit = spawnSync('node', ['--import', 'tsx', INDEX, 'board', '--width', '120'], {
+        encoding: 'utf-8', env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.strictEqual(explicit.status, 0, explicit.stderr);
+      assert.match(explicit.stdout, /^┌─ NEEDS YOU /m);
+
+      const invalid = spawnSync('node', ['--import', 'tsx', INDEX, 'board', '--width', 'wide'], {
+        encoding: 'utf-8', env, stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      assert.strictEqual(invalid.status, 1);
+      assert.match(
+        invalid.stderr,
+        /Board width must be a positive integer number of columns \(example: swarm board --width 80\)\./
+      );
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('T8 board cmux layout', () => {
   test('board tab defaults to a right split with the round-tripped watch command', () => {
     let invocation: { cwd: string; command: string; direction?: string } | null = null;
@@ -355,6 +482,19 @@ describe('T8 board cmux layout', () => {
       title: 'swarm board',
     });
     assert.deepStrictEqual(result, { workspaceRef: 'workspace:10', surfaceRef: 'surface:11' });
+  });
+
+  test('an explicit width round-trips into the spawned terminal-board command', () => {
+    let command = '';
+    spawnBoardTab({
+      width: 88,
+      spawnSplit: (_cwd, value) => {
+        command = value;
+        return { workspaceRef: 'workspace:12', surfaceRef: 'surface:13' };
+      },
+      write: () => {},
+    });
+    assert.strictEqual(command, 'swarm board --watch 5 --width 88');
   });
 
   test('cmux absence exits 1 with the exact guidance message instead of throwing', () => {

@@ -23,6 +23,8 @@ import { fileURLToPath, pathToFileURL } from 'url';
 
 export const BOARD_DEFAULT_WATCH_SECONDS = 5;
 export const BOARD_CMUX_GUIDANCE = "cmux not found — run 'swarm board --watch' directly in a terminal you want to watch.";
+export const BOARD_DEFAULT_WIDTH = 80;
+export const BOARD_NARROW_WIDTH = 70;
 const MERMAID_VENDOR_PATH = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   '..',
@@ -32,12 +34,18 @@ const MERMAID_VENDOR_PATH = path.resolve(
 
 export { boardHasTable } from './board-data.js';
 
-export interface BoardRenderOptions {
+export interface BoardWidthOptions {
+  width?: number;
+  env?: NodeJS.ProcessEnv;
+  widthSource?: () => number | undefined;
+}
+
+export interface BoardRenderOptions extends BoardWidthOptions {
   now?: number;
 }
 
-export interface BoardWatchOptions {
-  render: () => string;
+export interface BoardWatchOptions extends BoardWidthOptions {
+  render: (width: number) => string;
   intervalMs?: number;
   clear?: () => void;
   write?: (value: string) => void;
@@ -48,6 +56,7 @@ export interface BoardWatchOptions {
 export interface BoardTabOptions {
   cwd?: string;
   watchSeconds?: number;
+  width?: number;
   ownWorkspace?: boolean;
   spawnSplit?: typeof spawnSplitInWorkspace;
   spawnOwnWorkspace?: typeof spawnWorkspace;
@@ -81,12 +90,91 @@ export interface BoardGraphTabOptions {
   writeError?: (value: string) => void;
 }
 
-function section(title: string, lines: string[]): string {
+function positiveInteger(value: unknown): number | null {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string' || !/^\d+$/.test(value.trim())) return null;
+  const parsed = Number(value.trim());
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/** Resolve terminal width in CLI precedence order, with all ambient inputs injectable. */
+export function resolveBoardWidth(options: BoardWidthOptions = {}): number {
+  const explicit = positiveInteger(options.width);
+  if (explicit !== null) return explicit;
+  const environment = options.env ?? process.env;
+  const columns = positiveInteger(environment.COLUMNS);
+  if (columns !== null) return columns;
+  const widthSource = options.widthSource ?? (() => process.stdout.columns);
+  return positiveInteger(widthSource()) ?? BOARD_DEFAULT_WIDTH;
+}
+
+function wrapLine(value: string, maxWidth: number): string[] {
+  const text = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!text) return [''];
+
+  const continuationIndent = ' '.repeat(Math.min(2, Math.max(0, maxWidth - 1)));
+  const lines: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    const prefix = lines.length === 0 ? '' : continuationIndent;
+    const available = Math.max(1, maxWidth - prefix.length);
+    if (remaining.length <= available) {
+      lines.push(`${prefix}${remaining}`);
+      break;
+    }
+
+    const breakAt = remaining.lastIndexOf(' ', available);
+    if (breakAt > 0) {
+      lines.push(`${prefix}${remaining.slice(0, breakAt)}`);
+      remaining = remaining.slice(breakAt + 1).trimStart();
+    } else {
+      lines.push(`${prefix}${remaining.slice(0, available)}`);
+      remaining = remaining.slice(available).trimStart();
+    }
+  }
+  return lines;
+}
+
+function wrapRows(lines: string[], maxWidth: number, clampLines?: number): string[] {
+  const physical: string[] = [];
+  for (const line of lines) {
+    let wrapped = wrapLine(line, maxWidth);
+    if (clampLines && wrapped.length > clampLines) {
+      wrapped = wrapped.slice(0, clampLines);
+      const lastIndex = wrapped.length - 1;
+      const last = wrapped[lastIndex];
+      wrapped[lastIndex] = last.length < maxWidth
+        ? `${last}…`
+        : `${last.slice(0, Math.max(0, maxWidth - 1))}…`;
+    }
+    physical.push(...wrapped);
+  }
+  return physical;
+}
+
+function section(title: string, lines: string[], effectiveWidth: number, clampLines?: number): string {
   const rows = lines.length > 0 ? lines : ['not available'];
-  const innerWidth = Math.max(title.length + 3, 20, ...rows.map(row => row.length + 2));
-  const top = `\u250c\u2500 ${title} ${'\u2500'.repeat(Math.max(1, innerWidth - title.length - 3))}\u2510`;
-  const body = rows.map(row => `\u2502 ${row.padEnd(innerWidth - 1)}\u2502`).join('\n');
-  const bottom = `\u2514${'\u2500'.repeat(innerWidth)}\u2518`;
+  if (effectiveWidth < BOARD_NARROW_WIDTH) {
+    const baseIndent = ' '.repeat(Math.min(2, Math.max(0, effectiveWidth - 1)));
+    const contentWidth = Math.max(1, effectiveWidth - baseIndent.length);
+    const wrapped = wrapRows(rows, contentWidth, clampLines);
+    const header = `== ${title} ==`.slice(0, effectiveWidth);
+    return [header, ...wrapped.map(row => `${baseIndent}${row}`)].join('\n');
+  }
+
+  const maxContentWidth = effectiveWidth - 4;
+  const wrapped = wrapRows(rows, maxContentWidth, clampLines);
+  const neededWidth = Math.max(
+    22,
+    title.length + 6,
+    ...wrapped.map(row => row.length + 4)
+  );
+  const boxWidth = Math.min(neededWidth, effectiveWidth);
+  const top = `\u250c\u2500 ${title} ${'\u2500'.repeat(boxWidth - title.length - 5)}\u2510`;
+  const body = wrapped.map(row => `\u2502 ${row.padEnd(boxWidth - 4)} \u2502`).join('\n');
+  const bottom = `\u2514${'\u2500'.repeat(boxWidth - 2)}\u2518`;
   return `${top}\n${body}\n${bottom}`;
 }
 
@@ -104,7 +192,7 @@ function branchFacts(task: BoardTaskData): string {
 
 function renderNeedsYou(data: BoardData): string[] | null {
   if (isUnavailable(data, [
-    'messages', 'message_deliveries', 'tasks', 'task_events', 'grants', 'janitor_status',
+    'agents', 'messages', 'message_deliveries', 'tasks', 'task_events', 'grants', 'janitor_status',
   ])) return null;
   return data.needsYou.length > 0
     ? data.needsYou.map(item => item.label)
@@ -157,12 +245,13 @@ export function renderBoard(
 ): string {
   const requestedNow = options.now ?? Date.now();
   const now = Number.isFinite(requestedNow) ? requestedNow : Date.now();
+  const width = resolveBoardWidth(options);
   const data = collectBoardData(db, swarmId, { now });
   return [
-    section('NEEDS YOU', renderNeedsYou(data) ?? ['not available']),
-    section('TASKS', renderTasks(data) ?? ['not available']),
-    section('FLEET', renderFleet(data, now) ?? ['not available']),
-    section('DEBRIS + QUOTA', renderDebrisAndQuota(data) ?? ['not available']),
+    section('NEEDS YOU', renderNeedsYou(data) ?? ['not available'], width, 2),
+    section('TASKS', renderTasks(data) ?? ['not available'], width),
+    section('FLEET', renderFleet(data, now) ?? ['not available'], width),
+    section('DEBRIS + QUOTA', renderDebrisAndQuota(data) ?? ['not available'], width),
   ].join('\n');
 }
 
@@ -176,8 +265,9 @@ export async function watchBoard(options: BoardWatchOptions): Promise<number> {
   let renderCount = 0;
 
   while (shouldContinue(renderCount)) {
+    const width = resolveBoardWidth(options);
     clear();
-    write(`${options.render()}\n`);
+    write(`${options.render(width)}\n`);
     renderCount += 1;
     if (!shouldContinue(renderCount)) break;
     await wait(intervalMs);
@@ -198,7 +288,8 @@ export function spawnBoardTab(
 
   try {
     const cwd = options.cwd ?? process.cwd();
-    const command = `swarm board --watch ${watchSeconds}`;
+    const widthArg = options.width === undefined ? '' : ` --width ${options.width}`;
+    const command = `swarm board --watch ${watchSeconds}${widthArg}`;
     const result = options.ownWorkspace
       ? spawnOwnWorkspace(cwd, command, 'swarm board')
       : spawnSplit(cwd, command, 'right');

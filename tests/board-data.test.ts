@@ -425,4 +425,40 @@ describe('V1-A shared board data projection', () => {
       empty.close();
     }
   });
+
+  test('needsYou excludes dead-agent unacked delivery while retaining a live-agent control', () => {
+    const fixture = createFixture();
+    try {
+      const dead = fixture.db.prepare(`
+        INSERT INTO messages (
+          swarm_id, from_agent, to_agent, body, delivered, created_at, kind, superseded_by
+        ) VALUES ('default', 'Lead', 'RetiredAgent', 'dead recipient gate', 1, ?, 'gate', NULL)
+      `).run(iso(1));
+      const deadMessageId = Number(dead.lastInsertRowid);
+      fixture.db.prepare(`
+        INSERT INTO message_deliveries (
+          message_id, swarm_id, recipient, status, first_injected_at, inject_count, acked_at
+        ) VALUES (?, 'default', 'RetiredAgent', 'delivered', ?, 1, NULL)
+      `).run(deadMessageId, iso(1));
+
+      const data = collectBoardData(fixture.db, 'default', { now: NOW });
+      assert.ok(
+        data.needsYou.some(item => item.refId === String(fixture.gateId)),
+        'case-insensitive live Alice delivery remains visible'
+      );
+      assert.ok(
+        !data.needsYou.some(item => item.refId === String(deadMessageId)),
+        'unregistered recipient delivery is excluded'
+      );
+      assert.strictEqual(data.agents.find(agent => agent.name === 'Alice')?.unackedCount, 1);
+      assert.ok(!data.agents.some(agent => agent.name === 'RetiredAgent'));
+      assert.ok(
+        fixture.db.prepare('SELECT 1 FROM messages WHERE id = ?').get(deadMessageId),
+        'historical message remains stored for recent-message archaeology'
+      );
+    } finally {
+      fixture.db.close();
+      fs.rmSync(fixture.root, { recursive: true, force: true });
+    }
+  });
 });

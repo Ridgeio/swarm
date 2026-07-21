@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import SQLite from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { DEFAULT_SWARM_ID, getDbAt } from '../src/db.js';
 import {
   forceReap as forceReapRaw,
@@ -26,61 +26,61 @@ import {
   getRecentMessages as getRecentMessagesRaw,
   sendMessage as sendMessageRaw,
 } from '../src/mailbox.js';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 
-let db: Database.Database;
+let db: SwarmDb;
 let dbPath: string;
 const SWARM_ID = DEFAULT_SWARM_ID;
 
-function joinAgent(testDb: Database.Database, name: string, surfaceId: string, workspaceId: string | undefined, ppid: number, description?: string) {
+function joinAgent(testDb: SwarmDb, name: string, surfaceId: string, workspaceId: string | undefined, ppid: number, description?: string) {
   return joinAgentRaw(testDb, SWARM_ID, name, surfaceId, workspaceId, ppid, description);
 }
 
-function joinHeadlessAgent(testDb: Database.Database, name: string, description?: string) {
+function joinHeadlessAgent(testDb: SwarmDb, name: string, description?: string) {
   return joinHeadlessAgentRaw(testDb, SWARM_ID, name, description);
 }
 
-function joinA2AAgent(testDb: Database.Database, name: string, endpointUrl: string, description?: string) {
+function joinA2AAgent(testDb: SwarmDb, name: string, endpointUrl: string, description?: string) {
   return joinA2AAgentRaw(testDb, SWARM_ID, name, endpointUrl, description);
 }
 
-function leaveAgent(testDb: Database.Database, surfaceId: string) {
+function leaveAgent(testDb: SwarmDb, surfaceId: string) {
   return leaveAgentRaw(testDb, SWARM_ID, surfaceId);
 }
 
-function leaveA2AAgent(testDb: Database.Database, name: string) {
+function leaveA2AAgent(testDb: SwarmDb, name: string) {
   return leaveA2AAgentRaw(testDb, SWARM_ID, name);
 }
 
-function getAgent(testDb: Database.Database, name: string) {
+function getAgent(testDb: SwarmDb, name: string) {
   return getAgentRaw(testDb, SWARM_ID, name);
 }
 
-function listAgents(testDb: Database.Database) {
+function listAgents(testDb: SwarmDb) {
   return listAgentsRaw(testDb, SWARM_ID);
 }
 
-function updateStatus(testDb: Database.Database, surfaceId: string, description: string) {
+function updateStatus(testDb: SwarmDb, surfaceId: string, description: string) {
   return updateStatusRaw(testDb, SWARM_ID, surfaceId, description);
 }
 
-function reapIfDead(testDb: Database.Database, name: string) {
+function reapIfDead(testDb: SwarmDb, name: string) {
   return reapIfDeadRaw(testDb, SWARM_ID, name);
 }
 
-function reapAll(testDb: Database.Database) {
+function reapAll(testDb: SwarmDb) {
   return reapAllRaw(testDb, SWARM_ID);
 }
 
-function forceReap(testDb: Database.Database, name: string) {
+function forceReap(testDb: SwarmDb, name: string) {
   return forceReapRaw(testDb, SWARM_ID, name);
 }
 
-function getInbox(testDb: Database.Database, agentName: string, peek: boolean = false) {
+function getInbox(testDb: SwarmDb, agentName: string, peek: boolean = false) {
   return getInboxRaw(testDb, SWARM_ID, agentName, peek);
 }
 
-function sendMessage(testDb: Database.Database, fromName: string, toName: string, body: string) {
+function sendMessage(testDb: SwarmDb, fromName: string, toName: string, body: string) {
   return sendMessageRaw(testDb, SWARM_ID, fromName, toName, body);
 }
 
@@ -519,7 +519,7 @@ describe('mailbox', () => {
 describe('migration', () => {
   test('legacy single-swarm database migrates into default swarm', () => {
     const legacyPath = path.join(os.tmpdir(), `swarm-legacy-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const legacy = new SQLite(legacyPath);
+    const legacy = new DatabaseSync(legacyPath);
     legacy.exec(`
       CREATE TABLE agents (
         id TEXT PRIMARY KEY,
@@ -578,7 +578,7 @@ describe('migration', () => {
 
   test('a leftover *_new table from a prior failed migration does not wedge migrate()', () => {
     const legacyPath = path.join(os.tmpdir(), `swarm-wedge-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const legacy = new SQLite(legacyPath);
+    const legacy = new DatabaseSync(legacyPath);
     legacy.exec(`
       CREATE TABLE agents (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT,
@@ -622,7 +622,7 @@ describe('migration', () => {
     const oldPath = path.join(os.tmpdir(), `swarm-prekind-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     // Simulate a DB written by the previous build: modern multi-swarm messages
     // schema (has swarm_id) but no kind column.
-    const old = new SQLite(oldPath);
+    const old = new DatabaseSync(oldPath);
     old.exec(`
       CREATE TABLE messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -680,7 +680,7 @@ describe('migration', () => {
 
   test('a fully-legacy DB (pre-swarm_id rebuild) also ends up with the kind column', () => {
     const legacyPath = path.join(os.tmpdir(), `swarm-legacy-kind-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const legacy = new SQLite(legacyPath);
+    const legacy = new DatabaseSync(legacyPath);
     legacy.exec(`
       CREATE TABLE messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT, from_agent TEXT NOT NULL, to_agent TEXT,
@@ -711,7 +711,7 @@ describe('migration', () => {
 
   test('a pre-T1 tasks table gains one nullable claim_kind column additively', () => {
     const oldPath = path.join(os.tmpdir(), `swarm-preclaim-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const old = new SQLite(oldPath);
+    const old = new DatabaseSync(oldPath);
     old.exec(`
       CREATE TABLE tasks (
         id TEXT NOT NULL,
@@ -760,7 +760,7 @@ describe('migration', () => {
 
   test('migration de-duplicates case-variant names the new NOCASE unique would reject', () => {
     const legacyPath = path.join(os.tmpdir(), `swarm-nocase-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
-    const legacy = new SQLite(legacyPath);
+    const legacy = new DatabaseSync(legacyPath);
     legacy.exec(`
       CREATE TABLE agents (
         id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE, description TEXT,

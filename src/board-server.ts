@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { execFileSync } from 'node:child_process';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import fs from 'node:fs';
@@ -27,7 +27,7 @@ export interface BoardAssetRoots {
 }
 
 export type BoardProjection = (
-  db: Database.Database | null,
+  db: SwarmDb | null,
   swarmId: string,
   options?: CollectBoardDataOptions
 ) => BoardData;
@@ -35,7 +35,7 @@ export type BoardProjection = (
 export type BoardCmuxRunner = (binary: string, args: string[]) => string | Buffer;
 
 export interface StartBoardServerOptions {
-  db: Database.Database | null;
+  db: SwarmDb | null;
   swarmId: string;
   port?: number;
   projection?: BoardProjection;
@@ -194,7 +194,7 @@ function parseFocusLocation(raw: string | Buffer): { pane: string; workspace: st
 
 /** Resolve a registered agent and best-effort focus its exact cmux surface. */
 export function focusAgentTerminal(
-  db: Database.Database | null,
+  db: SwarmDb | null,
   swarmId: string,
   agentName: string,
   options: Pick<StartBoardServerOptions, 'cmuxRunner' | 'resolveCmuxBinary'> = {}

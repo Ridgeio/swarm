@@ -1,10 +1,10 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
-import { DEFAULT_SWARM_ID, DEFAULT_SWARM_NAME } from './db.js';
+import { DEFAULT_SWARM_ID, DEFAULT_SWARM_NAME, withImmediateTransaction } from './db.js';
 import { isSurfaceAlive } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
@@ -206,16 +206,16 @@ function removeSessionMarker(swarmId: string, agentName: string): void {
   }
 }
 
-export function getSwarmById(db: Database.Database, swarmId: string): Swarm | null {
+export function getSwarmById(db: SwarmDb, swarmId: string): Swarm | null {
   return db.prepare('SELECT * FROM swarms WHERE id = ?').get(swarmId) as Swarm | undefined ?? null;
 }
 
-export function getSwarm(db: Database.Database, name: string): Swarm | null {
+export function getSwarm(db: SwarmDb, name: string): Swarm | null {
   return db.prepare('SELECT * FROM swarms WHERE name = ? COLLATE NOCASE').get(normalizeSwarmName(name)) as Swarm | undefined ?? null;
 }
 
 export function getOrCreateSwarm(
-  db: Database.Database,
+  db: SwarmDb,
   name?: string,
   rootPath?: string,
   description?: string
@@ -251,13 +251,13 @@ export function getOrCreateSwarm(
   return created;
 }
 
-export function listSwarms(db: Database.Database): Swarm[] {
-  return db.prepare('SELECT * FROM swarms ORDER BY last_active_at DESC, name ASC').all() as Swarm[];
+export function listSwarms(db: SwarmDb): Swarm[] {
+  return db.prepare('SELECT * FROM swarms ORDER BY last_active_at DESC, name ASC').all() as unknown as Swarm[];
 }
 
-export function findSwarmForCwd(db: Database.Database, cwd: string = process.cwd()): Swarm | null {
+export function findSwarmForCwd(db: SwarmDb, cwd: string = process.cwd()): Swarm | null {
   const current = path.resolve(cwd);
-  const swarms = db.prepare('SELECT * FROM swarms WHERE root_path IS NOT NULL ORDER BY length(root_path) DESC').all() as Swarm[];
+  const swarms = db.prepare('SELECT * FROM swarms WHERE root_path IS NOT NULL ORDER BY length(root_path) DESC').all() as unknown as Swarm[];
 
   for (const swarm of swarms) {
     if (!swarm.root_path) continue;
@@ -270,21 +270,21 @@ export function findSwarmForCwd(db: Database.Database, cwd: string = process.cwd
   return null;
 }
 
-export function deleteSwarm(db: Database.Database, name: string): Swarm | null {
+export function deleteSwarm(db: SwarmDb, name: string): Swarm | null {
   const swarm = getSwarm(db, name);
   if (!swarm) return null;
   if (swarm.id === DEFAULT_SWARM_ID) {
     throw new Error('The default swarm cannot be deleted. Use "swarm reset --swarm default" to clear it.');
   }
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
     db.prepare('DELETE FROM swarms WHERE id = ?').run(swarm.id);
-  }).immediate();
+  });
   return swarm;
 }
 
 export function joinAgent(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   name: string,
   surfaceId: string,
@@ -304,7 +304,7 @@ export function joinAgent(
     ? null
     : captureWorkerVersion(host, versionRunner);
 
-  const tx = db.transaction(() => {
+  withImmediateTransaction(db, () => {
     const existing = getAgent(db, swarmId, name);
     if (existing && existing.surface_id !== surfaceId) {
       throw new Error(`Agent name "${name}" is already taken by a ${existing.agent_type} agent in this swarm. Choose a different name.`);
@@ -336,7 +336,6 @@ export function joinAgent(
 
     db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
   });
-  tx.immediate();
 
   const agent: Agent = {
     id,
@@ -361,7 +360,7 @@ export function joinAgent(
 }
 
 export function joinA2AAgent(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   name: string,
   endpointUrl: string,
@@ -375,20 +374,20 @@ export function joinA2AAgent(
   return joinAgent(db, swarmId, name, syntheticSurfaceId, undefined, 0, description, 'a2a', endpointUrl);
 }
 
-export function leaveAgent(db: Database.Database, swarmId: string, surfaceId: string): boolean {
+export function leaveAgent(db: SwarmDb, swarmId: string, surfaceId: string): boolean {
   const result = db.prepare('DELETE FROM agents WHERE swarm_id = ? AND surface_id = ?').run(swarmId, surfaceId);
-  if (result.changes > 0) removeSurfaceSessionMarker(swarmId, surfaceId);
-  return result.changes > 0;
+  if (Number(result.changes) > 0) removeSurfaceSessionMarker(swarmId, surfaceId);
+  return Number(result.changes) > 0;
 }
 
-export function leaveA2AAgent(db: Database.Database, swarmId: string, name: string): boolean {
+export function leaveA2AAgent(db: SwarmDb, swarmId: string, name: string): boolean {
   const result = db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'a2a'")
     .run(swarmId, name);
-  return result.changes > 0;
+  return Number(result.changes) > 0;
 }
 
 export function joinHeadlessAgent(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   name: string,
   description?: string,
@@ -424,7 +423,7 @@ export function joinHeadlessAgent(
 }
 
 export function leaveHeadlessAgent(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   name: string,
   options: HeadlessSessionOptions = {}
@@ -434,10 +433,10 @@ export function leaveHeadlessAgent(
   if (options.trackSession) {
     removeSessionMarker(swarmId, name);
   }
-  return result.changes > 0;
+  return Number(result.changes) > 0;
 }
 
-function resolveSelf(db: Database.Database, swarmId?: string): ResolvedSelf | null {
+function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
   const envSwarmId = process.env.SWARM_ID;
   const envSwarmName = process.env.SWARM_NAME;
   let resolvedSwarmId = swarmId || envSwarmId;
@@ -500,7 +499,7 @@ function resolveSelf(db: Database.Database, swarmId?: string): ResolvedSelf | nu
   return null;
 }
 
-export function getSelf(db: Database.Database, swarmId?: string): Agent | null {
+export function getSelf(db: SwarmDb, swarmId?: string): Agent | null {
   return resolveSelf(db, swarmId)?.agent ?? null;
 }
 
@@ -512,7 +511,7 @@ function tokensMatch(expected: string, presented: string | null): boolean {
   return timingSafeEqual(expectedBytes, presentedBytes);
 }
 
-export function getAuthenticatedSelf(db: Database.Database, swarmId?: string): Agent | null {
+export function getAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | null {
   const resolved = resolveSelf(db, swarmId);
   if (!resolved) return null;
   const { agent, presentedToken } = resolved;
@@ -525,37 +524,37 @@ export function getAuthenticatedSelf(db: Database.Database, swarmId?: string): A
   return agent;
 }
 
-export function getAgent(db: Database.Database, swarmId: string, name: string): Agent | null {
+export function getAgent(db: SwarmDb, swarmId: string, name: string): Agent | null {
   return db.prepare('SELECT * FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE')
     .get(swarmId, name) as Agent | undefined ?? null;
 }
 
-export async function listAgents(db: Database.Database, swarmId: string): Promise<Agent[]> {
+export async function listAgents(db: SwarmDb, swarmId: string): Promise<Agent[]> {
   await cleanupStale(db, swarmId);
-  return db.prepare('SELECT * FROM agents WHERE swarm_id = ? ORDER BY joined_at ASC').all(swarmId) as Agent[];
+  return db.prepare('SELECT * FROM agents WHERE swarm_id = ? ORDER BY joined_at ASC').all(swarmId) as unknown as Agent[];
 }
 
-export function listAgentsSync(db: Database.Database, swarmId?: string): Agent[] {
+export function listAgentsSync(db: SwarmDb, swarmId?: string): Agent[] {
   if (swarmId) {
-    return db.prepare('SELECT * FROM agents WHERE swarm_id = ? ORDER BY joined_at ASC').all(swarmId) as Agent[];
+    return db.prepare('SELECT * FROM agents WHERE swarm_id = ? ORDER BY joined_at ASC').all(swarmId) as unknown as Agent[];
   }
-  return db.prepare('SELECT * FROM agents ORDER BY joined_at ASC').all() as Agent[];
+  return db.prepare('SELECT * FROM agents ORDER BY joined_at ASC').all() as unknown as Agent[];
 }
 
-export function updateStatus(db: Database.Database, swarmId: string, surfaceId: string, description: string): boolean {
+export function updateStatus(db: SwarmDb, swarmId: string, surfaceId: string, description: string): boolean {
   const now = nowIso();
   const result = db.prepare('UPDATE agents SET description = ?, last_heartbeat = ? WHERE swarm_id = ? AND surface_id = ?')
     .run(description, now, swarmId, surfaceId);
   db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
-  return result.changes > 0;
+  return Number(result.changes) > 0;
 }
 
-export function updateWorkspace(db: Database.Database, swarmId: string, surfaceId: string, workspaceId: string): void {
+export function updateWorkspace(db: SwarmDb, swarmId: string, surfaceId: string, workspaceId: string): void {
   db.prepare('UPDATE agents SET workspace_id = ? WHERE swarm_id = ? AND surface_id = ?').run(workspaceId, swarmId, surfaceId);
 }
 
 export function updateHostAgent(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   surfaceId: string,
   hostAgent: HostAgentKind
@@ -564,7 +563,7 @@ export function updateHostAgent(
     .run(hostAgent, swarmId, surfaceId);
 }
 
-export function updateHeartbeat(db: Database.Database, swarmId: string, surfaceId: string): void {
+export function updateHeartbeat(db: SwarmDb, swarmId: string, surfaceId: string): void {
   const now = nowIso();
   db.prepare('UPDATE agents SET last_heartbeat = ? WHERE swarm_id = ? AND surface_id = ?').run(now, swarmId, surfaceId);
   db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
@@ -572,10 +571,10 @@ export function updateHeartbeat(db: Database.Database, swarmId: string, surfaceI
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes
 
-async function cleanupStale(db: Database.Database, swarmId?: string): Promise<void> {
+async function cleanupStale(db: SwarmDb, swarmId?: string): Promise<void> {
   const agents = swarmId
-    ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as Agent[]
-    : db.prepare('SELECT * FROM agents').all() as Agent[];
+    ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as unknown as Agent[]
+    : db.prepare('SELECT * FROM agents').all() as unknown as Agent[];
   const now = Date.now();
 
   const checks = agents.map(async (agent) => {
@@ -618,7 +617,7 @@ async function isConfirmedDead(agent: Agent): Promise<boolean> {
   return !(await probe());
 }
 
-export async function reapIfDead(db: Database.Database, swarmId: string, name: string): Promise<Agent | null> {
+export async function reapIfDead(db: SwarmDb, swarmId: string, name: string): Promise<Agent | null> {
   const existing = getAgent(db, swarmId, name);
   if (!existing) return null;
   if (existing.agent_type === 'headless') return null;
@@ -629,10 +628,10 @@ export async function reapIfDead(db: Database.Database, swarmId: string, name: s
   return null;
 }
 
-export async function reapAll(db: Database.Database, swarmId?: string): Promise<Agent[]> {
+export async function reapAll(db: SwarmDb, swarmId?: string): Promise<Agent[]> {
   const agents = swarmId
-    ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as Agent[]
-    : db.prepare('SELECT * FROM agents').all() as Agent[];
+    ? db.prepare('SELECT * FROM agents WHERE swarm_id = ?').all(swarmId) as unknown as Agent[]
+    : db.prepare('SELECT * FROM agents').all() as unknown as Agent[];
   const reaped: Agent[] = [];
   for (const agent of agents) {
     if (agent.agent_type === 'headless') continue;
@@ -644,7 +643,7 @@ export async function reapAll(db: Database.Database, swarmId?: string): Promise<
   return reaped;
 }
 
-export function forceReap(db: Database.Database, swarmId: string, name: string): Agent | null {
+export function forceReap(db: SwarmDb, swarmId: string, name: string): Agent | null {
   const existing = getAgent(db, swarmId, name);
   if (!existing) return null;
   db.prepare('DELETE FROM agents WHERE id = ?').run(existing.id);

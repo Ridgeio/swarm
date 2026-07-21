@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -45,7 +45,7 @@ interface RedeliverOptions {
  * so overlapping sweeps (hook + worker) can't double-deliver.
  */
 export async function redeliverPending(
-  db: Database.Database,
+  db: SwarmDb,
   options: RedeliverOptions = {}
 ): Promise<RedeliverResult> {
   const deliver = options.deliver ?? deliverToAgent;
@@ -62,7 +62,7 @@ export async function redeliverPending(
       AND m.id > COALESCE(c.last_read_id, 0)
       AND m.created_at > ?
     ORDER BY m.id ASC
-  `).all(cutoff) as Message[];
+  `).all(cutoff) as unknown as Message[];
 
   const result: RedeliverResult = { eligible: eligible.length, redelivered: 0, attempted: 0 };
   if (options.dryRun) return result;
@@ -72,7 +72,7 @@ export async function redeliverPending(
 
   for (const msg of eligible) {
     // Atomic claim — a concurrent sweep that got here first wins, we skip.
-    if (claim.run(msg.id).changes === 0) continue;
+    if (Number(claim.run(msg.id).changes) === 0) continue;
 
     const target = getAgent(db, msg.swarm_id, msg.to_agent!);
     if (!target) {
@@ -137,7 +137,7 @@ function releaseWorkerLock(): void {
   try { fs.rmSync(WORKER_LOCK, { recursive: true, force: true }); } catch {}
 }
 
-export async function runRedeliverWorker(db: Database.Database): Promise<void> {
+export async function runRedeliverWorker(db: SwarmDb): Promise<void> {
   if (!tryAcquireWorkerLock()) return; // another worker is already on it
   try {
     for (const delaySec of WORKER_DELAYS_SEC) {
@@ -164,7 +164,7 @@ export function spawnRedeliverWorker(): void {
 }
 
 /** Cheap check used by hook-context/inbox: anything worth redelivering? */
-export function hasPendingRedeliveries(db: Database.Database): boolean {
+export function hasPendingRedeliveries(db: SwarmDb): boolean {
   const cutoff = new Date(Date.now() - REDELIVER_WINDOW_MS).toISOString();
   const row = db.prepare(`
     SELECT m.id FROM messages m

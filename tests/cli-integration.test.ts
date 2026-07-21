@@ -5,7 +5,8 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
 import { fileURLToPath } from 'url';
-import SQLite from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
+import type { SwarmDb } from '../src/db.js';
 
 // Exercise the real CLI handlers (join reclaim, rename-workspace id resolution) as a
 // subprocess against an isolated HOME (so ~/.swarm is a throwaway temp DB, never the
@@ -26,7 +27,7 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
   if (childEnv.SWARM_AGENT_NAME && !Object.prototype.hasOwnProperty.call(env, 'SWARM_SESSION_TOKEN')) {
     const dbPath = join(home, '.swarm', 'swarm.db');
     if (existsSync(dbPath)) {
-      const identityDb = new SQLite(dbPath, { readonly: true });
+      const identityDb = new DatabaseSync(dbPath, { readOnly: true });
       try {
         const row = identityDb.prepare('SELECT session_token FROM agents WHERE name = ? COLLATE NOCASE')
           .get(childEnv.SWARM_AGENT_NAME) as { session_token: string | null } | undefined;
@@ -88,7 +89,7 @@ describe('cli integration', () => {
     // Age its heartbeat far past any threshold. A headless agent has no probeable surface,
     // so even a long-stale one is NOT auto-evicted (it could be busy on a long task) — only
     // an explicit --force reclaims it.
-    const sqlite = new SQLite(join(home, '.swarm', 'swarm.db'));
+    const sqlite = new DatabaseSync(join(home, '.swarm', 'swarm.db'));
     sqlite.prepare("UPDATE agents SET last_heartbeat = ? WHERE name = 'Qux'")
       .run(new Date(Date.now() - 60 * 60 * 1000).toISOString());
     sqlite.close();
@@ -262,8 +263,8 @@ describe('cli supersession and pull/ack delivery', () => {
     dropSessionMarkers(home);
   }
 
-  function openDb(home: string): SQLite.Database {
-    return new SQLite(join(home, '.swarm', 'swarm.db'));
+  function openDb(home: string): SwarmDb {
+    return new DatabaseSync(join(home, '.swarm', 'swarm.db'));
   }
 
   test('first join fences hook history while --recent deliberately replays it', () => {
@@ -387,7 +388,7 @@ describe('cli supersession and pull/ack delivery', () => {
       const delivery = pendingDb.prepare('SELECT status, inject_count FROM message_deliveries WHERE message_id = ?')
         .get(message.id) as { status: string; inject_count: number };
       const watermark = pendingDb.prepare("SELECT last_read_id FROM inbox_cursors WHERE agent_name = 'Bob'").get() as { last_read_id: number };
-      assert.deepStrictEqual(delivery, { status: 'injected', inject_count: 3 });
+      assert.deepStrictEqual({ ...delivery }, { status: 'injected', inject_count: 3 });
       assert.strictEqual(watermark.last_read_id, 0);
       pendingDb.close();
 

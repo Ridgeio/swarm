@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -55,7 +55,7 @@ function eventData(raw: string | null): Record<string, unknown> | null {
 }
 
 function latestCheckpoint(
-  db: Database.Database,
+  db: SwarmDb,
   task: Task
 ): { path: string | null; body: string | null } {
   const row = db.prepare(`
@@ -108,7 +108,7 @@ function resolveQuestion(task: Task, explicit: string | undefined, checkpointBod
   return question;
 }
 
-function evidenceLines(db: Database.Database, task: Task): string[] {
+function evidenceLines(db: SwarmDb, task: Task): string[] {
   const rows = db.prepare(`
     SELECT id, kind, data, created_at
     FROM task_events
@@ -132,7 +132,7 @@ function evidenceLines(db: Database.Database, task: Task): string[] {
   });
 }
 
-function recentEventLines(db: Database.Database, task: Task): string[] {
+function recentEventLines(db: SwarmDb, task: Task): string[] {
   const rows = db.prepare(`
     SELECT id, epoch, kind, actor, data, created_at
     FROM (
@@ -142,7 +142,7 @@ function recentEventLines(db: Database.Database, task: Task): string[] {
       ORDER BY id DESC LIMIT ?
     ) recent
     ORDER BY id ASC
-  `).all(task.swarm_id, task.id, RECENT_EVENT_LIMIT) as TaskEventRow[];
+  `).all(task.swarm_id, task.id, RECENT_EVENT_LIMIT) as unknown as TaskEventRow[];
   if (rows.length === 0) return ['- none recorded'];
   return rows.map(row => {
     const data = row.data ? ` — ${oneLine(row.data)}` : '';
@@ -163,7 +163,7 @@ function riskLine(task: Task): string {
 }
 
 function packetBody(
-  db: Database.Database,
+  db: SwarmDb,
   task: Task,
   checkpoint: { path: string | null; body: string | null },
   question: string
@@ -208,7 +208,7 @@ ${question}
 }
 
 export async function escalateTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
@@ -236,7 +236,7 @@ export async function escalateTask(
   const briefPath = path.join(briefDir, `${slug}--${minuteStamp(now)}.md`);
   fs.writeFileSync(briefPath, packetBody(db, task, checkpoint, question), 'utf-8');
 
-  const updated = db.transaction(() => {
+  const updated = withImmediateTransaction(db, () => {
     const current = getTask(db, swarmId, slug);
     if (!current) throw new Error(`Task "${slug}" not found in this swarm.`);
     const createdAt = now.toISOString();
@@ -253,7 +253,7 @@ export async function escalateTask(
       to: recipient,
     }), createdAt);
     return getTask(db, swarmId, slug)!;
-  }).immediate() as Task;
+  }) as Task;
 
   let messageId: number | null = null;
   if (recipient) {

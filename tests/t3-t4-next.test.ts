@@ -6,7 +6,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 import { AGENT_HELP_ENTRIES, CANONICAL_CLI_COMMANDS, renderAgentHelp } from '../src/agent-help.js';
 import { collectBoardData } from '../src/board-data.js';
 import { getDbAt, getDbReadOnly } from '../src/db.js';
@@ -67,7 +67,7 @@ function controlsFile(root: string, rows: string[]): string {
   return filePath;
 }
 
-function tableChecksums(db: Database.Database): Map<string, string> {
+function tableChecksums(db: SwarmDb): Map<string, string> {
   const tables = db.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'janitor_%'
@@ -80,7 +80,7 @@ function tableChecksums(db: Database.Database): Map<string, string> {
   }));
 }
 
-function insertTask(db: Database.Database, slug: string): void {
+function insertTask(db: SwarmDb, slug: string): void {
   const createdAt = new Date(NOW - 60_000).toISOString();
   db.prepare(`
     INSERT INTO tasks (
@@ -93,7 +93,7 @@ function insertTask(db: Database.Database, slug: string): void {
 }
 
 function insertEvent(
-  db: Database.Database,
+  db: SwarmDb,
   slug: string,
   kind: string,
   actor: string,
@@ -295,8 +295,8 @@ describe('T4 observer hardening and agent surfaces', () => {
     const readOnly = getDbReadOnly(dbPath);
     assert.ok(readOnly);
     try {
-      const pragma = readOnly!.pragma('query_only', { simple: true });
-      assert.strictEqual(pragma, 1);
+      const pragma = readOnly!.prepare('PRAGMA query_only').get() as { query_only: number };
+      assert.strictEqual(pragma.query_only, 1);
       assert.throws(() => readOnly!.prepare("UPDATE swarms SET name = 'mutated' WHERE id = 'default'").run());
     } finally {
       readOnly!.close();

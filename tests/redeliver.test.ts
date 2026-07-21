@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 import { getDbAt } from '../src/db.js';
 import { redeliverPending, hasPendingRedeliveries, REDELIVER_WINDOW_MS } from '../src/redeliver.js';
 
@@ -12,7 +12,7 @@ import { redeliverPending, hasPendingRedeliveries, REDELIVER_WINDOW_MS } from '.
 
 const SWARM = 'default';
 let dir: string;
-let db: Database.Database;
+let db: SwarmDb;
 
 function addAgent(name: string, type: 'cmux' | 'headless' | 'a2a' = 'cmux'): void {
   const now = new Date().toISOString();

@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -141,7 +141,7 @@ export function removeJanitorRoot(root: string, options: JanitorPathsOptions = {
 }
 
 function loadOrSeedJanitorRoots(
-  db: Database.Database,
+  db: SwarmDb,
   options: JanitorPathsOptions = {}
 ): string[] {
   const rootsPath = janitorRootsPath(options);
@@ -330,7 +330,7 @@ function scanControls(
 }
 
 function scanWorkerEpochs(
-  db: Database.Database,
+  db: SwarmDb,
   findings: Map<string, Finding>,
   kvUpdates: Map<string, string>
 ): void {
@@ -583,7 +583,7 @@ function emptyCounters(): JanitorCounters {
 }
 
 function persistTick(
-  db: Database.Database,
+  db: SwarmDb,
   tickAt: string,
   counters: JanitorCounters,
   findings: Map<string, Finding>,
@@ -610,7 +610,7 @@ function persistTick(
   `);
   const countersJson = JSON.stringify(counters);
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const finding of findings.values()) {
       upsertFinding.run(
         tickAt,
@@ -638,12 +638,12 @@ function persistTick(
     `).run(tickAt, counters.tickMs, countersJson);
     db.prepare('INSERT INTO janitor_snapshots (tick_at, counters) VALUES (?, ?)')
       .run(tickAt, countersJson);
-  })();
+  });
 }
 
 /** Recompute the complete observe-only census. No probe writes outside ~/.swarm. */
 export function runJanitorTick(
-  db: Database.Database,
+  db: SwarmDb,
   options: JanitorTickOptions = {}
 ): JanitorTickResult {
   const releaseLock = acquireJanitorLock(options);
@@ -685,7 +685,7 @@ function normalizeCounters(value: unknown): JanitorCounters {
   return counters;
 }
 
-export function getJanitorStatus(db: Database.Database): JanitorStatus | null {
+export function getJanitorStatus(db: SwarmDb): JanitorStatus | null {
   const table = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'janitor_status'").get();
   if (!table) return null;
   const row = db.prepare('SELECT last_tick_at, last_duration_ms, counters FROM janitor_status WHERE id = 1')

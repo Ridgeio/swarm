@@ -1,7 +1,7 @@
 import http from 'http';
 import os from 'os';
 import { randomUUID } from 'crypto';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { getAgent } from './registry.js';
 import { deliverToAgent } from './transport-router.js';
 import { spawnRedeliverWorker } from './redeliver.js';
@@ -19,7 +19,7 @@ import { spawnRedeliverWorker } from './redeliver.js';
  */
 
 export interface A2AServeOptions {
-  db: Database.Database;
+  db: SwarmDb;
   swarmId: string;
   swarmName: string;
   /** Local agent name whose inbox receives incoming messages. */
@@ -115,7 +115,7 @@ export async function startA2AServer(options: A2AServeOptions): Promise<http.Ser
           try {
             const push = await deliverToAgent(localTarget, `[SWARM from ${from}]: ${body}`);
             if (push.delivered) {
-              markDelivered.run(inserted.lastInsertRowid);
+              markDelivered.run(Number(inserted.lastInsertRowid));
               reply = `Delivered to ${agentName} on ${os.hostname()} (pushed to terminal).`;
             } else {
               // Busy surface (e.g. recipient mid-turn). The detached worker retries

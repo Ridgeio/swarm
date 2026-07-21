@@ -5,9 +5,9 @@ import os from 'os';
 import path from 'path';
 import { DEFAULT_SWARM_ID, getDbAt } from '../src/db.js';
 import { getFleetStats, formatFleetStats } from '../src/stats.js';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 
-let db: Database.Database;
+let db: SwarmDb;
 let dbPath: string;
 const SWARM_ID = DEFAULT_SWARM_ID;
 

@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { getAgent } from './registry.js';
 
 export const GRANT_OPS = ['merge', 'prod', 'spend', 'override'] as const;
@@ -43,7 +43,7 @@ export const GRANT_TTL_PATTERN = /^(\d+)(m|h|d)$/;
 
 export function validateGrantOp(value: string): GrantOp {
   if ((GRANT_OPS as readonly string[]).includes(value)) return value as BuiltinGrantOp;
-  if (/^custom:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return value as GrantOp;
+  if (/^custom:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return value as unknown as GrantOp;
   throw new Error(`Invalid grant op "${value}". Use merge, prod, spend, override, or custom:<name>.`);
 }
 
@@ -77,7 +77,7 @@ export function grantResourceMatches(grantResource: string, requestedResource: s
 }
 
 export function createGrant(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   options: CreateGrantOptions
@@ -116,44 +116,44 @@ export function createGrant(
     createdAt,
     expiresAt
   );
-  return db.prepare('SELECT * FROM grants WHERE id = ?').get(Number(result.lastInsertRowid)) as Grant;
+  return db.prepare('SELECT * FROM grants WHERE id = ?').get(Number(result.lastInsertRowid)) as unknown as Grant;
 }
 
 export function listGrants(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   liveOnly: boolean = false,
   now: number = Date.now()
 ): Grant[] {
   if (!liveOnly) {
-    return db.prepare('SELECT * FROM grants WHERE swarm_id = ? ORDER BY id ASC').all(swarmId) as Grant[];
+    return db.prepare('SELECT * FROM grants WHERE swarm_id = ? ORDER BY id ASC').all(swarmId) as unknown as Grant[];
   }
   return db.prepare(`
     SELECT * FROM grants
     WHERE swarm_id = ? AND revoked_at IS NULL AND expires_at > ?
     ORDER BY expires_at ASC, id ASC
-  `).all(swarmId, new Date(now).toISOString()) as Grant[];
+  `).all(swarmId, new Date(now).toISOString()) as unknown as Grant[];
 }
 
 export function revokeGrant(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   id: number,
   now: number = Date.now()
 ): Grant | null {
   const existing = db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
-    .get(swarmId, id) as Grant | undefined;
+    .get(swarmId, id) as unknown as Grant | undefined;
   if (!existing) return null;
   if (existing.revoked_at === null) {
     db.prepare('UPDATE grants SET revoked_at = ? WHERE swarm_id = ? AND id = ? AND revoked_at IS NULL')
       .run(new Date(now).toISOString(), swarmId, id);
   }
   return db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
-    .get(swarmId, id) as Grant;
+    .get(swarmId, id) as unknown as Grant;
 }
 
 export function findLiveGrant(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   options: FindLiveGrantOptions
 ): GrantMatch | null {
@@ -164,7 +164,7 @@ export function findLiveGrant(
     WHERE swarm_id = ? AND op = ? AND revoked_at IS NULL AND expires_at > ?
       AND (granted_to IS NULL OR granted_to = ? COLLATE NOCASE)
     ORDER BY id ASC
-  `).all(swarmId, op, at, options.actor) as Grant[];
+  `).all(swarmId, op, at, options.actor) as unknown as Grant[];
   for (const grant of candidates) {
     for (const resource of options.resources) {
       if (grantResourceMatches(grant.resource, resource)) {
@@ -176,7 +176,7 @@ export function findLiveGrant(
 }
 
 export function recordGrantUsed(
-  db: Database.Database,
+  db: SwarmDb,
   task: { swarm_id: string; id: string; lease_epoch: number },
   grant: Grant,
   actor: string,

@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import {
@@ -219,7 +219,7 @@ export interface CollectBoardDataOptions {
   now?: number;
 }
 
-function tableColumns(db: Database.Database, table: string): Set<string> | null {
+function tableColumns(db: SwarmDb, table: string): Set<string> | null {
   try {
     const exists = db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?")
       .get(table);
@@ -231,7 +231,7 @@ function tableColumns(db: Database.Database, table: string): Set<string> | null 
   }
 }
 
-export function boardHasTable(db: Database.Database | null, table: string): boolean {
+export function boardHasTable(db: SwarmDb | null, table: string): boolean {
   if (!db) return false;
   const columns = tableColumns(db, table);
   const required = REQUIRED_COLUMNS[table] ?? [];
@@ -401,7 +401,7 @@ function addUnavailable(unavailable: Set<string>, ...tables: string[]): void {
  * only queried; database writes and migrations are deliberately out of scope.
  */
 export function collectBoardData(
-  db: Database.Database | null,
+  db: SwarmDb | null,
   swarmId: string,
   options: CollectBoardDataOptions = {}
 ): BoardData {
@@ -442,7 +442,7 @@ export function collectBoardData(
           CASE state WHEN 'awaiting_review' THEN 0 WHEN 'active' THEN 1 WHEN 'open' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
           updated_at ASC,
           id ASC
-      `).all(swarmId, cutoff) as RawTask[];
+      `).all(swarmId, cutoff) as unknown as RawTask[];
     } catch {
       addUnavailable(unavailable, 'tasks');
       rawTasks = [];
@@ -483,7 +483,7 @@ export function collectBoardData(
           WHERE swarm_id = ? AND task_id = ?
             AND kind IN ('close_evidence', 'closed', 'gate_override', 'grant_used')
           ORDER BY id ASC
-        `).all(swarmId, task.id) as RawTaskEvent[];
+        `).all(swarmId, task.id) as unknown as RawTaskEvent[];
         for (const event of closeEvents) {
           const data = parseJsonObject(event.data);
           if (event.kind === 'close_evidence') {
@@ -658,7 +658,7 @@ export function collectBoardData(
         FROM task_events
         WHERE swarm_id = ? AND kind IN ('handoff', 'claimed')
         ORDER BY id ASC
-      `).all(swarmId) as RawTaskEvent[];
+      `).all(swarmId) as unknown as RawTaskEvent[];
       for (const event of edgeEvents) {
         const data = parseJsonObject(event.data);
         if (event.kind === 'handoff') {
@@ -908,7 +908,7 @@ export function collectBoardData(
           LIMIT ?
         ) recent
         ORDER BY id ASC
-      `).all(swarmId, TIMELINE_LIMIT) as RawTaskEvent[];
+      `).all(swarmId, TIMELINE_LIMIT) as unknown as RawTaskEvent[];
       timeline = events.map(event => ({
         taskId: event.task_id,
         epoch: event.epoch,

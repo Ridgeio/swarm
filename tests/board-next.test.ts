@@ -1,6 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -17,7 +17,7 @@ import {
   watchBoardGraph,
   writeBoardGraphFile,
 } from '../src/board.js';
-import { getDbAt } from '../src/db.js';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 
 const NOW = Date.parse('2026-07-18T18:00:00.000Z');
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
@@ -27,7 +27,7 @@ function iso(minutesAgo: number): string {
   return new Date(NOW - minutesAgo * 60_000).toISOString();
 }
 
-function insertAgent(db: Database.Database, name: string, host: string): void {
+function insertAgent(db: SwarmDb, name: string, host: string): void {
   db.prepare(`
     INSERT INTO agents (
       id, swarm_id, name, description, surface_id, workspace_id, ppid,
@@ -37,7 +37,7 @@ function insertAgent(db: Database.Database, name: string, host: string): void {
 }
 
 function insertTask(
-  db: Database.Database,
+  db: SwarmDb,
   id: string,
   state: string,
   owner: string,
@@ -64,7 +64,7 @@ function insertTask(
 }
 
 function insertEvent(
-  db: Database.Database,
+  db: SwarmDb,
   taskId: string,
   actor: string,
   kind: string,
@@ -89,7 +89,7 @@ function checkpointFile(root: string, name: string, quota: boolean): string {
 function createFixture(quota: boolean = true): {
   root: string;
   dbPath: string;
-  db: Database.Database;
+  db: SwarmDb;
 } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-next-'));
   const dbPath = path.join(root, 'swarm.db');
@@ -152,7 +152,7 @@ function createFixture(quota: boolean = true): {
   return { root, dbPath, db };
 }
 
-function databaseSnapshot(db: Database.Database): string {
+function databaseSnapshot(db: SwarmDb): string {
   const tables = db.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -257,7 +257,7 @@ describe('WI-7 swarm board', () => {
   });
 
   test('renders every section as not available against a fresh empty database', () => {
-    const db = new Database(':memory:');
+    const db = new DatabaseSync(':memory:');
     try {
       const output = renderBoard(db, 'default', { now: NOW });
       assert.ok(output.indexOf('NEEDS YOU') < output.indexOf('TASKS'));
@@ -274,7 +274,7 @@ describe('WI-7 swarm board', () => {
     const swarmDir = path.join(home, '.swarm');
     const dbPath = path.join(swarmDir, 'swarm.db');
     fs.mkdirSync(swarmDir);
-    new Database(dbPath).close();
+    new DatabaseSync(dbPath).close();
     try {
       const before = fileSnapshot(home);
       const output = execFileSync('node', ['--import', 'tsx', INDEX, 'board'], {
@@ -302,7 +302,7 @@ describe('WI-7 swarm board', () => {
     try {
       const beforeDb = databaseSnapshot(fixture.db);
       const beforeFiles = fileSnapshot(fixture.root);
-      fixture.db.pragma('query_only = ON');
+      fixture.db.exec('PRAGMA query_only = ON');
       const output = renderBoard(fixture.db, 'default', { now: NOW });
       assert.match(output, /NEEDS YOU/);
       assert.strictEqual(databaseSnapshot(fixture.db), beforeDb);
@@ -421,7 +421,7 @@ describe('WI-7c board Mermaid graph', () => {
   });
 
   test('missing tables return a minimal clear graph instead of throwing', () => {
-    const db = new Database(':memory:');
+    const db = new DatabaseSync(':memory:');
     try {
       const mermaid = buildBoardMermaid(db, 'legacy', { now: NOW });
       assert.match(mermaid, /^flowchart LR$/m);
@@ -492,7 +492,7 @@ describe('WI-7c board Mermaid graph', () => {
     const outputPath = path.join(fixture.root, 'output', 'board.html');
     try {
       const beforeDb = databaseSnapshot(fixture.db);
-      fixture.db.pragma('query_only = ON');
+      fixture.db.exec('PRAGMA query_only = ON');
       let clock = NOW;
       const waits: number[] = [];
       const count = await watchBoardGraph({

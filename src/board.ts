@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
 import fs from 'fs';
@@ -143,7 +143,7 @@ function renderDebrisAndQuota(data: BoardData): string[] | null {
 
 /** Render one read-only snapshot. This function performs no database or file writes. */
 export function renderBoard(
-  db: Database.Database | null,
+  db: SwarmDb | null,
   swarmId: string,
   options: BoardRenderOptions = {}
 ): string {
@@ -292,7 +292,7 @@ function minimalBoardMermaid(swarmId: string, missing: string[], now: number): s
 
 /** Build a deterministic, read-only Mermaid view of live ownership and handoffs. */
 export function buildBoardMermaid(
-  db: Database.Database | null,
+  db: SwarmDb | null,
   swarmId: string,
   options: BoardMermaidOptions = {}
 ): string {

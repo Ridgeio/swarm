@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Swarm CLI launcher.
-# Prefer a pinned Node so better-sqlite3's native ABI matches across agents:
+# Prefer a pinned Node that satisfies package.json engines.node (Node >= 24):
 #   1. $SWARM_NODE (absolute path to node binary)
 #   2. ~/.swarm/node-path (machine-local pin — do not commit)
 #   3. first `node` on PATH
@@ -34,7 +34,7 @@ resolve_node() {
 
 NODE="$(resolve_node)"
 if [ -z "${NODE}" ] || [ ! -x "${NODE}" ]; then
-  echo "swarm: node not found. Install Node >= 20 or set SWARM_NODE / ~/.swarm/node-path" >&2
+  echo "swarm: node not found. Install Node >= 24 or set SWARM_NODE / ~/.swarm/node-path" >&2
   exit 1
 fi
 

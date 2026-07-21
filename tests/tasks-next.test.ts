@@ -5,8 +5,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
-import SQLite from 'better-sqlite3';
-import { getDbAt } from '../src/db.js';
+import { DatabaseSync } from 'node:sqlite';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 import { closeTask, startTask } from '../src/tasks.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
@@ -18,7 +18,7 @@ function runCli(home: string, args: string[], agent?: string, cwd?: string): Cli
   let sessionToken = '';
   const dbPath = path.join(home, '.swarm', 'swarm.db');
   if (agent && fs.existsSync(dbPath)) {
-    const identityDb = new SQLite(dbPath, { readonly: true });
+    const identityDb = new DatabaseSync(dbPath, { readOnly: true });
     try {
       const row = identityDb.prepare('SELECT session_token FROM agents WHERE name = ? COLLATE NOCASE')
         .get(agent) as { session_token: string | null } | undefined;
@@ -99,11 +99,11 @@ function createPushedRepo(root: string, repoName: string = 'repo'): { repo: stri
   return { repo, remote };
 }
 
-function openDb(home: string): SQLite.Database {
-  return new SQLite(path.join(home, '.swarm', 'swarm.db'));
+function openDb(home: string): SwarmDb {
+  return new DatabaseSync(path.join(home, '.swarm', 'swarm.db'));
 }
 
-function taskRow(db: SQLite.Database, slug: string): any {
+function taskRow(db: SwarmDb, slug: string): any {
   return db.prepare('SELECT * FROM tasks WHERE swarm_id = ? AND id = ?').get('default', slug);
 }
 

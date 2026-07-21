@@ -5,9 +5,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import SQLite from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import { collectBoardData } from '../src/board-data.js';
-import { getDbAt } from '../src/db.js';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 import { escalateTask } from '../src/escalations.js';
 import {
   createGrant,
@@ -30,7 +30,7 @@ const NOW = Date.parse('2026-07-20T18:00:00.000Z');
 
 interface CliResult { stdout: string; stderr: string; status: number }
 
-function tempDb(prefix: string): { root: string; db: SQLite.Database } {
+function tempDb(prefix: string): { root: string; db: SwarmDb } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   return { root, db: getDbAt(path.join(root, 'swarm.db')) };
 }
@@ -147,7 +147,7 @@ describe('T2.1 typed grants', () => {
     try {
       const joined = runCli(home, ['join', 'Alice', '--headless'], { SWARM_AGENT_NAME: 'Alice' });
       assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
-      const db = new SQLite(path.join(home, '.swarm', 'swarm.db'));
+      const db = new DatabaseSync(path.join(home, '.swarm', 'swarm.db'));
       const identity = db.prepare("SELECT session_token FROM agents WHERE name = 'Alice'")
         .get() as { session_token: string };
       db.close();
@@ -321,7 +321,7 @@ May we accept the remaining rollout risk?
       const message = fixture.db.prepare(`
         SELECT body, kind, to_agent FROM messages WHERE id = ?
       `).get(result.messageId) as { body: string; kind: string; to_agent: string };
-      assert.deepStrictEqual(message, {
+      assert.deepStrictEqual({ ...message }, {
         body: result.briefPath, kind: 'escalation', to_agent: 'Lead',
       });
       const task = fixture.db.prepare("SELECT state FROM tasks WHERE id = 'decision-ready'")
@@ -459,7 +459,7 @@ describe('T2.4 sender authentication', () => {
     try {
       const joined = runCli(home, ['join', 'Alice', '--headless'], { SWARM_AGENT_NAME: 'Alice' });
       assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
-      const db = new SQLite(path.join(home, '.swarm', 'swarm.db'));
+      const db = new DatabaseSync(path.join(home, '.swarm', 'swarm.db'));
       const alice = db.prepare("SELECT session_token FROM agents WHERE name = 'Alice'")
         .get() as { session_token: string };
       assert.match(alice.session_token, /^[0-9a-f]{32}$/);

@@ -6,10 +6,10 @@ import { sendMessage, broadcastMessage, getInbox } from '../src/mailbox.js';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { mkdtempSync, rmSync } from 'fs';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 
 describe('headless integration', () => {
-  let db: Database.Database;
+  let db: SwarmDb;
   let tmpDir: string;
   const swarmId = DEFAULT_SWARM_ID;
 

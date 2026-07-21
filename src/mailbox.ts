@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { deliverToAgent } from './transport-router.js';
 import { getAgent, listAgents } from './registry.js';
 import type { DeliveryOptions } from './transport-interface.js';
@@ -41,7 +41,7 @@ export const HOOK_INJECT_BACKOFF_MINUTES = 45;
 export const HOOK_INJECT_BACKOFF_MS = HOOK_INJECT_BACKOFF_MINUTES * 60_000;
 
 function insertMessage(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   fromName: string,
   toName: string | null,
@@ -50,7 +50,7 @@ function insertMessage(
   kind: string | null,
   supersedes?: number
 ): number {
-  const tx = db.transaction(() => {
+  return withImmediateTransaction(db, () => {
     if (supersedes !== undefined) {
       const owned = db.prepare(`
         SELECT id FROM messages
@@ -73,12 +73,10 @@ function insertMessage(
     }
     return messageId;
   });
-
-  return tx.immediate();
 }
 
 export async function sendMessage(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   fromName: string,
   toName: string,
@@ -117,7 +115,7 @@ export async function sendMessage(
 }
 
 export async function broadcastMessage(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   fromName: string,
   body: string,
@@ -165,7 +163,7 @@ export async function broadcastMessage(
   return { sent, queued, failed, messageId: msgId };
 }
 
-function getCursor(db: Database.Database, swarmId: string, agentName: string): number {
+function getCursor(db: SwarmDb, swarmId: string, agentName: string): number {
   const cursor = db.prepare(`
     SELECT last_read_id FROM inbox_cursors
     WHERE swarm_id = ? AND agent_name = ? COLLATE NOCASE
@@ -174,7 +172,7 @@ function getCursor(db: Database.Database, swarmId: string, agentName: string): n
 }
 
 function ensureDeliveryRows(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   messageIds: number[]
@@ -184,13 +182,13 @@ function ensureDeliveryRows(
     INSERT OR IGNORE INTO message_deliveries (message_id, swarm_id, recipient)
     VALUES (?, ?, ?)
   `);
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const id of messageIds) insert.run(id, swarmId, agentName);
-  })();
+  });
 }
 
 function advanceCursor(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   messageIds: number[]
@@ -206,7 +204,7 @@ function advanceCursor(
 }
 
 export function acknowledgeMessages(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   messageIds: number[],
@@ -234,7 +232,7 @@ export function acknowledgeMessages(
       acked_at = COALESCE(message_deliveries.acked_at, excluded.acked_at)
   `);
 
-  const tx = db.transaction(() => {
+  withImmediateTransaction(db, () => {
     for (const id of ids) {
       if (!visible.get(id, swarmId, agentName, agentName)) {
         throw new Error(`Message #${id} was not found in this swarm or is not addressed to you.`);
@@ -243,12 +241,11 @@ export function acknowledgeMessages(
     for (const id of ids) upsert.run(id, swarmId, agentName, ackedAt);
     advanceCursor(db, swarmId, agentName, ids);
   });
-  tx.immediate();
   return ids;
 }
 
 export function getInbox(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   peek: boolean = false,
@@ -273,7 +270,7 @@ export function getInbox(
       AND ((d.message_id IS NULL AND m.id > ?) OR d.status != 'acked')
       ${kind ? 'AND m.kind = ?' : ''}
     ORDER BY m.id ASC
-  `).all(...params) as Message[];
+  `).all(...params) as unknown as Message[];
 
   ensureDeliveryRows(db, swarmId, agentName, messages.map(message => message.id));
 
@@ -287,7 +284,7 @@ export function getInbox(
 }
 
 export function acknowledgeAllMessages(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   now: number = Date.now()
@@ -297,7 +294,7 @@ export function acknowledgeAllMessages(
 }
 
 export function recordHookInjections(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   messages: Message[],
@@ -322,11 +319,11 @@ export function recordHookInjections(
     WHERE message_id = ? AND swarm_id = ? AND recipient = ? COLLATE NOCASE
   `);
 
-  return db.transaction(() => {
+  return withImmediateTransaction(db, () => {
     const entries: HookInboxEntry[] = [];
     for (const message of messages) {
       upsert.run(message.id, swarmId, agentName, injectedAt);
-      const delivery = select.get(message.id, swarmId, agentName) as MessageDelivery;
+      const delivery = select.get(message.id, swarmId, agentName) as unknown as MessageDelivery;
       if (delivery.status === 'acked') continue;
       const firstInjectedAt = new Date(delivery.first_injected_at ?? injectedAt).getTime();
       const elapsedMs = Math.max(0, now - firstInjectedAt);
@@ -340,7 +337,7 @@ export function recordHookInjections(
       });
     }
     return entries;
-  })();
+  });
 }
 
 /**
@@ -349,7 +346,7 @@ export function recordHookInjections(
  * deliberate archaeology path for acknowledged and pre-join history.
  */
 export function getRecentMessages(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   limit: number = 10,
@@ -366,7 +363,7 @@ export function getRecentMessages(
       ${kind ? 'AND kind = ?' : ''}
     ORDER BY id DESC
     LIMIT ?
-  `).all(...params) as Message[];
+  `).all(...params) as unknown as Message[];
   return messages.reverse();
 }
 
@@ -377,7 +374,7 @@ export function getRecentMessages(
  * already consumed them, and `--recent` is the recovery path.
  */
 export function countRecentMessages(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   agentName: string,
   hours: number = 24

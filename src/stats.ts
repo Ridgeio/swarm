@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { getJanitorStatus, janitorTickAgeMinutes, type JanitorStatus } from './janitor.js';
 
 /**
@@ -75,8 +75,14 @@ interface MessageRow {
   body: string;
 }
 
+interface EncodedMessageRow {
+  from_agent: Uint8Array;
+  to_agent: Uint8Array | null;
+  body: Uint8Array;
+}
+
 export function getFleetStats(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   windowHours: number,
   /** Registered agent names (for broadcast fanout + never-sent stall checks).
@@ -87,11 +93,23 @@ export function getFleetStats(
   const agentNames = Array.isArray(activeAgents) ? activeAgents : [];
   const activeAgentCount = Array.isArray(activeAgents) ? activeAgents.length : activeAgents;
   const since = new Date(now - windowHours * 3_600_000).toISOString();
-  const rows = db
+  // node:sqlite exposes TEXT through SQLite's C-string accessor, which truncates
+  // embedded NULs. Read the bytes and decode them so stats preserve stored text.
+  const decoder = new TextDecoder();
+  const encodedRows = db
     .prepare(
-      'SELECT from_agent, to_agent, body FROM messages WHERE swarm_id = ? AND created_at >= ? ORDER BY id'
+      `SELECT
+         CAST(from_agent AS BLOB) AS from_agent,
+         CASE WHEN to_agent IS NULL THEN NULL ELSE CAST(to_agent AS BLOB) END AS to_agent,
+         CAST(body AS BLOB) AS body
+       FROM messages WHERE swarm_id = ? AND created_at >= ? ORDER BY id`
     )
-    .all(swarmId, since) as MessageRow[];
+    .all(swarmId, since) as unknown as EncodedMessageRow[];
+  const rows: MessageRow[] = encodedRows.map(row => ({
+    from_agent: decoder.decode(row.from_agent),
+    to_agent: row.to_agent === null ? null : decoder.decode(row.to_agent),
+    body: decoder.decode(row.body),
+  }));
 
   const byAgent = new Map<string, AgentTraffic>();
   const traffic = (name: string): AgentTraffic => {

@@ -14,14 +14,12 @@
     "prebuild": "rm -rf dist"
   },
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24"
   },
   "license": "MIT",
   "dependencies": {
     "@a2a-js/sdk": "^0.3.13",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^25.5.0",
-    "better-sqlite3": "^12.9.0",
     "typescript": "^6.0.2"
   },
   "devDependencies": {

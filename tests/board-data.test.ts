@@ -1,12 +1,12 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
 import { execFileSync } from 'child_process';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { collectBoardData } from '../src/board-data.js';
-import { getDbAt } from '../src/db.js';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 
 const NOW = Date.parse('2026-07-18T18:00:00.000Z');
 
@@ -32,7 +32,7 @@ function checkpointFile(root: string, name: string, quota: boolean = false): str
 }
 
 function insertAgent(
-  db: Database.Database,
+  db: SwarmDb,
   name: string,
   agentType: string,
   host: string | null,
@@ -47,7 +47,7 @@ function insertAgent(
 }
 
 function insertTask(
-  db: Database.Database,
+  db: SwarmDb,
   id: string,
   state: string,
   owner: string | null,
@@ -75,7 +75,7 @@ function insertTask(
 }
 
 function insertEvent(
-  db: Database.Database,
+  db: SwarmDb,
   taskId: string,
   epoch: number,
   kind: string,
@@ -96,7 +96,7 @@ function insertEvent(
   );
 }
 
-function databaseSnapshot(db: Database.Database): string {
+function databaseSnapshot(db: SwarmDb): string {
   const tables = db.prepare(`
     SELECT name FROM sqlite_master
     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
@@ -108,7 +108,7 @@ function databaseSnapshot(db: Database.Database): string {
   })));
 }
 
-function createFixture(): { root: string; db: Database.Database; gateId: number; checkpointPath: string } {
+function createFixture(): { root: string; db: SwarmDb; gateId: number; checkpointPath: string } {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-board-data-'));
   const db = getDbAt(path.join(root, 'swarm.db'));
   db.prepare("UPDATE swarms SET name = 'Ridge Fleet' WHERE id = 'default'").run();
@@ -232,7 +232,7 @@ describe('V1-A shared board data projection', () => {
     const fixture = createFixture();
     try {
       const before = databaseSnapshot(fixture.db);
-      fixture.db.pragma('query_only = ON');
+      fixture.db.exec('PRAGMA query_only = ON');
       const data = collectBoardData(fixture.db, 'default', { now: NOW });
 
       assert.strictEqual(data.generatedAt, '2026-07-18T18:00:00.000Z');
@@ -409,7 +409,7 @@ describe('V1-A shared board data projection', () => {
       fs.rmSync(fixture.root, { recursive: true, force: true });
     }
 
-    const empty = new Database(':memory:');
+    const empty = new DatabaseSync(':memory:');
     try {
       const data = collectBoardData(empty, 'legacy', { now: NOW });
       assert.deepStrictEqual(data.unavailable, [

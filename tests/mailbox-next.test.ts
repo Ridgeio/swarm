@@ -3,7 +3,7 @@ import assert from 'node:assert';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from '../src/db.js';
 import { DEFAULT_SWARM_ID, getDbAt } from '../src/db.js';
 import {
   acknowledgeAllMessages,
@@ -25,7 +25,7 @@ import {
 } from '../src/registry.js';
 
 const SWARM_ID = DEFAULT_SWARM_ID;
-let db: Database.Database;
+let db: SwarmDb;
 let tempDir: string;
 
 function insertMessage(
@@ -207,7 +207,7 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
       SELECT message_id, status FROM message_deliveries
       WHERE recipient = ? COLLATE NOCASE ORDER BY message_id
     `).all('Bob') as Array<{ message_id: number; status: string }>;
-    assert.deepStrictEqual(deliveries, [
+    assert.deepStrictEqual(deliveries.map(delivery => ({ ...delivery })), [
       { message_id: firstId, status: 'acked' },
       { message_id: secondId, status: 'acked' },
     ]);

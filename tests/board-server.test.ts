@@ -1,6 +1,6 @@
 import { describe, test, type TestContext } from 'node:test';
 import assert from 'node:assert';
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -16,7 +16,7 @@ import {
   type RunningBoardServer,
   type StartBoardServerOptions,
 } from '../src/board-server.js';
-import { getDbAt } from '../src/db.js';
+import { getDbAt, type SwarmDb } from '../src/db.js';
 
 const ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
@@ -99,7 +99,7 @@ function request(
 }
 
 function insertFocusAgent(
-  db: Database.Database,
+  db: SwarmDb,
   name: string,
   agentType: string,
   surfaceId: string,
@@ -219,8 +219,8 @@ describe('V1-B served board', () => {
     const writable = getDbAt(dbPath);
     writable.close();
     const before = fs.readFileSync(dbPath);
-    const readOnly = new Database(dbPath, { readonly: true, fileMustExist: true });
-    readOnly.pragma('query_only = ON');
+    const readOnly = new DatabaseSync(dbPath, { readOnly: true });
+    readOnly.exec('PRAGMA query_only = ON');
     const running = await startOrSkip(context, { db: readOnly, swarmId: 'default' });
     if (!running) {
       readOnly.close();

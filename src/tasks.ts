@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
@@ -205,7 +205,7 @@ export function effectiveClaimKind(task: Pick<Task, 'claim_kind'>): ClaimKind {
   return task.claim_kind ?? 'code-merged';
 }
 
-export function getTask(db: Database.Database, swarmId: string, slug: string): Task | null {
+export function getTask(db: SwarmDb, swarmId: string, slug: string): Task | null {
   return db.prepare('SELECT * FROM tasks WHERE swarm_id = ? AND id = ?')
     .get(swarmId, slug) as Task | undefined ?? null;
 }
@@ -232,7 +232,7 @@ function transcriptHint(): string {
   }
 }
 
-function assertRepoWorktreeAllowed(db: Database.Database, repoPath: string): string {
+function assertRepoWorktreeAllowed(db: SwarmDb, repoPath: string): string {
   const repo = realOrResolved(repoPath);
   const blockedRoots = ['/private/tmp', process.env.TMPDIR].filter((value): value is string => !!value)
     .map(realOrResolved);
@@ -254,7 +254,7 @@ function assertRepoWorktreeAllowed(db: Database.Database, repoPath: string): str
 }
 
 function prepareTaskWorktree(
-  db: Database.Database,
+  db: SwarmDb,
   actor: string,
   slug: string,
   repoPath: string
@@ -286,7 +286,7 @@ function prepareTaskWorktree(
 }
 
 function insertEvent(
-  db: Database.Database,
+  db: SwarmDb,
   task: Pick<Task, 'swarm_id' | 'id' | 'lease_epoch'>,
   kind: string,
   actor: string | null,
@@ -300,7 +300,7 @@ function insertEvent(
   return Number(result.lastInsertRowid);
 }
 
-function latestActorEpoch(db: Database.Database, task: Task, actor: string): number | null {
+function latestActorEpoch(db: SwarmDb, task: Task, actor: string): number | null {
   const row = db.prepare(`
     SELECT epoch FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND actor = ? COLLATE NOCASE
@@ -319,14 +319,14 @@ function staleAuthorityMessage(task: Task, actor: string, verb: string, presente
 }
 
 function checkAuthority(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   slug: string,
   actor: string,
   verb: string,
   expectedEpoch?: number
 ): AuthorityCheck {
-  return db.transaction(() => {
+  return withImmediateTransaction(db, () => {
     const task = getTask(db, swarmId, slug);
     if (!task) return { error: `Task "${slug}" not found in this swarm.` };
     const presentedEpoch = expectedEpoch ?? latestActorEpoch(db, task, actor);
@@ -340,11 +340,11 @@ function checkAuthority(
       return { error: staleAuthorityMessage(task, actor, verb, presentedEpoch) };
     }
     return { task, epoch: task.lease_epoch };
-  }).immediate() as AuthorityCheck;
+  }) as AuthorityCheck;
 }
 
 function requireAuthority(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   slug: string,
   actor: string,
@@ -359,7 +359,7 @@ function requireAuthority(
 }
 
 export async function startTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
@@ -386,7 +386,7 @@ export async function startTask(
     worktree = prepareTaskWorktree(db, actor, slug, requestedRepo);
   }
 
-  const result = db.transaction(() => {
+  const result = withImmediateTransaction(db, () => {
     const current = getTask(db, swarmId, slug);
     if (current && ['done', 'abandoned'].includes(current.state)) {
       throw new Error(`Task "${slug}" is ${current.state} and cannot be started again.`);
@@ -464,7 +464,7 @@ export async function startTask(
       claim_kind: effectiveClaimKind(task),
     }, timestamp);
     return { task, eventKind, previousOwner };
-  }).immediate() as StartTaskResult;
+  }) as StartTaskResult;
 
   if (result.eventKind === 'claimed' && result.previousOwner) {
     await sendMessage(
@@ -518,7 +518,7 @@ ${other}
 `;
 }
 
-function recordedCheckpointPaths(db: Database.Database, task: Task): Set<string> {
+function recordedCheckpointPaths(db: SwarmDb, task: Task): Set<string> {
   const rows = db.prepare(`
     SELECT data FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND kind = 'checkpoint'
@@ -546,7 +546,7 @@ function existingCheckpointFiles(dir: string): Array<{ sequence: number; path: s
 }
 
 export function checkpointTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
@@ -578,7 +578,7 @@ export function checkpointTask(
   const committed = checkAuthority(db, swarmId, slug, actor, 'checkpoint', authority.epoch);
   if (committed.error || !committed.task) throw new Error(committed.error ?? `Task "${slug}" authority changed.`);
   const timestamp = nowIso();
-  const updatedTask = db.transaction(() => {
+  const updatedTask = withImmediateTransaction(db, () => {
     const checked = getTask(db, swarmId, slug);
     if (!checked || !sameName(checked.owner_agent, actor) || checked.lease_epoch !== authority.epoch) {
       if (checked) {
@@ -596,7 +596,7 @@ export function checkpointTask(
       .run(leaseExpiry(), timestamp, swarmId, slug);
     insertEvent(db, checked, 'checkpoint', actor, { path: checkpointPath, sequence }, timestamp);
     return { task: getTask(db, swarmId, slug) };
-  }).immediate() as { task?: Task | null; error?: string };
+  }) as { task?: Task | null; error?: string };
   if (updatedTask.error || !updatedTask.task) throw new Error(updatedTask.error ?? `Failed to record checkpoint for "${slug}".`);
   return { task: updatedTask.task, path: checkpointPath, sequence, recorded: true, exitCode: 0 };
 }
@@ -687,7 +687,7 @@ export const defaultDeployHealthCheck: DeployHealthCheck = async (url: string) =
 };
 
 async function reviewCloseEvidence(
-  db: Database.Database,
+  db: SwarmDb,
   task: Task,
   claimKind: ClaimKind,
   rawEvidence: string[],
@@ -858,7 +858,7 @@ function missingCloseGrantMessage(
 }
 
 function requireCloseGrant(
-  db: Database.Database,
+  db: SwarmDb,
   task: Task,
   actor: string,
   op: 'merge' | 'override',
@@ -873,7 +873,7 @@ function requireCloseGrant(
 }
 
 export async function closeTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
@@ -924,7 +924,7 @@ export async function closeTask(
     throw new Error(failures.find(failure => failure.message)?.message ?? `Cannot close task "${slug}": a close gate failed.`);
   }
 
-  const result = db.transaction(() => {
+  const result = withImmediateTransaction(db, () => {
     const current = getTask(db, swarmId, slug);
     if (!current || !sameName(current.owner_agent, actor) || current.lease_epoch !== authority.epoch) {
       if (current) {
@@ -988,14 +988,14 @@ export async function closeTask(
     if (options.outcome !== undefined) closeData.outcome = options.outcome;
     insertEvent(db, current, 'closed', actor, closeData, timestamp);
     return { task: getTask(db, swarmId, slug) };
-  }).immediate() as { task?: Task | null; error?: string };
+  }) as { task?: Task | null; error?: string };
 
   if (result.error || !result.task) throw new Error(result.error ?? `Failed to close task "${slug}".`);
   return result.task;
 }
 
 function resolveRunTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   taskId: string | undefined,
   cwd: string
@@ -1014,7 +1014,7 @@ function resolveRunTask(
     SELECT * FROM tasks
     WHERE swarm_id = ? AND worktree_path IS NOT NULL AND state <> 'done'
     ORDER BY LENGTH(worktree_path) DESC, id ASC
-  `).all(swarmId) as Task[]).filter(task =>
+  `).all(swarmId) as unknown as Task[]).filter(task =>
     task.worktree_path !== null && isSameOrInside(resolvedCwd, realOrResolved(task.worktree_path))
   );
   if (candidates.length === 0) {
@@ -1054,7 +1054,7 @@ export function boundedRunSummary(output: string): string {
 }
 
 export function runTaskCommand(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   argv: string[],
@@ -1104,7 +1104,7 @@ export function runTaskCommand(
   return { task, exitCode, logPath, durationMs, summary };
 }
 
-function latestCheckpoint(db: Database.Database, task: Task): { event: TaskEvent; path: string } | null {
+function latestCheckpoint(db: SwarmDb, task: Task): { event: TaskEvent; path: string } | null {
   const event = db.prepare(`
     SELECT * FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND kind = 'checkpoint'
@@ -1125,7 +1125,7 @@ function minuteStamp(date: Date): string {
 }
 
 export async function handoffTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
@@ -1177,7 +1177,7 @@ ${task.transcript_hint ?? 'not available'}
 ${checkpointBody}`;
   fs.writeFileSync(briefPath, brief, 'utf-8');
 
-  const transferred = db.transaction(() => {
+  const transferred = withImmediateTransaction(db, () => {
     const current = getTask(db, swarmId, slug);
     if (!current || !sameName(current.owner_agent, actor) || current.lease_epoch !== authority.epoch) {
       if (current) {
@@ -1206,7 +1206,7 @@ ${checkpointBody}`;
       checkpoint_age_minutes: ageMinutes,
     }, timestamp);
     return { task: next };
-  }).immediate() as { task?: Task; error?: string };
+  }) as { task?: Task; error?: string };
   if (transferred.error || !transferred.task) throw new Error(transferred.error ?? `Failed to hand off task "${slug}".`);
 
   const body = `Handoff ${slug}: ${briefPath.replace(/[\r\n]+/g, ' ')} — ${title}`;
@@ -1218,7 +1218,7 @@ ${checkpointBody}`;
 }
 
 export function recordDecision(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   body: string,
@@ -1231,7 +1231,7 @@ export function recordDecision(
     validateTaskSlug(taskId);
     if (!getTask(db, swarmId, taskId)) throw new Error(`Task "${taskId}" not found in this swarm.`);
   }
-  return db.transaction(() => {
+  return withImmediateTransaction(db, () => {
     if (supersedes !== undefined) {
       const previous = db.prepare('SELECT id FROM decisions WHERE id = ? AND swarm_id = ?')
         .get(supersedes, swarmId);
@@ -1247,7 +1247,7 @@ export function recordDecision(
         .run(supersedes, swarmId);
     }
     return { id: Number(result.lastInsertRowid) };
-  }).immediate() as DecisionResult;
+  }) as DecisionResult;
 }
 
 function firstNextAction(contents: string): string | null {
@@ -1263,7 +1263,7 @@ function firstNextAction(contents: string): string | null {
 }
 
 export function getActiveTaskHookLines(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   actor: string,
   at: Date = new Date()
@@ -1272,7 +1272,7 @@ export function getActiveTaskHookLines(
     SELECT * FROM tasks
     WHERE swarm_id = ? AND owner_agent = ? COLLATE NOCASE AND state = 'active'
     ORDER BY updated_at ASC, id ASC
-  `).all(swarmId, actor) as Task[];
+  `).all(swarmId, actor) as unknown as Task[];
 
   const lines: string[] = [];
   for (const task of tasks) {

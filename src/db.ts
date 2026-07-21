@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import { DatabaseSync } from 'node:sqlite';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -7,8 +7,9 @@ const SWARM_DIR = path.join(os.homedir(), '.swarm');
 const DB_PATH = path.join(SWARM_DIR, 'swarm.db');
 export const DEFAULT_SWARM_ID = 'default';
 export const DEFAULT_SWARM_NAME = 'default';
+export type SwarmDb = DatabaseSync;
 
-let db: Database.Database | null = null;
+let db: SwarmDb | null = null;
 
 function ensureDir(): void {
   if (!fs.existsSync(SWARM_DIR)) {
@@ -16,17 +17,17 @@ function ensureDir(): void {
   }
 }
 
-function tableColumns(db: Database.Database, table: string): Set<string> {
+function tableColumns(db: SwarmDb, table: string): Set<string> {
   const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
   return new Set(rows.map(row => row.name));
 }
 
-function tableExists(db: Database.Database, table: string): boolean {
+function tableExists(db: SwarmDb, table: string): boolean {
   const row = db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table);
   return !!row;
 }
 
-function ensureLegacyAgentColumns(db: Database.Database): void {
+function ensureLegacyAgentColumns(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
 
   const columns = tableColumns(db, 'agents');
@@ -49,7 +50,7 @@ function ensureLegacyAgentColumns(db: Database.Database): void {
   }
 }
 
-function createSwarmsTable(db: Database.Database): void {
+function createSwarmsTable(db: SwarmDb): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS swarms (
       id TEXT PRIMARY KEY,
@@ -68,7 +69,7 @@ function createSwarmsTable(db: Database.Database): void {
   `).run(DEFAULT_SWARM_ID, DEFAULT_SWARM_NAME, now, now);
 }
 
-function createCurrentTables(db: Database.Database): void {
+function createCurrentTables(db: SwarmDb): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id TEXT PRIMARY KEY,
@@ -207,7 +208,7 @@ function createCurrentTables(db: Database.Database): void {
   `);
 }
 
-function migrateAgents(db: Database.Database): void {
+function migrateAgents(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) {
     createCurrentTables(db);
     return;
@@ -221,7 +222,7 @@ function migrateAgents(db: Database.Database): void {
   // DROP ... IF EXISTS clears any half-built table from a prior interrupted/failed
   // run; without atomicity a failed INSERT would leave agents_new committed and
   // permanently wedge every future migrate() with "table agents_new already exists".
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     db.exec(`
       DROP TABLE IF EXISTS agents_new;
 
@@ -268,10 +269,10 @@ function migrateAgents(db: Database.Database): void {
       DROP TABLE agents;
       ALTER TABLE agents_new RENAME TO agents;
     `);
-  })();
+  });
 }
 
-function migrateMessages(db: Database.Database): void {
+function migrateMessages(db: SwarmDb): void {
   if (!tableExists(db, 'messages')) {
     createCurrentTables(db);
     return;
@@ -280,7 +281,7 @@ function migrateMessages(db: Database.Database): void {
   const columns = tableColumns(db, 'messages');
   if (columns.has('swarm_id')) return;
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     db.exec(`
       DROP TABLE IF EXISTS messages_new;
 
@@ -302,10 +303,10 @@ function migrateMessages(db: Database.Database): void {
       DROP TABLE messages;
       ALTER TABLE messages_new RENAME TO messages;
     `);
-  })();
+  });
 }
 
-function migrateInboxCursors(db: Database.Database): void {
+function migrateInboxCursors(db: SwarmDb): void {
   if (!tableExists(db, 'inbox_cursors')) {
     createCurrentTables(db);
     return;
@@ -314,7 +315,7 @@ function migrateInboxCursors(db: Database.Database): void {
   const columns = tableColumns(db, 'inbox_cursors');
   if (columns.has('swarm_id')) return;
 
-  db.transaction(() => {
+  withImmediateTransaction(db, () => {
     db.exec(`
       DROP TABLE IF EXISTS inbox_cursors_new;
 
@@ -341,7 +342,7 @@ function migrateInboxCursors(db: Database.Database): void {
       DROP TABLE inbox_cursors;
       ALTER TABLE inbox_cursors_new RENAME TO inbox_cursors;
     `);
-  })();
+  });
 }
 
 // messages.kind — nullable classification tag (status | digest | merge-req | ...).
@@ -351,7 +352,7 @@ function migrateInboxCursors(db: Database.Database): void {
 // INSERT columns explicitly (the new column defaults to NULL) and ignore the extra
 // field on SELECT *, while this build sees NULL kinds from rows older builds wrote.
 // Runs AFTER migrateMessages so a legacy table rebuilt there also gains the column.
-function ensureMessageKindColumn(db: Database.Database): void {
+function ensureMessageKindColumn(db: SwarmDb): void {
   if (!tableExists(db, 'messages')) return;
   const columns = tableColumns(db, 'messages');
   if (!columns.has('kind')) {
@@ -359,7 +360,7 @@ function ensureMessageKindColumn(db: Database.Database): void {
   }
 }
 
-function ensureMessageSupersededByColumn(db: Database.Database): void {
+function ensureMessageSupersededByColumn(db: SwarmDb): void {
   if (!tableExists(db, 'messages')) return;
   const columns = tableColumns(db, 'messages');
   if (!columns.has('superseded_by')) {
@@ -370,7 +371,7 @@ function ensureMessageSupersededByColumn(db: Database.Database): void {
 // tasks.claim_kind — nullable so databases written by earlier builds retain an
 // honest legacy marker. Callers interpret NULL as code-merged; new task starts
 // always write an explicit claim kind.
-function ensureTaskClaimKindColumn(db: Database.Database): void {
+function ensureTaskClaimKindColumn(db: SwarmDb): void {
   if (!tableExists(db, 'tasks')) return;
   const columns = tableColumns(db, 'tasks');
   if (!columns.has('claim_kind')) {
@@ -378,7 +379,7 @@ function ensureTaskClaimKindColumn(db: Database.Database): void {
   }
 }
 
-function ensureAgentSessionTokenColumn(db: Database.Database): void {
+function ensureAgentSessionTokenColumn(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
   const columns = tableColumns(db, 'agents');
   if (!columns.has('session_token')) {
@@ -386,7 +387,7 @@ function ensureAgentSessionTokenColumn(db: Database.Database): void {
   }
 }
 
-function ensureAgentWorkerVersionColumn(db: Database.Database): void {
+function ensureAgentWorkerVersionColumn(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
   const columns = tableColumns(db, 'agents');
   if (!columns.has('worker_version')) {
@@ -394,7 +395,7 @@ function ensureAgentWorkerVersionColumn(db: Database.Database): void {
   }
 }
 
-function migrate(db: Database.Database): void {
+function migrate(db: SwarmDb): void {
   createSwarmsTable(db);
   createCurrentTables(db);
   migrateAgents(db);
@@ -422,23 +423,45 @@ function migrate(db: Database.Database): void {
   `);
 }
 
-export function getDb(): Database.Database {
+export function withImmediateTransaction<T>(database: SwarmDb, fn: () => T): T {
+  if (database.isTransaction) {
+    throw new Error('Nested SQLite transactions are not supported.');
+  }
+
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const result = fn();
+    database.exec('COMMIT');
+    return result;
+  } catch (error) {
+    if (database.isTransaction) {
+      try {
+        database.exec('ROLLBACK');
+      } catch {
+        // Preserve the operation error; it is the actionable failure for callers.
+      }
+    }
+    throw error;
+  }
+}
+
+export function getDb(): SwarmDb {
   if (db) return db;
   ensureDir();
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
-  db.pragma('busy_timeout = 5000');
-  db.pragma('foreign_keys = ON');
+  db = new DatabaseSync(DB_PATH);
+  db.exec('PRAGMA journal_mode = WAL');
+  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA foreign_keys = ON');
   migrate(db);
   return db;
 }
 
 // For testing: allow custom DB path
-export function getDbAt(dbPath: string): Database.Database {
-  const testDb = new Database(dbPath);
-  testDb.pragma('journal_mode = WAL');
-  testDb.pragma('busy_timeout = 5000');
-  testDb.pragma('foreign_keys = ON');
+export function getDbAt(dbPath: string): SwarmDb {
+  const testDb = new DatabaseSync(dbPath);
+  testDb.exec('PRAGMA journal_mode = WAL');
+  testDb.exec('PRAGMA busy_timeout = 5000');
+  testDb.exec('PRAGMA foreign_keys = ON');
   migrate(testDb);
   return testDb;
 }
@@ -448,10 +471,10 @@ export function getDbAt(dbPath: string): Database.Database {
  * journal settings. Read-only commands such as `swarm board` use this path so
  * observing the fleet cannot itself become fleet activity.
  */
-export function getDbReadOnly(dbPath: string = DB_PATH): Database.Database | null {
+export function getDbReadOnly(dbPath: string = DB_PATH): SwarmDb | null {
   if (!fs.existsSync(dbPath)) return null;
-  const readDb = new Database(dbPath, { readonly: true, fileMustExist: true });
-  readDb.pragma('busy_timeout = 5000');
-  readDb.pragma('query_only = ON');
+  const readDb = new DatabaseSync(dbPath, { readOnly: true });
+  readDb.exec('PRAGMA busy_timeout = 5000');
+  readDb.exec('PRAGMA query_only = ON');
   return readDb;
 }

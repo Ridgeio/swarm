@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -218,7 +218,7 @@ function writeManifest(artifactDir: string, manifest: RescueManifest): void {
 }
 
 function resolveTargets(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   options: RescueTargetOptions
 ): RescueTarget[] {
@@ -239,7 +239,7 @@ function resolveTargets(
       SELECT * FROM tasks
       WHERE swarm_id = ? AND owner_agent = ? COLLATE NOCASE AND worktree_path IS NOT NULL
       ORDER BY updated_at ASC, id ASC
-    `).all(swarmId, options.agent) as Task[];
+    `).all(swarmId, options.agent) as unknown as Task[];
     if (tasks.length === 0) throw new Error(`Agent "${options.agent}" has no recorded task worktrees in this swarm.`);
     const seen = new Set<string>();
     return tasks.flatMap(task => {
@@ -252,7 +252,7 @@ function resolveTargets(
 
   const worktreePath = canonical(options.worktree!);
   const tasks = db.prepare('SELECT * FROM tasks WHERE swarm_id = ? AND worktree_path IS NOT NULL')
-    .all(swarmId) as Task[];
+    .all(swarmId) as unknown as Task[];
   const task = tasks.find(row => canonical(row.worktree_path!) === worktreePath) ?? null;
   return [{ worktreePath, task, agent: task?.owner_agent ?? 'unknown' }];
 }
@@ -419,7 +419,7 @@ function rescueOne(target: RescueTarget): RescueResult {
 }
 
 export function rescueTargets(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   options: RescueTargetOptions
 ): RescueResult[] {

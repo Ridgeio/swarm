@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { SwarmDb } from './db.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -78,13 +78,13 @@ function evidenceLine(row: TaskEventRow): string {
     `exit=${String(data?.exit ?? 'unknown')}`;
 }
 
-function eventRows(db: Database.Database, task: Task): TaskEventRow[] {
+function eventRows(db: SwarmDb, task: Task): TaskEventRow[] {
   return db.prepare(`
     SELECT id, epoch, kind, actor, data, created_at
     FROM task_events
     WHERE swarm_id = ? AND task_id = ?
     ORDER BY id ASC
-  `).all(task.swarm_id, task.id) as TaskEventRow[];
+  `).all(task.swarm_id, task.id) as unknown as TaskEventRow[];
 }
 
 export function renderHarnessReview(task: Task, events: TaskEventRow[]): string {
@@ -124,7 +124,7 @@ function skeleton(rendered: string): string {
 }
 
 export function harnessReviewTask(
-  db: Database.Database,
+  db: SwarmDb,
   swarmId: string,
   slug: string,
   options: HarnessReviewOptions = {}

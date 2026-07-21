@@ -104,9 +104,11 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 ## Task-based operation
 
-Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start` assigns an owner with a fenced lease epoch; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires remote or preservation evidence. Tasks, task events, and decisions survive `swarm reset`.
+Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
 
-The operating principles are in [docs/philosophy.md](docs/philosophy.md), and the exact v1 contracts and evidence gates are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md).
+Claim kinds are `code-merged`, `journey-works`, `deploy-healthy`, `analysis`, `decision`, and `probe`. Evidence uses repeatable `--evidence <kind>:<ref>` flags. `swarm run` executes an argv array without a shell, stores the full combined log under `~/.swarm/evidence/<swarm>/<task>/`, prints a bounded summary, and returns the child exit code. `--override --reason <text>` bypasses evidence/Git gates with a `gate_override` audit event.
+
+The operating principles are in [docs/philosophy.md](docs/philosophy.md), the ledger contracts are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md), and the claim/evidence contracts are in [docs/design/SWARM-NEXT-V2.md](docs/design/SWARM-NEXT-V2.md).
 
 ## Skills
 
@@ -145,10 +147,13 @@ Messaging:
 
 Task ledger:
   swarm task start <slug> --title <text>       Create or claim a fenced task lease
-        [--repo <path>] [--no-worktree] [--takeover]
+        [--repo <path>] [--no-worktree] [--takeover] [--claim <kind>]
   swarm task checkpoint <slug> [--notes <text>] Record a numbered durable checkpoint
   swarm task close <slug> --disposition <kind> Close with pr|merged|archive|discard evidence
-        [--force-discard]
+        --not-established <text> [--evidence <kind>:<ref>]
+        [--outcome inconclusive] [--force-discard]
+        [--override --reason <text>]
+  swarm run [--task <slug>] -- <cmd> [args...] Capture a full task evidence log
   swarm task list                              List the durable task ledger
   swarm task show <slug>                       Show task facts, events, and decisions
   swarm handoff <slug> --to <agent>            Transfer with a fresh checkpoint brief
@@ -217,9 +222,12 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 |---|---|
 | Acknowledge delivery | `swarm ack 41 42` or `swarm ack --all` |
 | Supersede an instruction | `swarm send Bob "use the revised migration plan" --kind gate --supersedes 41` |
-| Start or take over a task | `swarm task start auth-refresh --title "Refresh auth" --repo . --takeover` |
+| Start or take over a task | `swarm task start auth-refresh --title "Refresh auth" --repo . --claim code-merged --takeover` |
 | Checkpoint a task | `swarm task checkpoint auth-refresh --notes "Token rotation works; next run integration tests"` |
-| Close a task | `swarm task close auth-refresh --disposition pr` |
+| Capture a task run | `swarm run --task auth-refresh -- npm test` |
+| Close a task | `swarm task close auth-refresh --disposition pr --not-established "production health"` |
+| Close an analysis | `swarm task close design-audit --disposition archive --evidence report:/path/audit.md --not-established "runtime behavior"` |
+| Audit an override | `swarm task close auth-refresh --disposition archive --not-established "none" --override --reason "operator-approved recovery"` |
 | List tasks | `swarm task list` |
 | Show task history | `swarm task show auth-refresh` |
 | Hand off work | `swarm handoff auth-refresh --to Bob` |

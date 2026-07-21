@@ -10,9 +10,30 @@ import { getAgent } from './registry.js';
 export const TASK_LEASE_HOURS = 24;
 export const HANDOFF_FRESH_MINUTES = 60;
 export const CHECKPOINT_STALE_MINUTES = 90;
+export const RUN_SUMMARY_HEAD_LINES = 15;
+export const RUN_SUMMARY_TAIL_LINES = 25;
+export const DEPLOY_HEALTH_TIMEOUT_MS = 2_000;
 
 export type TaskState = 'open' | 'active' | 'awaiting_review' | 'done' | 'abandoned';
 export type TaskDisposition = 'pr' | 'merged' | 'archive' | 'discard';
+export const CLAIM_KINDS = [
+  'code-merged',
+  'journey-works',
+  'deploy-healthy',
+  'analysis',
+  'decision',
+  'probe',
+] as const;
+export type ClaimKind = typeof CLAIM_KINDS[number];
+export const EVIDENCE_KINDS = ['journey', 'deploy-health', 'report', 'decision'] as const;
+export type EvidenceKind = typeof EVIDENCE_KINDS[number];
+export type EvidenceVerification = boolean | number | 'unverified';
+
+export interface CloseEvidence {
+  kind: EvidenceKind | string;
+  ref: string;
+  verified: EvidenceVerification;
+}
 
 export interface Task {
   id: string;
@@ -27,6 +48,7 @@ export interface Task {
   worktree_path: string | null;
   transcript_hint: string | null;
   disposition: TaskDisposition | null;
+  claim_kind: ClaimKind | null;
   created_at: string;
   updated_at: string;
 }
@@ -61,6 +83,7 @@ export interface StartTaskOptions {
   repoPath?: string;
   noWorktree?: boolean;
   takeover?: boolean;
+  claimKind?: string;
 }
 
 export interface StartTaskResult {
@@ -80,6 +103,27 @@ export interface CheckpointResult {
 export interface CloseTaskOptions {
   disposition: TaskDisposition;
   forceDiscard?: boolean;
+  evidence?: string[];
+  notEstablished?: string;
+  outcome?: string;
+  override?: boolean;
+  reason?: string;
+  deployHealthCheck?: DeployHealthCheck;
+}
+
+export type DeployHealthCheck = (url: string) => Promise<number | 'unverified'>;
+
+export interface RunTaskCommandOptions {
+  taskId?: string;
+  cwd?: string;
+}
+
+export interface RunTaskCommandResult {
+  task: Task;
+  exitCode: number;
+  logPath: string;
+  durationMs: number;
+  summary: string;
 }
 
 export interface HandoffResult {
@@ -147,6 +191,17 @@ export function validateTaskSlug(slug: string): void {
   if (!/^[a-z0-9-]{3,64}$/.test(slug)) {
     throw new Error(`Invalid task slug "${slug}". Use 3-64 lowercase letters, digits, or hyphens.`);
   }
+}
+
+export function validateClaimKind(value: string): ClaimKind {
+  if (!(CLAIM_KINDS as readonly string[]).includes(value)) {
+    throw new Error(`Invalid --claim "${value}". Expected one of: ${CLAIM_KINDS.join(', ')}.`);
+  }
+  return value as ClaimKind;
+}
+
+export function effectiveClaimKind(task: Pick<Task, 'claim_kind'>): ClaimKind {
+  return task.claim_kind ?? 'code-merged';
 }
 
 export function getTask(db: Database.Database, swarmId: string, slug: string): Task | null {
@@ -310,6 +365,9 @@ export async function startTask(
   options: StartTaskOptions
 ): Promise<StartTaskResult> {
   validateTaskSlug(slug);
+  const explicitClaimKind = options.claimKind === undefined
+    ? undefined
+    : validateClaimKind(options.claimKind);
   const prior = getTask(db, swarmId, slug);
   if (!prior && !options.title?.trim()) {
     throw new Error(`Task "${slug}" is new; --title <text> is required.`);
@@ -343,13 +401,20 @@ export async function startTask(
     const timestamp = nowIso();
     const title = options.title?.trim() || current?.title;
     if (!title) throw new Error(`Task "${slug}" requires --title <text>.`);
+    const claimKind: ClaimKind | null = explicitClaimKind !== undefined
+      ? explicitClaimKind
+      : current
+        ? current.claim_kind
+        : requestedRepo && !options.noWorktree
+          ? 'code-merged'
+          : 'analysis';
 
     if (current) {
       db.prepare(`
         UPDATE tasks
         SET title = ?, state = 'active', owner_agent = ?, lease_epoch = ?, lease_expires_at = ?,
             repo_path = ?, branch = ?, worktree_path = ?, transcript_hint = ?, disposition = NULL,
-            updated_at = ?
+            claim_kind = ?, updated_at = ?
         WHERE swarm_id = ? AND id = ?
       `).run(
         title,
@@ -360,6 +425,7 @@ export async function startTask(
         worktree?.branch ?? current.branch,
         worktree?.worktreePath ?? current.worktree_path,
         transcriptHint(),
+        claimKind,
         timestamp,
         swarmId,
         slug
@@ -368,8 +434,8 @@ export async function startTask(
       db.prepare(`
         INSERT INTO tasks (
           id, swarm_id, title, state, owner_agent, lease_epoch, lease_expires_at,
-          repo_path, branch, worktree_path, transcript_hint, disposition, created_at, updated_at
-        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+          repo_path, branch, worktree_path, transcript_hint, disposition, claim_kind, created_at, updated_at
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
       `).run(
         slug,
         swarmId,
@@ -381,6 +447,7 @@ export async function startTask(
         worktree?.branch ?? null,
         worktree?.worktreePath ?? null,
         transcriptHint(),
+        claimKind,
         timestamp,
         timestamp
       );
@@ -393,6 +460,7 @@ export async function startTask(
       repo_path: task.repo_path,
       branch: task.branch,
       worktree_path: task.worktree_path,
+      claim_kind: effectiveClaimKind(task),
     }, timestamp);
     return { task, eventKind, previousOwner };
   }).immediate() as StartTaskResult;
@@ -552,24 +620,233 @@ function hasVerifiedRescue(task: Task): boolean {
   return false;
 }
 
-function assertRemoteReachability(task: Task, facts: GitFacts, disposition: TaskDisposition): void {
-  if (disposition !== 'pr' && disposition !== 'merged') return;
-  if (!task.repo_path || !task.branch || facts.head === 'unknown') {
-    throw new Error(`Cannot close task "${task.id}" as ${disposition}: no named branch tip is recorded.`);
-  }
-  const containing = tryGit(task.repo_path, ['branch', '-r', '--contains', facts.head]) ?? '';
-  if (!containing.trim()) {
-    throw new Error(`Cannot close task "${task.id}" as ${disposition}: branch tip ${facts.head} is not reachable from any remote ref. Push it first.`);
+const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = {
+  'code-merged': EVIDENCE_KINDS,
+  'journey-works': ['journey'],
+  'deploy-healthy': ['deploy-health'],
+  analysis: ['report'],
+  decision: ['decision', 'report'],
+  probe: ['report'],
+};
+
+interface GateFailure {
+  gate: string;
+  message: string;
+}
+
+interface EvidenceReview {
+  evidence: CloseEvidence[];
+  failures: GateFailure[];
+}
+
+function expectedEvidenceMessage(task: Task, claimKind: ClaimKind, received?: string): string {
+  const expected = CLAIM_EVIDENCE_KINDS[claimKind].join(', ');
+  const receivedText = received ? `; received "${received}"` : '';
+  return `Cannot close task "${task.id}": claim "${claimKind}" expects evidence kind(s): ${expected}${receivedText}. ` +
+    `Pass ${CLAIM_EVIDENCE_KINDS[claimKind].map(kind => `--evidence ${kind}:<ref>`).join(' or ')}.`;
+}
+
+function parseEvidenceSpec(raw: string): { kind: string; ref: string } | null {
+  const separator = raw.indexOf(':');
+  if (separator <= 0 || separator === raw.length - 1) return null;
+  const kind = raw.slice(0, separator).trim();
+  const ref = raw.slice(separator + 1).trim();
+  return kind && ref ? { kind, ref } : null;
+}
+
+function httpUrl(ref: string): boolean {
+  try {
+    const parsed = new URL(ref);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
   }
 }
 
-export function closeTask(
+function fileFacts(ref: string): { exists: boolean; nonEmpty: boolean } {
+  try {
+    const stats = fs.statSync(ref);
+    return { exists: stats.isFile(), nonEmpty: stats.isFile() && stats.size > 0 };
+  } catch {
+    return { exists: false, nonEmpty: false };
+  }
+}
+
+export const defaultDeployHealthCheck: DeployHealthCheck = async (url: string) => {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), DEPLOY_HEALTH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, { method: 'HEAD', signal: controller.signal });
+    return response.status;
+  } catch {
+    return 'unverified';
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+async function reviewCloseEvidence(
+  db: Database.Database,
+  task: Task,
+  claimKind: ClaimKind,
+  rawEvidence: string[],
+  outcome: string | undefined,
+  deployHealthCheck: DeployHealthCheck
+): Promise<EvidenceReview> {
+  const evidence: CloseEvidence[] = [];
+  const failures: GateFailure[] = [];
+  const allowed = CLAIM_EVIDENCE_KINDS[claimKind];
+
+  if (outcome !== undefined && outcome !== 'inconclusive') {
+    failures.push({
+      gate: 'evidence-outcome',
+      message: 'Invalid --outcome. The only supported value is "inconclusive" for a probe claim.',
+    });
+  } else if (outcome === 'inconclusive' && claimKind !== 'probe') {
+    failures.push({
+      gate: 'evidence-outcome',
+      message: `Cannot close task "${task.id}" with --outcome inconclusive: only claim "probe" accepts that outcome. ` +
+        `Supply evidence for claim "${claimKind}" instead.`,
+    });
+  }
+
+  for (const raw of rawEvidence) {
+    const parsed = parseEvidenceSpec(raw);
+    if (!parsed) {
+      failures.push({
+        gate: 'evidence-format',
+        message: `Invalid --evidence "${raw}". Expected <kind>:<ref>; valid kinds for claim "${claimKind}": ${allowed.join(', ')}.`,
+      });
+      continue;
+    }
+
+    const item: CloseEvidence = { kind: parsed.kind, ref: parsed.ref, verified: false };
+    evidence.push(item);
+    if (!(EVIDENCE_KINDS as readonly string[]).includes(parsed.kind) || !allowed.includes(parsed.kind as EvidenceKind)) {
+      failures.push({
+        gate: 'evidence-kind',
+        message: expectedEvidenceMessage(task, claimKind, parsed.kind),
+      });
+      continue;
+    }
+
+    const kind = parsed.kind as EvidenceKind;
+    if (kind === 'journey') {
+      if (httpUrl(parsed.ref)) {
+        item.verified = 'unverified';
+      } else {
+        const facts = fileFacts(parsed.ref);
+        if (facts.exists) {
+          item.verified = true;
+        } else {
+          failures.push({
+            gate: 'evidence-file',
+            message: `Cannot close task "${task.id}": journey evidence file "${parsed.ref}" does not exist. ` +
+              `Create the journey log/screenshot/recording, then retry with --evidence journey:${parsed.ref}.`,
+          });
+        }
+      }
+    } else if (kind === 'deploy-health') {
+      if (httpUrl(parsed.ref)) {
+        try {
+          item.verified = await deployHealthCheck(parsed.ref);
+        } catch {
+          item.verified = 'unverified';
+        }
+      } else {
+        const facts = fileFacts(parsed.ref);
+        if (facts.exists) {
+          item.verified = true;
+        } else {
+          failures.push({
+            gate: 'evidence-file',
+            message: `Cannot close task "${task.id}": deploy-health evidence file "${parsed.ref}" does not exist. ` +
+              `Create the health-check log, then retry with --evidence deploy-health:${parsed.ref}.`,
+          });
+        }
+      }
+    } else if (kind === 'report') {
+      const facts = fileFacts(parsed.ref);
+      if (facts.nonEmpty) {
+        item.verified = true;
+      } else {
+        failures.push({
+          gate: 'evidence-file',
+          message: `Cannot close task "${task.id}": report evidence file "${parsed.ref}" must exist and be non-empty. ` +
+            `Write the report, then retry with --evidence report:${parsed.ref}.`,
+        });
+      }
+    } else if (kind === 'decision') {
+      const decisionId = /^\d+$/.test(parsed.ref) ? Number(parsed.ref) : 0;
+      const row = decisionId > 0 && Number.isSafeInteger(decisionId)
+        ? db.prepare('SELECT id FROM decisions WHERE id = ? AND swarm_id = ?').get(decisionId, task.swarm_id)
+        : undefined;
+      if (row) {
+        item.verified = true;
+      } else {
+        failures.push({
+          gate: 'evidence-decision',
+          message: `Cannot close task "${task.id}": decision evidence id "${parsed.ref}" does not exist in this swarm. ` +
+            `Record it with "swarm decision <text> --task ${task.id}", then retry with --evidence decision:<id>.`,
+        });
+      }
+    }
+  }
+
+  const evidenceOptional = claimKind === 'code-merged' || (claimKind === 'probe' && outcome === 'inconclusive');
+  if (rawEvidence.length === 0 && !evidenceOptional) {
+    failures.unshift({
+      gate: 'evidence-required',
+      message: expectedEvidenceMessage(task, claimKind),
+    });
+  }
+  return { evidence, failures };
+}
+
+function gitGateFailures(
+  task: Task,
+  facts: GitFacts,
+  disposition: TaskDisposition,
+  preservedArchive: boolean,
+  forcedDiscard: boolean
+): GateFailure[] {
+  if (!task.repo_path) return [];
+  const failures: GateFailure[] = [];
+  if (!preservedArchive && !forcedDiscard &&
+      (facts.unpushed.length > 0 || facts.dirtyTracked > 0 || facts.untracked > 0)) {
+    if (facts.unpushed.length > 0) failures.push({ gate: 'git-unpushed', message: '' });
+    if (facts.dirtyTracked > 0) failures.push({ gate: 'git-dirty-tracked', message: '' });
+    if (facts.untracked > 0) failures.push({ gate: 'git-untracked', message: '' });
+    failures[0].message =
+      `Cannot close task "${task.id}": unpushed commits: ${facts.unpushed.length}, dirty tracked files: ${facts.dirtyTracked}, untracked files: ${facts.untracked}. ` +
+      'Push and clean the branch, create a verified rescue then use --disposition archive, or use --disposition discard --force-discard.';
+  }
+  if (disposition === 'pr' || disposition === 'merged') {
+    if (!task.branch || facts.head === 'unknown') {
+      failures.push({
+        gate: 'git-remote-reachability',
+        message: `Cannot close task "${task.id}" as ${disposition}: no named branch tip is recorded. Start it with an attached repository and named task branch, then push it.`,
+      });
+    } else {
+      const containing = tryGit(task.repo_path, ['branch', '-r', '--contains', facts.head]) ?? '';
+      if (!containing.trim()) {
+        failures.push({
+          gate: 'git-remote-reachability',
+          message: `Cannot close task "${task.id}" as ${disposition}: branch tip ${facts.head} is not reachable from any remote ref. Push it first.`,
+        });
+      }
+    }
+  }
+  return failures;
+}
+
+export async function closeTask(
   db: Database.Database,
   swarmId: string,
   actor: string,
   slug: string,
   options: CloseTaskOptions
-): Task {
+): Promise<Task> {
   validateTaskSlug(slug);
   if (!['pr', 'merged', 'archive', 'discard'].includes(options.disposition)) {
     throw new Error('Invalid disposition. Use pr, merged, archive, or discard.');
@@ -580,18 +857,36 @@ export function closeTask(
   if (options.disposition === 'discard' && !options.forceDiscard) {
     throw new Error('Discard requires both --disposition discard and --force-discard.');
   }
+  const notEstablished = options.notEstablished?.trim();
+  if (!notEstablished) {
+    throw new Error(`Task close requires --not-established "<text>" for "${slug}" (use --not-established "none" when appropriate).`);
+  }
+  if (options.override && !options.reason?.trim()) {
+    throw new Error(`--override for task "${slug}" requires --reason "<text>" so the bypass is auditable.`);
+  }
+  if (!options.override && options.reason !== undefined) {
+    throw new Error('--reason requires --override.');
+  }
 
   const authority = requireAuthority(db, swarmId, slug, actor, 'close');
   const task = authority.task;
+  const claimKind = effectiveClaimKind(task);
+  const evidenceReview = await reviewCloseEvidence(
+    db,
+    task,
+    claimKind,
+    options.evidence ?? [],
+    options.outcome,
+    options.deployHealthCheck ?? defaultDeployHealthCheck
+  );
   const facts = taskGitFacts(task);
   const preservedArchive = options.disposition === 'archive' && hasVerifiedRescue(task);
   const forcedDiscard = options.disposition === 'discard' && options.forceDiscard === true;
-  if ((facts.unpushed.length > 0 || facts.dirtyTracked > 0 || facts.untracked > 0) && !preservedArchive && !forcedDiscard) {
-    throw new Error(
-      `Cannot close task "${slug}": unpushed commits: ${facts.unpushed.length}, dirty tracked files: ${facts.dirtyTracked}, untracked files: ${facts.untracked}. Push and clean the branch, create a verified rescue then use --disposition archive, or use --disposition discard --force-discard.`
-    );
+  const gitFailures = gitGateFailures(task, facts, options.disposition, preservedArchive, forcedDiscard);
+  const failures = [...evidenceReview.failures, ...gitFailures];
+  if (!options.override && failures.length > 0) {
+    throw new Error(failures.find(failure => failure.message)?.message ?? `Cannot close task "${slug}": a close gate failed.`);
   }
-  assertRemoteReachability(task, facts, options.disposition);
 
   const result = db.transaction(() => {
     const current = getTask(db, swarmId, slug);
@@ -610,7 +905,7 @@ export function closeTask(
 
     if (current.worktree_path && fs.existsSync(current.worktree_path) && current.repo_path) {
       const removeArgs = ['worktree', 'remove'];
-      if (preservedArchive || forcedDiscard) removeArgs.push('--force');
+      if (preservedArchive || forcedDiscard || options.override) removeArgs.push('--force');
       removeArgs.push(current.worktree_path);
       runGit(current.repo_path, removeArgs);
     }
@@ -623,16 +918,141 @@ export function closeTask(
         untracked: facts.untracked,
       }, timestamp);
     }
+    for (const item of evidenceReview.evidence) {
+      insertEvent(db, current, 'close_evidence', actor, item, timestamp);
+    }
+    if (options.override) {
+      insertEvent(db, current, 'gate_override', actor, {
+        reason: options.reason!.trim(),
+        bypassed_gates: [...new Set(failures.map(failure => failure.gate))],
+      }, timestamp);
+    }
     db.prepare(`
       UPDATE tasks SET state = 'done', disposition = ?, lease_expires_at = NULL, updated_at = ?
       WHERE swarm_id = ? AND id = ?
     `).run(options.disposition, timestamp, swarmId, slug);
-    insertEvent(db, current, 'closed', actor, { disposition: options.disposition }, timestamp);
+    const closeData: Record<string, unknown> = {
+      disposition: options.disposition,
+      claim_kind: claimKind,
+      not_established: notEstablished,
+    };
+    if (options.outcome !== undefined) closeData.outcome = options.outcome;
+    insertEvent(db, current, 'closed', actor, closeData, timestamp);
     return { task: getTask(db, swarmId, slug) };
   }).immediate() as { task?: Task | null; error?: string };
 
   if (result.error || !result.task) throw new Error(result.error ?? `Failed to close task "${slug}".`);
   return result.task;
+}
+
+function resolveRunTask(
+  db: Database.Database,
+  swarmId: string,
+  taskId: string | undefined,
+  cwd: string
+): Task {
+  if (taskId) {
+    validateTaskSlug(taskId);
+    const task = getTask(db, swarmId, taskId);
+    if (!task) {
+      throw new Error(`Task "${taskId}" not found in this swarm. Run "swarm task list" and retry with --task <slug>.`);
+    }
+    return task;
+  }
+
+  const resolvedCwd = realOrResolved(cwd);
+  const candidates = (db.prepare(`
+    SELECT * FROM tasks
+    WHERE swarm_id = ? AND worktree_path IS NOT NULL AND state <> 'done'
+    ORDER BY LENGTH(worktree_path) DESC, id ASC
+  `).all(swarmId) as Task[]).filter(task =>
+    task.worktree_path !== null && isSameOrInside(resolvedCwd, realOrResolved(task.worktree_path))
+  );
+  if (candidates.length === 0) {
+    throw new Error(`Cannot infer a task for "swarm run" from cwd "${cwd}". Pass --task <slug> or run from under a recorded task worktree.`);
+  }
+  const longest = candidates[0].worktree_path?.length ?? 0;
+  const equallySpecific = candidates.filter(task => (task.worktree_path?.length ?? 0) === longest);
+  if (equallySpecific.length > 1) {
+    throw new Error(`Cannot infer a unique task for "swarm run" from cwd "${cwd}" (${equallySpecific.map(task => task.id).join(', ')}). Pass --task <slug>.`);
+  }
+  return candidates[0];
+}
+
+function nextRunLogPath(task: Task): string {
+  const dir = path.join(swarmHome(), 'evidence', task.swarm_id, task.id);
+  fs.mkdirSync(dir, { recursive: true });
+  let maxSequence = 0;
+  for (const entry of fs.readdirSync(dir)) {
+    const match = /^run-(\d+)\.log$/.exec(entry);
+    if (match) maxSequence = Math.max(maxSequence, Number(match[1]));
+  }
+  return path.join(dir, `run-${String(maxSequence + 1).padStart(3, '0')}.log`);
+}
+
+export function boundedRunSummary(output: string): string {
+  const normalized = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+  const lines = normalized.length === 0 ? [] : normalized.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  const limit = RUN_SUMMARY_HEAD_LINES + RUN_SUMMARY_TAIL_LINES;
+  if (lines.length <= limit) return lines.join('\n');
+  const omitted = lines.length - limit;
+  return [
+    ...lines.slice(0, RUN_SUMMARY_HEAD_LINES),
+    `... [output truncated: ${omitted} line${omitted === 1 ? '' : 's'} omitted] ...`,
+    ...lines.slice(-RUN_SUMMARY_TAIL_LINES),
+  ].join('\n');
+}
+
+export function runTaskCommand(
+  db: Database.Database,
+  swarmId: string,
+  actor: string,
+  argv: string[],
+  options: RunTaskCommandOptions = {}
+): RunTaskCommandResult {
+  if (argv.length === 0 || !argv[0]) {
+    throw new Error('swarm run requires a command after --. Usage: swarm run [--task <slug>] -- <cmd> [args...]');
+  }
+  const invocationCwd = path.resolve(options.cwd ?? process.cwd());
+  const task = resolveRunTask(db, swarmId, options.taskId, invocationCwd);
+  const commandCwd = task.worktree_path ?? invocationCwd;
+  if (task.worktree_path && !fs.existsSync(task.worktree_path)) {
+    throw new Error(`Task "${task.id}" worktree does not exist at "${task.worktree_path}". Restore/restart the task worktree or run a no-worktree task with --task.`);
+  }
+
+  const logPath = nextRunLogPath(task);
+  const logFd = fs.openSync(logPath, 'wx');
+  const started = Date.now();
+  let exitCode = 0;
+  try {
+    try {
+      execFileSync(argv[0], argv.slice(1), {
+        cwd: commandCwd,
+        stdio: ['inherit', logFd, logFd],
+      });
+    } catch (error: unknown) {
+      const failure = error as { status?: number | null; code?: string; signal?: string; message?: string };
+      if (typeof failure.status === 'number') {
+        exitCode = failure.status;
+      } else {
+        exitCode = failure.code === 'ENOENT' ? 127 : 126;
+        fs.writeSync(logFd, `swarm run could not execute ${argv[0]}: ${failure.message ?? failure.code ?? failure.signal ?? 'unknown error'}\n`);
+      }
+    }
+  } finally {
+    fs.closeSync(logFd);
+  }
+  const durationMs = Math.max(0, Date.now() - started);
+  insertEvent(db, task, 'run', actor, {
+    argv0: argv[0],
+    argsCount: argv.length - 1,
+    exit: exitCode,
+    logPath,
+    durationMs,
+  });
+  const summary = boundedRunSummary(fs.readFileSync(logPath, 'utf-8'));
+  return { task, exitCode, logPath, durationMs, summary };
 }
 
 function latestCheckpoint(db: Database.Database, task: Task): { event: TaskEvent; path: string } | null {

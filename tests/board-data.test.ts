@@ -138,6 +138,7 @@ function createFixture(): { root: string; db: Database.Database; gateId: number;
   insertTask(db, 'program-capacity', 'active', 'Alice', 4, 30);
   insertTask(db, 'recent-done', 'done', 'Alice', 5, 30);
   insertTask(db, 'old-done', 'done', 'Bob', 6, 25 * 60);
+  db.prepare("UPDATE tasks SET claim_kind = 'decision' WHERE id = 'recent-done'").run();
 
   const stalePath = checkpointFile(root, 'stale');
   const checkpointPath = checkpointFile(root, 'fresh');
@@ -147,6 +148,15 @@ function createFixture(): { root: string; db: Database.Database; gateId: number;
   insertEvent(db, 'program-capacity', 4, 'checkpoint', 'Alice', 6, { path: quotaPath, sequence: 2 });
   insertEvent(db, 'stale-task', 3, 'handoff', 'Alice', 4, { to: 'Bob', brief_path: '/tmp/brief' });
   insertEvent(db, 'stale-task', 4, 'claimed', 'Bob', 3, { previous_owner: 'Alice' });
+  insertEvent(db, 'recent-done', 5, 'close_evidence', 'Alice', 2, {
+    kind: 'decision', ref: '42', verified: true,
+  });
+  insertEvent(db, 'recent-done', 5, 'gate_override', 'Alice', 2, {
+    reason: 'operator-approved exception', bypassed_gates: ['evidence-required'],
+  });
+  insertEvent(db, 'recent-done', 5, 'closed', 'Alice', 2, {
+    disposition: 'archive', claim_kind: 'decision', not_established: 'runtime behavior',
+  });
 
   const gate = db.prepare(`
     INSERT INTO messages (
@@ -271,6 +281,22 @@ describe('V1-A shared board data projection', () => {
       assert.ok(stale?.stale);
       assert.strictEqual(stale.checkpoint?.ageMin, 91);
       assert.strictEqual(data.tasks.find(task => task.id === 'review-task')?.checkpoint, null);
+      assert.strictEqual(fresh.claimKind, 'code-merged', 'legacy NULL claims project as code-merged');
+      assert.deepStrictEqual(fresh.evidence, []);
+      assert.strictEqual(fresh.notEstablished, null);
+      assert.deepStrictEqual(fresh.overrides, []);
+      const recentDone = data.tasks.find(task => task.id === 'recent-done');
+      assert.ok(recentDone);
+      assert.strictEqual(recentDone.claimKind, 'decision');
+      assert.deepStrictEqual(recentDone.evidence, [{ kind: 'decision', ref: '42', verified: true }]);
+      assert.strictEqual(recentDone.notEstablished, 'runtime behavior');
+      assert.deepStrictEqual(recentDone.overrides, [{
+        eventId: recentDone.overrides[0].eventId,
+        reason: 'operator-approved exception',
+        bypassedGates: ['evidence-required'],
+        actor: 'Alice',
+        at: iso(2),
+      }]);
 
       assert.ok(data.edges.ownership.some(edge => edge.agent === 'alice' && edge.taskId === 'fresh-task'));
       assert.deepStrictEqual(data.edges.handoffs, [{

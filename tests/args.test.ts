@@ -65,4 +65,14 @@ describe('parseGlobalFlags', () => {
       { args: ['broadcast', 'deploy with -s now'], swarmName: undefined }
     );
   });
+
+  test('a literal -- preserves every swarm-like child argv token for swarm run', () => {
+    assert.deepStrictEqual(
+      parseGlobalFlags(['--swarm', 'proj', 'run', '--task', 'build-it', '--', 'tool', '--swarm', 'child', '-s']),
+      {
+        args: ['run', '--task', 'build-it', '--', 'tool', '--swarm', 'child', '-s'],
+        swarmName: 'proj',
+      }
+    );
+  });
 });

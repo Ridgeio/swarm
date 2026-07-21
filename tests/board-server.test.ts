@@ -486,9 +486,11 @@ describe('V1-B static board assets', () => {
     assert.ok(references.every(reference => reference.startsWith('./assets/')));
     assert.doesNotMatch(html, /type="module"/);
     assert.match(html, /assets\/echarts\.min\.js/);
-    assert.doesNotMatch(
-      fs.readFileSync(path.join(ROOT, 'web', 'board.js'), 'utf-8'),
-      /innerHTML/
-    );
+    const boardScript = fs.readFileSync(path.join(ROOT, 'web', 'board.js'), 'utf-8');
+    assert.doesNotMatch(boardScript, /innerHTML/);
+    assert.match(boardScript, /'Claim kind'/);
+    assert.match(boardScript, /'Not established'/);
+    assert.match(boardScript, /'Close evidence'/);
+    assert.match(boardScript, /'GATE OVERRIDES'/);
   });
 });

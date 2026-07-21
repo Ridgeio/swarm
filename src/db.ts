@@ -126,6 +126,7 @@ function createCurrentTables(db: Database.Database): void {
       worktree_path TEXT,
       transcript_hint TEXT,
       disposition TEXT,
+      claim_kind TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (swarm_id, id)
@@ -334,6 +335,17 @@ function ensureMessageSupersededByColumn(db: Database.Database): void {
   }
 }
 
+// tasks.claim_kind — nullable so databases written by earlier builds retain an
+// honest legacy marker. Callers interpret NULL as code-merged; new task starts
+// always write an explicit claim kind.
+function ensureTaskClaimKindColumn(db: Database.Database): void {
+  if (!tableExists(db, 'tasks')) return;
+  const columns = tableColumns(db, 'tasks');
+  if (!columns.has('claim_kind')) {
+    db.exec('ALTER TABLE tasks ADD COLUMN claim_kind TEXT');
+  }
+}
+
 function migrate(db: Database.Database): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -342,6 +354,7 @@ function migrate(db: Database.Database): void {
   migrateInboxCursors(db);
   ensureMessageKindColumn(db);
   ensureMessageSupersededByColumn(db);
+  ensureTaskClaimKindColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);

@@ -6,12 +6,15 @@ import os from 'os';
 import path from 'path';
 import { pathToFileURL, fileURLToPath } from 'url';
 import SQLite from 'better-sqlite3';
+import { getDbAt } from '../src/db.js';
+import { closeTask, startTask } from '../src/tasks.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+const TSX_IMPORT = import.meta.resolve('tsx');
 
 interface CliResult { stdout: string; stderr: string; status: number }
 
-function runCli(home: string, args: string[], agent?: string): CliResult {
+function runCli(home: string, args: string[], agent?: string, cwd?: string): CliResult {
   const env: Record<string, string> = {
     PATH: process.env.PATH ?? '',
     HOME: home,
@@ -30,9 +33,10 @@ function runCli(home: string, args: string[], agent?: string): CliResult {
     GROK_AGENT: '',
   };
   try {
-    const stdout = execFileSync('node', ['--import', 'tsx', INDEX, ...args], {
+    const stdout = execFileSync('node', ['--import', TSX_IMPORT, INDEX, ...args], {
       encoding: 'utf-8',
       env,
+      cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     return { stdout, stderr: '', status: 0 };
@@ -116,6 +120,7 @@ describe('WI-3 task ledger CLI', () => {
       const active = taskRow(db, 'happy-path');
       assert.strictEqual(active.state, 'active');
       assert.strictEqual(active.lease_epoch, 1);
+      assert.strictEqual(active.claim_kind, 'code-merged');
       assert.strictEqual(active.branch, 'swarm/Alice/happy-path');
       assert.strictEqual(active.worktree_path, path.join(home, '.swarm', 'wt', 'repo', 'Alice--happy-path'));
       assert.ok(active.transcript_hint.includes(`cwd=${process.cwd()}`));
@@ -141,7 +146,7 @@ describe('WI-3 task ledger CLI', () => {
       assert.strictEqual(secondCheckpoint.status, 0, secondCheckpoint.stderr || secondCheckpoint.stdout);
       assert.match(secondCheckpoint.stdout, /Checkpoint #002 recorded: .*\/002\.md/);
 
-      const closed = runCli(home, ['task', 'close', 'happy-path', '--disposition', 'pr'], 'Alice');
+      const closed = runCli(home, ['task', 'close', 'happy-path', '--disposition', 'pr', '--not-established', 'none'], 'Alice');
       assert.strictEqual(closed.status, 0, closed.stderr || closed.stdout);
       const verified = openDb(home);
       const done = taskRow(verified, 'happy-path');
@@ -199,7 +204,7 @@ describe('WI-3 task ledger CLI', () => {
       assert.match(claimed.stdout, /lease epoch 2/);
 
       const staleCheckpoint = runCli(home, ['task', 'checkpoint', 'fenced-task', '--notes', 'stale'], 'Alice');
-      const staleClose = runCli(home, ['task', 'close', 'fenced-task', '--disposition', 'archive'], 'Alice');
+      const staleClose = runCli(home, ['task', 'close', 'fenced-task', '--disposition', 'archive', '--not-established', 'none'], 'Alice');
       assert.notStrictEqual(staleCheckpoint.status, 0);
       assert.notStrictEqual(staleClose.status, 0);
       assert.match(staleCheckpoint.stderr, /Refused stale task authority.*owner is "Bob".*epoch 2/s);
@@ -238,14 +243,14 @@ describe('WI-3 task ledger CLI', () => {
       fs.appendFileSync(path.join(task.worktree_path, 'tracked.txt'), 'dirty\n');
       fs.writeFileSync(path.join(task.worktree_path, 'untracked.txt'), 'untracked\n');
 
-      const refused = runCli(home, ['task', 'close', 'count-state', '--disposition', 'pr'], 'Alice');
+      const refused = runCli(home, ['task', 'close', 'count-state', '--disposition', 'pr', '--not-established', 'none'], 'Alice');
       assert.notStrictEqual(refused.status, 0);
       assert.match(refused.stderr, /unpushed commits: 1, dirty tracked files: 1, untracked files: 1/);
 
-      const singleConfirm = runCli(home, ['task', 'close', 'count-state', '--disposition', 'discard'], 'Alice');
+      const singleConfirm = runCli(home, ['task', 'close', 'count-state', '--disposition', 'discard', '--not-established', 'none'], 'Alice');
       assert.notStrictEqual(singleConfirm.status, 0);
       assert.match(singleConfirm.stderr, /requires both --disposition discard and --force-discard/);
-      const discarded = runCli(home, ['task', 'close', 'count-state', '--disposition', 'discard', '--force-discard'], 'Alice');
+      const discarded = runCli(home, ['task', 'close', 'count-state', '--disposition', 'discard', '--force-discard', '--not-established', 'none'], 'Alice');
       assert.strictEqual(discarded.status, 0, discarded.stderr || discarded.stdout);
       const after = openDb(home);
       const forceEvent = after.prepare("SELECT data FROM task_events WHERE task_id = 'count-state' AND kind = 'force_discard'").get() as { data: string };
@@ -278,7 +283,7 @@ describe('WI-3 task ledger CLI', () => {
       assert.strictEqual(manifest.attribution.task_id, 'archive-it');
       assert.strictEqual(manifest.attribution.agent, 'Alice');
 
-      const closed = runCli(home, ['task', 'close', 'archive-it', '--disposition', 'archive'], 'Alice');
+      const closed = runCli(home, ['task', 'close', 'archive-it', '--disposition', 'archive', '--not-established', 'none'], 'Alice');
       assert.strictEqual(closed.status, 0, closed.stderr || closed.stdout);
       assert.ok(!fs.existsSync(task.worktree_path));
     } finally {
@@ -308,7 +313,7 @@ describe('WI-3 task ledger CLI', () => {
       assert.ok(fs.existsSync(reclaimed.worktree_path));
       assert.strictEqual(git(reclaimed.worktree_path, ['branch', '--show-current']), 'swarm/Alice/branch-reclaim');
       db.close();
-      const cleanup = runCli(home, ['task', 'close', 'branch-reclaim', '--disposition', 'discard', '--force-discard'], 'Alice');
+      const cleanup = runCli(home, ['task', 'close', 'branch-reclaim', '--disposition', 'discard', '--force-discard', '--not-established', 'none'], 'Alice');
       assert.strictEqual(cleanup.status, 0, cleanup.stderr || cleanup.stdout);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
@@ -336,8 +341,8 @@ describe('WI-3 task ledger CLI', () => {
         assert.strictEqual(manifest.counts.untracked, 0);
       }
 
-      assert.strictEqual(runCli(home, ['task', 'close', 'agent-one', '--disposition', 'pr'], 'Alice').status, 0);
-      assert.strictEqual(runCli(home, ['task', 'close', 'agent-two', '--disposition', 'pr'], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, ['task', 'close', 'agent-one', '--disposition', 'pr', '--not-established', 'none'], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, ['task', 'close', 'agent-two', '--disposition', 'pr', '--not-established', 'none'], 'Alice').status, 0);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -516,6 +521,376 @@ describe('WI-3 task ledger CLI', () => {
       assert.strictEqual(after, before);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('T1 claim matrix accepts matching evidence and refuses wrong kinds, missing files, and missing decisions', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-matrix-'));
+    const evidenceRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-evidence-'));
+    try {
+      joinAgent(home, 'Alice');
+      const report = path.join(evidenceRoot, 'report.md');
+      const journey = path.join(evidenceRoot, 'journey.log');
+      const health = path.join(evidenceRoot, 'health.log');
+      fs.writeFileSync(report, '# findings\nEstablished by the analysis.\n');
+      fs.writeFileSync(journey, 'opened /login and completed the journey\n');
+      fs.writeFileSync(health, 'GET /health 200\n');
+      const missing = path.join(evidenceRoot, 'missing.log');
+
+      const invalidClaim = runCli(home, [
+        'task', 'start', 'bad-claim', '--title', 'Bad', '--no-worktree', '--claim', 'wishful-thinking',
+      ], 'Alice');
+      assert.notStrictEqual(invalidClaim.status, 0);
+      assert.match(invalidClaim.stderr, /Invalid --claim.*code-merged.*journey-works.*deploy-healthy.*analysis.*decision.*probe/s);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'code-claim', '--title', 'Code', '--no-worktree', '--claim', 'code-merged',
+      ], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'code-claim', '--disposition', 'archive', '--not-established', 'runtime behavior',
+      ], 'Alice').status, 0);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'journey-claim', '--title', 'Journey', '--no-worktree', '--claim', 'journey-works',
+      ], 'Alice').status, 0);
+      const journeyWrong = runCli(home, [
+        'task', 'close', 'journey-claim', '--disposition', 'archive', '--evidence', `report:${report}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(journeyWrong.status, 0);
+      assert.match(journeyWrong.stderr, /claim "journey-works" expects evidence kind\(s\): journey; received "report"/);
+      const journeyMissing = runCli(home, [
+        'task', 'close', 'journey-claim', '--disposition', 'archive', '--evidence', `journey:${missing}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(journeyMissing.status, 0);
+      assert.match(journeyMissing.stderr, /journey evidence file .* does not exist.*--evidence journey:/s);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'journey-claim', '--disposition', 'archive', '--evidence', `journey:${journey}`, '--not-established', 'visual polish',
+      ], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'journey-url', '--title', 'Journey URL', '--no-worktree', '--claim', 'journey-works',
+      ], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'journey-url', '--disposition', 'archive',
+        '--evidence', 'journey:https://evidence.example/run/42', '--not-established', 'cross-browser behavior',
+      ], 'Alice').status, 0);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'deploy-claim', '--title', 'Deploy', '--no-worktree', '--claim', 'deploy-healthy',
+      ], 'Alice').status, 0);
+      const deployWrong = runCli(home, [
+        'task', 'close', 'deploy-claim', '--disposition', 'archive', '--evidence', `report:${report}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(deployWrong.status, 0);
+      assert.match(deployWrong.stderr, /expects evidence kind\(s\): deploy-health; received "report"/);
+      const deployMissing = runCli(home, [
+        'task', 'close', 'deploy-claim', '--disposition', 'archive', '--evidence', `deploy-health:${missing}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(deployMissing.status, 0);
+      assert.match(deployMissing.stderr, /deploy-health evidence file .* does not exist/);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'deploy-claim', '--disposition', 'archive', '--evidence', `deploy-health:${health}`, '--not-established', 'long-term health',
+      ], 'Alice').status, 0);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'analysis-claim', '--title', 'Analysis', '--no-worktree',
+      ], 'Alice').status, 0);
+      const analysisAbsent = runCli(home, [
+        'task', 'close', 'analysis-claim', '--disposition', 'archive', '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(analysisAbsent.status, 0);
+      assert.match(analysisAbsent.stderr, /claim "analysis" expects evidence kind\(s\): report/);
+      const analysisWrong = runCli(home, [
+        'task', 'close', 'analysis-claim', '--disposition', 'archive', '--evidence', `journey:${journey}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(analysisWrong.status, 0);
+      assert.match(analysisWrong.stderr, /claim "analysis" expects evidence kind\(s\): report; received "journey"/);
+      const analysisMissing = runCli(home, [
+        'task', 'close', 'analysis-claim', '--disposition', 'archive', '--evidence', `report:${missing}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(analysisMissing.status, 0);
+      assert.match(analysisMissing.stderr, /must exist and be non-empty/);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'analysis-claim', '--disposition', 'archive', '--evidence', `report:${report}`, '--not-established', 'production behavior',
+      ], 'Alice').status, 0);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'decision-claim', '--title', 'Decision', '--no-worktree', '--claim', 'decision',
+      ], 'Alice').status, 0);
+      const decisionWrong = runCli(home, [
+        'task', 'close', 'decision-claim', '--disposition', 'archive', '--evidence', `journey:${journey}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(decisionWrong.status, 0);
+      assert.match(decisionWrong.stderr, /expects evidence kind\(s\): decision, report; received "journey"/);
+      const absentDecision = runCli(home, [
+        'task', 'close', 'decision-claim', '--disposition', 'archive', '--evidence', 'decision:999999', '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(absentDecision.status, 0);
+      assert.match(absentDecision.stderr, /decision evidence id "999999" does not exist in this swarm/);
+      const recorded = runCli(home, [
+        'decision', 'DECISION: use the typed close BECAUSE evidence must match', '--task', 'decision-claim',
+      ], 'Alice');
+      assert.strictEqual(recorded.status, 0, recorded.stderr || recorded.stdout);
+      const decisionId = recorded.stdout.match(/#(\d+)/)?.[1];
+      assert.ok(decisionId);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'decision-claim', '--disposition', 'archive',
+        '--evidence', `decision:${decisionId}`, '--evidence', `report:${report}`,
+        '--not-established', 'implementation correctness',
+      ], 'Alice').status, 0);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'probe-claim', '--title', 'Probe', '--no-worktree', '--claim', 'probe',
+      ], 'Alice').status, 0);
+      const probeWrong = runCli(home, [
+        'task', 'close', 'probe-claim', '--disposition', 'archive', '--evidence', `journey:${journey}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(probeWrong.status, 0);
+      assert.match(probeWrong.stderr, /claim "probe" expects evidence kind\(s\): report; received "journey"/);
+      const probeMissing = runCli(home, [
+        'task', 'close', 'probe-claim', '--disposition', 'archive', '--evidence', `report:${missing}`, '--not-established', 'none',
+      ], 'Alice');
+      assert.notStrictEqual(probeMissing.status, 0);
+      assert.match(probeMissing.stderr, /must exist and be non-empty/);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'probe-claim', '--disposition', 'archive', '--outcome', 'inconclusive',
+        '--not-established', 'the probe established no answer',
+      ], 'Alice').status, 0);
+
+      const db = openDb(home);
+      assert.strictEqual(taskRow(db, 'analysis-claim').claim_kind, 'analysis', '--no-worktree defaults to analysis');
+      const decisionEvidence = db.prepare(`
+        SELECT data FROM task_events WHERE task_id = 'decision-claim' AND kind = 'close_evidence' ORDER BY id
+      `).all() as Array<{ data: string }>;
+      assert.deepStrictEqual(decisionEvidence.map(row => JSON.parse(row.data)), [
+        { kind: 'decision', ref: decisionId, verified: true },
+        { kind: 'report', ref: report, verified: true },
+      ]);
+      const journeyUrlEvidence = db.prepare("SELECT data FROM task_events WHERE task_id = 'journey-url' AND kind = 'close_evidence'").get() as { data: string };
+      assert.deepStrictEqual(JSON.parse(journeyUrlEvidence.data), {
+        kind: 'journey', ref: 'https://evidence.example/run/42', verified: 'unverified',
+      });
+      const probeClose = db.prepare("SELECT data FROM task_events WHERE task_id = 'probe-claim' AND kind = 'closed'").get() as { data: string };
+      assert.strictEqual(JSON.parse(probeClose.data).outcome, 'inconclusive');
+      db.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(evidenceRoot, { recursive: true, force: true });
+    }
+  });
+
+  test('T1 requires and surfaces --not-established while legacy NULL claims behave as code-merged', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-honesty-'));
+    const report = path.join(home, 'analysis.md');
+    fs.writeFileSync(report, 'bounded analysis\n');
+    try {
+      joinAgent(home, 'Alice');
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'honest-close', '--title', 'Honest', '--no-worktree', '--claim', 'analysis',
+      ], 'Alice').status, 0);
+      const missingFlag = runCli(home, [
+        'task', 'close', 'honest-close', '--disposition', 'archive', '--evidence', `report:${report}`,
+      ], 'Alice');
+      assert.notStrictEqual(missingFlag.status, 0);
+      assert.match(missingFlag.stderr, /requires --not-established/);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'honest-close', '--disposition', 'archive', '--evidence', `report:${report}`,
+        '--not-established', 'deployment health',
+      ], 'Alice').status, 0);
+      const show = runCli(home, ['task', 'show', 'honest-close'], 'Alice');
+      assert.strictEqual(show.status, 0, show.stderr || show.stdout);
+      assert.match(show.stdout, /claim: analysis/);
+      assert.match(show.stdout, /report:.*analysis\.md \[verified: true\]/);
+      assert.match(show.stdout, /not established: deployment health/);
+      let db = openDb(home);
+      const closeEvent = db.prepare("SELECT data FROM task_events WHERE task_id = 'honest-close' AND kind = 'closed'").get() as { data: string };
+      assert.strictEqual(JSON.parse(closeEvent.data).not_established, 'deployment health');
+      db.close();
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'legacy-null', '--title', 'Legacy', '--no-worktree', '--claim', 'analysis',
+      ], 'Alice').status, 0);
+      db = openDb(home);
+      db.prepare("UPDATE tasks SET claim_kind = NULL WHERE id = 'legacy-null'").run();
+      db.close();
+      const legacyList = runCli(home, ['task', 'list'], 'Alice');
+      assert.match(legacyList.stdout, /legacy-null .*claim code-merged/);
+      const legacyClose = runCli(home, [
+        'task', 'close', 'legacy-null', '--disposition', 'archive', '--not-established', 'none',
+      ], 'Alice');
+      assert.strictEqual(legacyClose.status, 0, legacyClose.stderr || legacyClose.stdout);
+      const legacyShow = runCli(home, ['task', 'show', 'legacy-null'], 'Alice');
+      assert.match(legacyShow.stdout, /claim: code-merged/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('T1 repo-backed non-code claims retain git gates and override requires a reason and records bypassed gates', () => {
+    const root = fs.mkdtempSync(path.join(suiteRoot, 'override-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-override-'));
+    try {
+      const { repo } = createPushedRepo(root);
+      const report = path.join(home, 'report.md');
+      fs.writeFileSync(report, 'analysis complete\n');
+      joinAgent(home, 'Alice');
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'override-gates', '--title', 'Override gates', '--repo', repo, '--claim', 'analysis',
+      ], 'Alice').status, 0);
+      let db = openDb(home);
+      const task = taskRow(db, 'override-gates');
+      db.close();
+      fs.appendFileSync(path.join(task.worktree_path, 'tracked.txt'), 'dirty\n');
+
+      const gated = runCli(home, [
+        'task', 'close', 'override-gates', '--disposition', 'archive', '--evidence', `report:${report}`,
+        '--not-established', 'runtime behavior',
+      ], 'Alice');
+      assert.notStrictEqual(gated.status, 0);
+      assert.match(gated.stderr, /dirty tracked files: 1/);
+
+      const noReason = runCli(home, [
+        'task', 'close', 'override-gates', '--disposition', 'archive', '--override', '--not-established', 'runtime behavior',
+      ], 'Alice');
+      assert.notStrictEqual(noReason.status, 0);
+      assert.match(noReason.stderr, /--override.*requires --reason/s);
+
+      const overridden = runCli(home, [
+        'task', 'close', 'override-gates', '--disposition', 'archive', '--override', '--reason', 'urgent audit handoff',
+        '--not-established', 'runtime behavior',
+      ], 'Alice');
+      assert.strictEqual(overridden.status, 0, overridden.stderr || overridden.stdout);
+      assert.ok(!fs.existsSync(task.worktree_path));
+      db = openDb(home);
+      const overrideEvent = db.prepare("SELECT data FROM task_events WHERE task_id = 'override-gates' AND kind = 'gate_override'").get() as { data: string };
+      assert.deepStrictEqual(JSON.parse(overrideEvent.data), {
+        reason: 'urgent audit handoff',
+        bypassed_gates: ['evidence-required', 'git-dirty-tracked'],
+      });
+      db.close();
+      const show = runCli(home, ['task', 'show', 'override-gates'], 'Alice');
+      assert.match(show.stdout, /gate overrides:\n  #\d+ reason: urgent audit handoff; bypassed: evidence-required, git-dirty-tracked/);
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('T1 swarm run logs full combined output, bounds the summary, propagates exit, infers worktrees, and records events', () => {
+    const root = fs.mkdtempSync(path.join(suiteRoot, 'run-'));
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-run-'));
+    try {
+      const { repo } = createPushedRepo(root);
+      joinAgent(home, 'Alice');
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'run-evidence', '--title', 'Run evidence', '--repo', repo,
+      ], 'Alice').status, 0);
+      const db = openDb(home);
+      const task = taskRow(db, 'run-evidence');
+      db.close();
+      const nested = path.join(task.worktree_path, 'nested');
+      fs.mkdirSync(nested);
+      const script = [
+        'for (let i = 1; i <= 45; i += 1) {',
+        "  const line = 'line-' + String(i).padStart(3, '0');",
+        '  (i % 2 === 0 ? console.error : console.log)(line);',
+        '}',
+        'process.exit(7);',
+      ].join('\n');
+      const inferred = runCli(home, ['run', '--', process.execPath, '-e', script], 'Alice', nested);
+      assert.strictEqual(inferred.status, 7, inferred.stderr || inferred.stdout);
+      assert.match(inferred.stdout, /^line-001$/m);
+      assert.match(inferred.stdout, /^line-015$/m);
+      assert.doesNotMatch(inferred.stdout, /^line-020$/m);
+      assert.match(inferred.stdout, /output truncated: 5 lines omitted/);
+      assert.match(inferred.stdout, /^line-021$/m);
+      assert.match(inferred.stdout, /^line-045$/m);
+      assert.match(inferred.stdout, /Exit status: 7/);
+      const logPath = inferred.stdout.match(/^Log: (.+)$/m)?.[1];
+      assert.strictEqual(logPath, path.join(home, '.swarm', 'evidence', 'default', 'run-evidence', 'run-001.log'));
+      const fullLog = fs.readFileSync(logPath!, 'utf-8');
+      assert.strictEqual((fullLog.match(/^line-\d{3}$/gm) ?? []).length, 45);
+      assert.match(fullLog, /^line-002$/m, 'stderr is captured in the combined full log');
+
+      const explicit = runCli(home, [
+        'run', '--task', 'run-evidence', '--', process.execPath, '-e', "console.log('explicit-task')",
+      ], 'Alice', root);
+      assert.strictEqual(explicit.status, 0, explicit.stderr || explicit.stdout);
+      assert.match(explicit.stdout, /explicit-task/);
+      assert.match(explicit.stdout, /run-002\.log/);
+
+      const outside = runCli(home, ['run', '--', process.execPath, '-e', "console.log('no task')"], 'Alice', root);
+      assert.notStrictEqual(outside.status, 0);
+      assert.match(outside.stderr, /Pass --task <slug> or run from under a recorded task worktree/);
+
+      assert.strictEqual(runCli(home, [
+        'task', 'start', 'run-no-worktree', '--title', 'No worktree run', '--no-worktree',
+      ], 'Alice', root).status, 0);
+      const noWorktree = runCli(home, [
+        'run', '--task', 'run-no-worktree', '--', process.execPath, '-e', 'console.log(process.cwd())',
+      ], 'Alice', root);
+      assert.strictEqual(noWorktree.status, 0, noWorktree.stderr || noWorktree.stdout);
+      assert.match(noWorktree.stdout, new RegExp(`^${root.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+
+      const after = openDb(home);
+      const events = after.prepare("SELECT data FROM task_events WHERE task_id = 'run-evidence' AND kind = 'run' ORDER BY id").all() as Array<{ data: string }>;
+      assert.strictEqual(events.length, 2);
+      assert.deepStrictEqual(JSON.parse(events[0].data), {
+        argv0: process.execPath,
+        argsCount: 2,
+        exit: 7,
+        logPath,
+        durationMs: JSON.parse(events[0].data).durationMs,
+      });
+      assert.ok(Number.isInteger(JSON.parse(events[0].data).durationMs));
+      after.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('T1 deploy-health URL failures are injected, non-blocking, and recorded as unverified', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-deploy-stub-'));
+    const db = getDbAt(path.join(root, 'swarm.db'));
+    try {
+      await startTask(db, 'default', 'Alice', 'deploy-url', {
+        title: 'Deploy URL',
+        noWorktree: true,
+        claimKind: 'deploy-healthy',
+      });
+      const calls: string[] = [];
+      const closed = await closeTask(db, 'default', 'Alice', 'deploy-url', {
+        disposition: 'archive',
+        evidence: ['deploy-health:https://health.invalid/status'],
+        notEstablished: 'sustained health',
+        deployHealthCheck: async url => {
+          calls.push(url);
+          throw new Error('stubbed network failure');
+        },
+      });
+      assert.strictEqual(closed.state, 'done');
+      assert.deepStrictEqual(calls, ['https://health.invalid/status']);
+      const event = db.prepare("SELECT data FROM task_events WHERE task_id = 'deploy-url' AND kind = 'close_evidence'").get() as { data: string };
+      assert.deepStrictEqual(JSON.parse(event.data), {
+        kind: 'deploy-health',
+        ref: 'https://health.invalid/status',
+        verified: 'unverified',
+      });
+
+      await startTask(db, 'default', 'Alice', 'deploy-status', {
+        title: 'Deploy status',
+        noWorktree: true,
+        claimKind: 'deploy-healthy',
+      });
+      await closeTask(db, 'default', 'Alice', 'deploy-status', {
+        disposition: 'archive',
+        evidence: ['deploy-health:https://health.example/status'],
+        notEstablished: 'sustained health',
+        deployHealthCheck: async () => 204,
+      });
+      const statusEvent = db.prepare("SELECT data FROM task_events WHERE task_id = 'deploy-status' AND kind = 'close_evidence'").get() as { data: string };
+      assert.strictEqual(JSON.parse(statusEvent.data).verified, 204);
+    } finally {
+      db.close();
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

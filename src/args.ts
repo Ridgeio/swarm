@@ -24,6 +24,13 @@ export function parseGlobalFlags(input: string[]): { args: string[]; swarmName: 
   for (let i = 0; i < input.length; i += 1) {
     const arg = input[i];
 
+    // Conventional argv boundary: everything after a literal -- belongs to the
+    // subcommand (notably `swarm run`) and must never be reinterpreted globally.
+    if (arg === '--') {
+      stripped.push(...input.slice(i));
+      break;
+    }
+
     // Inside a command's free-text tail every token is literal (part of the message/title).
     if (positionals >= freeTextStart) {
       stripped.push(arg);

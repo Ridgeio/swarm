@@ -54,11 +54,14 @@ import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 import {
   checkpointTask,
   closeTask,
+  effectiveClaimKind,
   getTask,
   getActiveTaskHookLines,
   handoffTask,
   recordDecision,
+  runTaskCommand,
   startTask,
+  type ClaimKind,
   type TaskDisposition,
 } from './tasks.js';
 import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './rescue.js';
@@ -105,6 +108,14 @@ function getFlag(flag: string): string | undefined {
   const idx = args.indexOf(flag);
   if (idx === -1 || idx + 1 >= args.length) return undefined;
   return args[idx + 1];
+}
+
+function getRepeatedFlags(flag: string): string[] {
+  const values: string[] = [];
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === flag && index + 1 < args.length) values.push(args[index + 1]);
+  }
+  return values;
 }
 
 function hasFlag(flag: string): boolean {
@@ -269,12 +280,14 @@ Communication:
 
 Task Ledger:
   swarm task start <slug> --title <text>           Create or claim a fenced task lease
-    [--repo <path>] [--no-worktree] [--takeover]
+    [--repo <path>] [--no-worktree] [--takeover] [--claim <kind>]
   swarm task checkpoint <slug> [--notes <text>]    Record a numbered checkpoint; --notes puts
                                                      text under decisions and fills other
                                                      narrative sections with "- none noted"
   swarm task close <slug> --disposition <kind>     Close with pr|merged|archive|discard evidence
-    [--force-discard]
+    --not-established <text> [--evidence <kind>:<ref>] [--outcome inconclusive]
+    [--force-discard] [--override --reason <text>]
+  swarm run [--task <slug>] -- <cmd> [args...]     Capture full output as task evidence
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
   swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
@@ -827,7 +840,7 @@ async function main() {
         const { db, self } = requireSelf();
         if (subcommand === 'list') {
           const tasks = db.prepare(`
-            SELECT id, title, state, owner_agent, lease_epoch, disposition, updated_at
+            SELECT id, title, state, owner_agent, lease_epoch, disposition, claim_kind, updated_at
             FROM tasks
             WHERE swarm_id = ?
             ORDER BY CASE state WHEN 'awaiting_review' THEN 0 WHEN 'active' THEN 1 WHEN 'open' THEN 2 WHEN 'done' THEN 3 ELSE 4 END,
@@ -839,13 +852,14 @@ async function main() {
             owner_agent: string | null;
             lease_epoch: number;
             disposition: string | null;
+            claim_kind: ClaimKind | null;
           }>;
           if (tasks.length === 0) {
             console.log('No tasks recorded.');
           } else {
             for (const task of tasks) {
               const disposition = task.disposition ? `; disposition ${task.disposition}` : '';
-              console.log(`${task.id} [${task.state}] \u2014 ${task.owner_agent ?? 'unowned'}(${task.lease_epoch})${disposition} \u2014 ${task.title}`);
+              console.log(`${task.id} [${task.state}] \u2014 ${task.owner_agent ?? 'unowned'}(${task.lease_epoch})${disposition} \u2014 ${task.title}; claim ${effectiveClaimKind(task)}`);
             }
             console.log(`\n${tasks.length} task(s)`);
           }
@@ -863,6 +877,7 @@ async function main() {
           }
           console.log(`${task.id}: ${task.title}`);
           console.log(`state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; lease epoch: ${task.lease_epoch}`);
+          console.log(`claim: ${effectiveClaimKind(task)}`);
           console.log(`lease expires: ${task.lease_expires_at ?? 'none'}; disposition: ${task.disposition ?? 'none'}`);
           console.log(`repo: ${task.repo_path ?? 'none'}`);
           console.log(`branch: ${task.branch ?? 'none'}; worktree: ${task.worktree_path ?? 'none'}`);
@@ -880,6 +895,37 @@ async function main() {
             data: string | null;
             created_at: string;
           }>;
+          const parsedEvents = events.map(event => {
+            if (!event.data) return { event, data: null as Record<string, unknown> | null };
+            try {
+              const parsed = JSON.parse(event.data) as unknown;
+              return {
+                event,
+                data: parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+                  ? parsed as Record<string, unknown>
+                  : null,
+              };
+            } catch {
+              return { event, data: null as Record<string, unknown> | null };
+            }
+          });
+          const evidence = parsedEvents.filter(({ event }) => event.kind === 'close_evidence');
+          console.log('close evidence:');
+          if (evidence.length === 0) console.log('  none');
+          for (const item of evidence) {
+            console.log(`  ${String(item.data?.kind ?? 'unknown')}:${String(item.data?.ref ?? 'unknown')} [verified: ${String(item.data?.verified ?? false)}]`);
+          }
+          const closed = [...parsedEvents].reverse().find(({ event }) => event.kind === 'closed');
+          console.log(`not established: ${String(closed?.data?.not_established ?? 'not recorded')}`);
+          const overrides = parsedEvents.filter(({ event }) => event.kind === 'gate_override');
+          console.log('gate overrides:');
+          if (overrides.length === 0) console.log('  none');
+          for (const item of overrides) {
+            const gates = Array.isArray(item.data?.bypassed_gates)
+              ? item.data.bypassed_gates.map(String).join(', ')
+              : 'none';
+            console.log(`  #${item.event.id} reason: ${String(item.data?.reason ?? 'not recorded')}; bypassed: ${gates}`);
+          }
           console.log('events:');
           if (events.length === 0) console.log('  none');
           for (const event of events) {
@@ -917,6 +963,7 @@ async function main() {
             repoPath: getFlag('--repo'),
             noWorktree: hasFlag('--no-worktree'),
             takeover: hasFlag('--takeover'),
+            claimKind: getFlag('--claim'),
           });
           const verb = result.eventKind === 'claimed' ? 'claimed' : 'started';
           console.log(`Task "${slug}" ${verb} by ${self.name} at lease epoch ${result.task.lease_epoch}.`);
@@ -938,12 +985,17 @@ async function main() {
         if (subcommand === 'close') {
           const disposition = getFlag('--disposition') as TaskDisposition | undefined;
           if (!disposition) {
-            console.error('Usage: swarm task close <slug> --disposition pr|merged|archive|discard [--force-discard]');
+            console.error('Usage: swarm task close <slug> --disposition pr|merged|archive|discard --not-established <text> [--evidence <kind>:<ref>] [--outcome inconclusive] [--force-discard] [--override --reason <text>]');
             process.exit(1);
           }
-          const task = closeTask(db, self.swarm_id, self.name, slug, {
+          const task = await closeTask(db, self.swarm_id, self.name, slug, {
             disposition,
             forceDiscard: hasFlag('--force-discard'),
+            evidence: getRepeatedFlags('--evidence'),
+            notEstablished: getFlag('--not-established'),
+            outcome: getFlag('--outcome'),
+            override: hasFlag('--override'),
+            reason: getFlag('--reason'),
           });
           console.log(`Task "${slug}" closed as ${task.disposition}. Branch ref kept; task worktree removed.`);
           break;
@@ -951,6 +1003,35 @@ async function main() {
         console.error(`Unknown task command: ${subcommand}`);
         console.error('Usage: swarm task start|checkpoint|close|show <slug> [options] | swarm task list');
         process.exit(1);
+        break;
+      }
+
+      case 'run': {
+        const usage = 'Usage: swarm run [--task <slug>] -- <cmd> [args...]';
+        const separator = args.indexOf('--');
+        if (separator === -1 || separator === args.length - 1) {
+          console.error(usage);
+          process.exit(1);
+        }
+        let taskId: string | undefined;
+        const wrapperArgs = args.slice(1, separator);
+        for (let index = 0; index < wrapperArgs.length; index += 1) {
+          if (wrapperArgs[index] !== '--task' || index + 1 >= wrapperArgs.length || taskId !== undefined) {
+            console.error(usage);
+            process.exit(1);
+          }
+          taskId = wrapperArgs[index + 1];
+          index += 1;
+        }
+        const { db, self } = requireSelf();
+        const result = runTaskCommand(db, self.swarm_id, self.name, args.slice(separator + 1), {
+          taskId,
+          cwd: process.cwd(),
+        });
+        if (result.summary) console.log(result.summary);
+        console.log(`Log: ${result.logPath}`);
+        console.log(`Exit status: ${result.exitCode}`);
+        process.exitCode = result.exitCode;
         break;
       }
 

@@ -1,7 +1,12 @@
 import type Database from 'better-sqlite3';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
-import { CHECKPOINT_STALE_MINUTES } from './tasks.js';
+import {
+  CHECKPOINT_STALE_MINUTES,
+  effectiveClaimKind,
+  type ClaimKind,
+  type EvidenceVerification,
+} from './tasks.js';
 import {
   JANITOR_HEARTBEAT_STALE_MS,
   type JanitorCounters,
@@ -48,6 +53,7 @@ interface RawTask {
   repo_path: string | null;
   branch: string | null;
   worktree_path: string | null;
+  claim_kind: ClaimKind | null;
   created_at: string;
   updated_at: string;
 }
@@ -99,6 +105,20 @@ export interface BoardGitData {
   unpushed: number;
 }
 
+export interface BoardCloseEvidenceData {
+  kind: string;
+  ref: string;
+  verified: EvidenceVerification;
+}
+
+export interface BoardGateOverrideData {
+  eventId: number;
+  reason: string;
+  bypassedGates: string[];
+  actor: string | null;
+  at: string;
+}
+
 export interface BoardTaskData {
   id: string;
   title: string;
@@ -108,6 +128,10 @@ export interface BoardTaskData {
   repoPath: string | null;
   branch: string | null;
   worktreePath: string | null;
+  claimKind: ClaimKind;
+  evidence: BoardCloseEvidenceData[];
+  notEstablished: string | null;
+  overrides: BoardGateOverrideData[];
   createdAt: string;
   checkpoint: BoardCheckpointData | null;
   stale: boolean;
@@ -392,9 +416,12 @@ export function collectBoardData(
   if (available('tasks')) {
     try {
       const cutoff = new Date(now - RECENT_DONE_WINDOW_MS).toISOString();
+      const claimColumn = tableColumns(database!, 'tasks')?.has('claim_kind')
+        ? 'claim_kind'
+        : 'NULL AS claim_kind';
       rawTasks = database!.prepare(`
         SELECT id, title, state, owner_agent, lease_epoch, repo_path, branch,
-               worktree_path, created_at, updated_at
+               worktree_path, ${claimColumn}, created_at, updated_at
         FROM tasks
         WHERE swarm_id = ? AND (state <> 'done' OR updated_at >= ?)
         ORDER BY
@@ -410,6 +437,9 @@ export function collectBoardData(
 
   const tasks: BoardTaskData[] = rawTasks.map(task => {
     let checkpoint: BoardCheckpointData | null = null;
+    const evidence: BoardCloseEvidenceData[] = [];
+    const overrides: BoardGateOverrideData[] = [];
+    let notEstablished: string | null = null;
     if (available('task_events')) {
       try {
         const event = database!.prepare(`
@@ -432,6 +462,39 @@ export function collectBoardData(
             path,
           };
         }
+        const closeEvents = database!.prepare(`
+          SELECT id, task_id, epoch, kind, actor, data, created_at
+          FROM task_events
+          WHERE swarm_id = ? AND task_id = ?
+            AND kind IN ('close_evidence', 'closed', 'gate_override')
+          ORDER BY id ASC
+        `).all(swarmId, task.id) as RawTaskEvent[];
+        for (const event of closeEvents) {
+          const data = parseJsonObject(event.data);
+          if (event.kind === 'close_evidence') {
+            if (typeof data?.kind !== 'string' || typeof data.ref !== 'string') continue;
+            const rawVerified = data.verified;
+            const verified: EvidenceVerification = typeof rawVerified === 'boolean' ||
+              typeof rawVerified === 'number' || rawVerified === 'unverified'
+              ? rawVerified
+              : false;
+            evidence.push({ kind: data.kind, ref: data.ref, verified });
+          } else if (event.kind === 'closed') {
+            notEstablished = typeof data?.not_established === 'string'
+              ? data.not_established
+              : notEstablished;
+          } else if (event.kind === 'gate_override') {
+            overrides.push({
+              eventId: event.id,
+              reason: typeof data?.reason === 'string' ? data.reason : 'not recorded',
+              bypassedGates: Array.isArray(data?.bypassed_gates)
+                ? data.bypassed_gates.filter((gate): gate is string => typeof gate === 'string')
+                : [],
+              actor: event.actor,
+              at: event.created_at,
+            });
+          }
+        }
       } catch {
         addUnavailable(unavailable, 'task_events');
       }
@@ -446,6 +509,10 @@ export function collectBoardData(
       repoPath: task.repo_path,
       branch: task.branch,
       worktreePath: task.worktree_path,
+      claimKind: effectiveClaimKind(task),
+      evidence,
+      notEstablished,
+      overrides,
       createdAt: task.created_at,
       checkpoint,
       stale: task.state === 'active' && evidenceAge !== null && evidenceAge > CHECKPOINT_STALE_MINUTES,

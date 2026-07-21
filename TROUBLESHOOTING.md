@@ -211,7 +211,22 @@ The served board uses a fresh per-process token. Open the exact URL printed by t
 
 ---
 
-## Task close refuses
+## Task close refuses because evidence does not match the claim
+
+Read the claim kind and expected evidence kinds in the refusal; the CLI prints both. Inspect the durable contract with `swarm task show <slug>`, then retry with the named kind:
+
+```bash
+swarm task show design-audit
+swarm task close design-audit --disposition archive \
+  --evidence report:/absolute/path/to/audit.md \
+  --not-established "runtime behavior"
+```
+
+`journey:<path>` and `deploy-health:<path>` must name existing files; `report:<path>` must also be non-empty; `decision:<id>` must exist in this swarm. A deploy-health URL is checked once with a two-second best-effort request; network failure is recorded as `unverified` and does not block close. A probe may use `--outcome inconclusive` instead of report evidence.
+
+Every close, including an override, must type `--not-established "<text>"`; use `"none"` only when that is honest. To bypass an evidence or Git gate deliberately, pass both `--override --reason "<text>"`. The reason and exact bypassed-gate list are recorded in a `gate_override` event.
+
+## Task close refuses because Git state is not preserved
 
 `task close` has an exact-count preservation gate. The error reports all three blocking counts: `unpushed commits: N, dirty tracked files: N, untracked files: N`. For `pr` or `merged`, the recorded branch tip must also be reachable from a remote ref.
 
@@ -222,10 +237,10 @@ The normal fix is to push the branch and clean or commit the worktree. The expli
 
 ```bash
 swarm rescue --task auth-refresh
-swarm task close auth-refresh --disposition archive
+swarm task close auth-refresh --disposition archive --not-established "none"
 
 # destructive intent, double-confirmed:
-swarm task close auth-refresh --disposition discard --force-discard
+swarm task close auth-refresh --disposition discard --force-discard --not-established "none"
 ```
 
 ---

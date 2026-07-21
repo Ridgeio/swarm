@@ -709,6 +709,55 @@ describe('migration', () => {
     }
   });
 
+  test('a pre-T1 tasks table gains one nullable claim_kind column additively', () => {
+    const oldPath = path.join(os.tmpdir(), `swarm-preclaim-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
+    const old = new SQLite(oldPath);
+    old.exec(`
+      CREATE TABLE tasks (
+        id TEXT NOT NULL,
+        swarm_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'open',
+        owner_agent TEXT COLLATE NOCASE,
+        lease_epoch INTEGER NOT NULL DEFAULT 0,
+        lease_expires_at TEXT,
+        repo_path TEXT,
+        branch TEXT,
+        worktree_path TEXT,
+        transcript_hint TEXT,
+        disposition TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (swarm_id, id)
+      );
+    `);
+    const now = new Date().toISOString();
+    old.prepare(`
+      INSERT INTO tasks (
+        id, swarm_id, title, state, owner_agent, lease_epoch, created_at, updated_at
+      ) VALUES ('legacy-task', ?, 'Legacy task', 'active', 'Alice', 1, ?, ?)
+    `).run(DEFAULT_SWARM_ID, now, now);
+    old.close();
+
+    let migrated = getDbAt(oldPath);
+    try {
+      let claimColumns = (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
+        .filter(column => column.name === 'claim_kind');
+      assert.strictEqual(claimColumns.length, 1);
+      assert.strictEqual((migrated.prepare("SELECT claim_kind FROM tasks WHERE id = 'legacy-task'").get() as any).claim_kind, null);
+      migrated.close();
+      migrated = getDbAt(oldPath);
+      claimColumns = (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
+        .filter(column => column.name === 'claim_kind');
+      assert.strictEqual(claimColumns.length, 1, 'the additive guard is idempotent');
+    } finally {
+      migrated.close();
+      try { fs.unlinkSync(oldPath); } catch {}
+      try { fs.unlinkSync(oldPath + '-wal'); } catch {}
+      try { fs.unlinkSync(oldPath + '-shm'); } catch {}
+    }
+  });
+
   test('migration de-duplicates case-variant names the new NOCASE unique would reject', () => {
     const legacyPath = path.join(os.tmpdir(), `swarm-nocase-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     const legacy = new SQLite(legacyPath);

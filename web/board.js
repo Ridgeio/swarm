@@ -662,6 +662,19 @@
     detailRow(list, 'Title', task.title);
     detailRow(list, 'State', task.state + (task.stale ? ' · stale' : ''));
     detailRow(list, 'Owner / epoch', (task.owner || 'unowned') + ' / ' + task.leaseEpoch);
+    detailRow(list, 'Claim kind', task.claimKind || 'code-merged');
+    detailRow(list, 'Not established', task.notEstablished || 'not recorded');
+    detailRow(list, 'Close evidence', task.evidence && task.evidence.length > 0
+      ? task.evidence.map(function (item) {
+        return item.kind + ':' + item.ref + ' [verified: ' + item.verified + ']';
+      }).join(' · ')
+      : 'none');
+    detailRow(list, 'GATE OVERRIDES', task.overrides && task.overrides.length > 0
+      ? task.overrides.map(function (item) {
+        return '#' + item.eventId + ' ' + item.reason + ' [bypassed: ' +
+          (item.bypassedGates.length > 0 ? item.bypassedGates.join(', ') : 'none') + ']';
+      }).join(' · ')
+      : 'none');
     detailRow(list, 'Checkpoint', task.checkpoint
       ? task.checkpoint.ageMin + 'm ago · #' + task.checkpoint.seq
       : 'none');

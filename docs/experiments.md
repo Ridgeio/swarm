@@ -91,6 +91,40 @@ Template:
 - Decision: merged. Companion doctrine in orchestration.md (phase squeeze,
   zombie protocol, positive-evidence completion) from the MAP-CCS review.
 
+## Subtraction experiment template (v2)
+For standing controls (docs/controls.md): disable ONE control for a bounded
+window; the guard metric IS the failure class it protects against; verdict
+retain / revise / retire, recorded here and mirrored in the controls table.
+Never run two subtractions concurrently (confounds attribution).
+
+## EXP-011 — Claim-typed close evidence (T1)   [status: running]
+- Opened 2026-07-20. Measure by: first 10 closes of the next program.
+- Hypothesis: per-claim evidence contracts + mandatory not-established fields
+  make closed-task quality auditable (every close names its evidence ceiling)
+  without adding >1 min of close friction (guard: overrides stay <10% of closes).
+
+## EXP-012 — Grants + escalation packets + sender auth (T2)   [status: running]
+- Opened 2026-07-20. Measure by: next program retro.
+- Hypothesis: typed expiring grants + decision-ready escalation packets reduce
+  operator interruptions per gate decision (packet answers the questions chat
+  used to) with zero unauthorized merged-closes (guard metric).
+
+## EXP-013 — Worker-epoch registry + requalification (T3)   [status: running]
+- Opened 2026-07-20. Measure by: first epoch change after landing.
+- Hypothesis: version capture + epoch-change findings make requalification
+  happen within 48h of a CLI/model update (baseline: never happened at all).
+
+## EXP-014 — Control retirement loop (T3)   [status: running]
+- Opened 2026-07-20. Measure by: first retest-due date (2026-08-03,
+  debris-counters-hook — a real subtraction candidate).
+- Hypothesis: retest-by dates + census findings produce at least one honest
+  retire/revise verdict per month; P5 stops being a pure ratchet.
+
+## EXP-015 — node:sqlite campaign + ratchet (T5)   [status: proposed]
+- Hypothesis: one-sweep driver swap + a reintroduction-refusing ratchet test
+  removes the better-sqlite3 ABI fleet-outage class with zero behavior change
+  (guard: full suite green, no new flakes for 2 weeks).
+
 ## EXP-006 — Broadcast backfill fence + supersession (WI-1)   [status: running]
 - Date opened: 2026-07-19. Measure by: first phase boundary of the next PromptEden program.
 - Hypothesis: fencing new joiners' cursors and adding --supersedes tombstones

@@ -42,9 +42,9 @@ The research is unanimous that the win over mermaid is **coordinated views + a t
 
 Rendering a graph is the easy, solved part. The novel, hard work both the critic and Codex flagged is **`onNodeClick` → focus that agent's cmux terminal tab**. Design it up front against the existing `cmux-transport.ts` / `applescript-transport.ts` machinery and the `surface_id` already stored per agent. Contract: the browser calls one tightly-scoped localhost endpoint that resolves the *registered* `surface_id` and uses `execFile` to focus the surface — **never** a browser-provided command string.
 
-## 5. v2 — graduate to a React SPA ONLY on a real trigger
+## 5. ~~v2 — graduate to a React SPA~~ — DROPPED (2026-07-20)
 
-If v1's static-HTML page proves the content is right AND its limitations become the actual daily pain — persistent selection lost on reload, no non-disruptive incremental updates, coordinated-filtering across three panels feels cramped — then graduate to: **React Flow (`@xyflow/react`, MIT) + @dagrejs/dagre (the SCOPED package; the unscoped `dagre` is the abandoned original) + TanStack Table (MIT, headless) + shadcn/ui + Recharts**, built with Vite/React in a **separate `web/` workspace**, served by **Hono + @hono/node-server** over **SSE** with WAL-file change detection. React Flow is the cross-model consensus for the full version (both panels + the workflow picked it; MIT, xyflow GmbH weekly releases). Do not adopt this speculatively — it is real new surface justified only by proven daily use.
+Removed from the roadmap per docs/design/HARNESS-ENGINEERING-REVIEW.md ("keep the bundle proportional"; a promised second UI era is competing prompt material agents will faithfully extend). The served no-build board meets the visibility claim. Revisit only if a **named unresolved decision** arises that the current board cannot resolve — and then re-run the stack research rather than reaching for the 2026-07-19 snapshot (React Flow + TanStack + shadcn was the consensus then; libraries drift). Historical detail preserved in git history of this section.
 
 ## 6. Risks & traps (from the adversarial critic — bake these in)
 

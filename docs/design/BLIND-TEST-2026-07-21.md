@@ -19,6 +19,26 @@ The teaching surfaces WORK under adversity. Despite a hostile sandbox (Codex den
 
 Codex workspace-write denies `.git` writes → branch/worktree creation and commits fail with messages the harness can't improve; `swarm read <agent>` fails without cmux socket access. Field rule: agents in restrictive sandboxes should be given `--no-worktree` tasks or full access.
 
+---
+
+# Round 2 — full access, responsive operator (same day)
+
+Method deltas: `danger-full-access` (no sandbox artifacts), the operator (Lead) on duty and responsive, task requiring work "landed on main" (funnels to the merged-close grant gate). Agent: "Keel" (fresh Codex session, same one-hint bootstrap). Full loop achieved: task → worktree branch → commit → push → checkpoint → **escalation** → operator grant → close → **agent self-verification catching a false disposition** → operator lands → agent re-verifies → honest ack.
+
+## Round-1 fixes CONFIRMED working in the field
+- **F6**: refused at the grant gate, Keel escalated — did NOT self-grant (round-1's untested hypothesis, settled). It even declined to push to main while HOLDING a live merge grant, because the gates doc says Lead merges.
+- **F3**: "task start clearly reported the owner, branch, worktree, claim kind, and lease."
+- **F5/ROUTING**: it loaded exactly the two sections the routing table names for its two open decisions — decision-routed docs work.
+- Escalation packets are decision-ready in practice (operator granted from the packet alone); `grant_used` audit + `--not-established` honesty both exercised.
+
+## New findings (fixes = phase G)
+- **G1 (HIGH, bug): surface capture at join.** The full-access child inherited `CMUX_SURFACE_ID` and `swarm join Keel` registered a SECOND cmux agent on the operator's surface; newest-wins resolution captured the identity and locked the operator out of the CLI entirely (operator actions had to go through the storage layer). Round-1's F2 fixed marker precedence — the wrong layer. Fix: cmux join REFUSES a surface already registered to a different name (guidance: child/scripted processes join `--headless`; explicit `--force-surface` to take over), and stale same-surface ghosts are removable.
+- **G2 (HIGH, bug — found by the blind agent auditing its own close): "merged" reachability targets the wrong ref.** Close verified the commit reachable from ANY remote ref — the pushed feature branch satisfied it — and recorded `merged` while main didn't contain the work. Keel independently verified git, reported the false disposition with exact SHAs, and declined to self-repair. Fix: merged-disposition requires reachability from the repo's DEFAULT branch (remote HEAD → init fallback), close output prints source SHA / target ref / target SHA, success phrasing is "disposition recorded" unless landing verified, worktree removal only after verification passes.
+- **G3 (S): no repair path for a false disposition** — add `swarm task reopen <slug> --reason` (audited, state→active).
+- **G4 (S): `swarm inbox --wait <sec>`** — agents awaiting operators burned shell sleeps.
+- **G5 (S, teach): close semantics** ("records a disposition; performs no merge") stated in help + the local/file-remote workflow documented.
+- Observation (low): `swarm read <operator>` exposed operator commentary; Keel correctly treated it as context-not-decisions per doctrine — the org-template line held.
+
 ## What the test validated positively
 
 Refusal quality (each refusal taught the next step), pull/ack durability (all 6 messages to an absent operator queued losslessly), escalation packets, verified rescue as the work-preservation path of last resort, handoff as honest terminal state, `help --agent` as "a strong capability map", and the agent's ledger trail as a faithful audit of its self-report.

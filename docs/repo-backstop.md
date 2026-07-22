@@ -18,11 +18,14 @@ runs it or which CLI it is. They are the distillation of field-tested swarm
 doctrine (see swarm repo `docs/philosophy.md`); the swarm CLI enforces them
 mechanically where it is installed, but they bind even without it.
 
-1. **One writer per lane.** Never edit files another agent's task owns. Before
-   starting multi-file work, claim it (swarm task, issue assignment, or an
-   explicit note from your human). Branch naming: `swarm/<human>/<task-slug>`
-   (or `<human>/<slug>` outside swarm mode). One branch = one owner; never
-   push to a branch you don't own — freeze and fork instead.
+1. **One writer per branch/worktree; paths are shared advisorily.** The hard
+   boundary is the branch and worktree: never work in another agent's worktree
+   and never push to a branch you don't own — freeze and fork instead. Editing
+   files that another task also touches is ALLOWED and expected — coordinate it
+   with an advisory reservation (rule 11): you are warned on overlap and may
+   override with a reason. Do not treat task ownership as a file lock. Branch
+   naming: `swarm/<human>/<task-slug>/e<epoch>` (or `<human>/<slug>` outside
+   swarm mode).
 2. **Worktree isolation.** One writing agent per checkout. Never run two
    writing agents in the same working tree.
 3. **Completion claims require evidence.** "Done" means: the artifact exists
@@ -36,8 +39,11 @@ mechanically where it is installed, but they bind even without it.
    fresh context. Priors: hunt missing behavior in Claude-authored code; hunt
    build breakage in Codex-authored code. "Looks good" is not a review —
    evidence required: file/line, counterexample, or failing test.
-5. **No self-merge.** PR → green CI → cross-family review → human (or
-   designated lead) merges. No exceptions for small fixes.
+5. **No self-merge; the repo's landing authority merges.** PR → green CI →
+   cross-family review → the repository's single named **landing authority**
+   merges (not just any human or lead), and only when the pre-landing check
+   binds the exact head SHA to a still-valid submission. No exceptions for
+   small fixes; the only bypass is the audited break-glass.
 6. **CI is a budget.** Open PRs as DRAFTS; flip ready-for-review only when the
    work is review-ready. Never push empty commits to retrigger CI; never loop
    CI on a red you don't understand.
@@ -54,9 +60,26 @@ mechanically where it is installed, but they bind even without it.
 10. **When blocked, say so early.** >30 min blocked → surface it to your
     human/lead with the exact blocker. Never loop silently; never widen scope
     to route around a blocker without approval.
+11. **Reserve work socially, override transparently.** Before starting
+    multi-file or multi-agent work, place an advisory reservation on the
+    area/files you're taking (identity + a short TTL) so others have
+    situational awareness — it warns, it does not block. If you must work a
+    scope someone else has reserved, override it WITH A STATED REASON and let
+    the holder know; don't silently collide. Reservations are awareness, not
+    permission — landing to a protected branch is still the repo's single
+    landing authority's call.
+12. **Read the design before you change it; keep it current.** If the
+    component has a living design doc (`DESIGN.md` or equivalent), read it
+    before starting and update it in the SAME PR as your change, so it never
+    goes stale. If your change contradicts the recorded design, FLAG the
+    component's owner/landing authority rather than silently diverging — design
+    conflicts are cheapest to resolve before the work, not at merge.
 
 Repo-specific (edit per repo):
 - Protected branches, required checks, CODEOWNERS paths: see `.github/`.
-- Known hotspots requiring serialization (migrations, lockfiles, generated
-  registries): list them here.
+- Landing authority (who merges to protected branches): name them here.
+- Shared-environment apply points that are hard-gated at apply, not by file
+  locks (DB migrations applied to shared databases, prod deploys): list them
+  here. Editing these files stays advisory; only their *application* is gated.
+- Living design docs (component → `DESIGN.md` path): list them here.
 - Actions budget note if metered.

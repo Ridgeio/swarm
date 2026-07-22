@@ -6,7 +6,7 @@ Row format is machine-parsed (strict): `| id | mechanism | guards-against | YYYY
 
 | id | mechanism | guards-against | retest-by | retirement condition |
 | --- | --- | --- | --- | --- |
-| debris-counters-hook | per-turn debris counters in hook context | silent debris accumulation between census looks | 2026-08-03 | retire if a 2-week subtraction shows census findings flat without them |
+| debris-counters-hook | per-turn debris counters in Claude/Grok hook context; absent on Codex | silent debris accumulation between census looks | 2026-08-03 | retire if a 2-week subtraction shows census findings flat without them |
 | unacked-collapse-3-45 | 3-show/45-min message collapse in hook | context bloat from re-injected unacked messages | 2026-08-17 | retire only if ack discipline makes re-injection rare (<1/day) |
 | backfill-fence | new-joiner cursor fence at MAX(id) | stale-doctrine replay to new agents | 2026-09-01 | permanent until message TTLs exist; then reassess |
 | janitor-hook-piggyback | hook spawns janitor tick when >10 min stale | idle-fleet census gaps between launchd ticks | 2026-08-17 | retire if launchd alone keeps tick age <15 min for 2 weeks |

@@ -183,3 +183,54 @@ Never run two subtractions concurrently (confounds attribution).
   (flag-token stripping matches --interject convention; peek-zero hint line).
 - Measure by next review: broadcast count (expect ~0), receipt-check
   round-trips (expect 0), Atlas repeat-send pairs, gate-message latency.
+
+## EPOCH: codex codex-cli 0.144.6 -> 0.145.0 — 2026-07-22
+- Journeys run: (1) builder baseline from PromptEden Train F, a real
+  entitlement/onboarding fix that used task start, five checkpoints,
+  cross-family review, amendment, full CI, exact-SHA merge, and evidence-gated
+  close (`worker-requal/run-002.log`, `run-003.log`); (2) cold review of merged
+  PromptEden Train G against its recorded Claude review
+  (`worker-requal/run-004.log`,
+  `worker-requal-train-g-cold-review-2026-07-22.md`).
+- Verdicts: builder quality remains appropriate for the Codex spine/security
+  lane — Train F merged after one review cycle, with 668 files / 5,542 tests,
+  real-Postgres coverage, build, security, and integration gates green. The
+  cold Train G review found no blocker and independently recovered the accepted
+  non-atomic add risk plus the SQL-fixture gap; Claude's earlier review found
+  the original parser/data-quality defects before amendment. This is the first
+  epoch note, so it establishes a baseline rather than claiming a delta from
+  0.144.6.
+- Routing changes: none. Keep Codex as primary for spine/migrations/security
+  and keep cross-family review mandatory; the observed complementary finding
+  profiles support the existing table.
+- Toolchain friction: the repository has both `package-lock.json` and
+  `pnpm-lock.yaml` but no declared `packageManager`. `pnpm test` under pnpm
+  11.5.3 attempted an install, generated `pnpm-workspace.yaml`, and failed on
+  ignored `esbuild` build scripts (`run-009.log`); the generated file was
+  removed. The non-installing `npm test` path passed all 281 tests and
+  `npm run build` passed (`run-010.log`, `run-011.log`). Package-manager policy
+  was not changed during requalification.
+- Subtraction: `debris-counters-hook`, the nearest-due control. Codex installs
+  static swarm instructions but no dynamic UserPromptSubmit hook, so the
+  control was naturally absent for the bounded 19:27:47Z–19:33:38Z task
+  window. Janitor snapshots stayed flat at 17 worktrees, 0 detached heads,
+  9 unpushed commits, 0 temp strays, and 0 junk dirs (`run-006.log`–`run-008.log`).
+  Verdict: **retain / inconclusive** — six minutes cannot satisfy the registry's
+  two-week retirement condition, and the run exposed a Codex coverage gap
+  rather than evidence that the control has no value. The controls row now
+  states its actual host scope; retest-by remains 2026-08-03.
+- Finding disposition: janitor finding `2037` remains `hold`. The CLI has no
+  janitor-finding acknowledgement command and worker-epoch findings never
+  auto-clear; Lead authorized leaving it held and prohibited a direct DB write.
+
+## EPOCH: claude-code 2.1.215 -> 2.1.217 — 2026-07-22
+- Journeys observed in the same live program: Sage's cross-family reviews of
+  PromptEden Trains F and G found the high-severity behavior/data-quality gaps,
+  verified their amended SHAs, and returned clean narrow-recheck verdicts.
+- Verdicts: reviewer behavior still matches the Claude inversion lane. This
+  Codex-operated requalification did not run a fresh Claude builder journey, so
+  Claude builder behavior is not established by this note.
+- Routing changes: none; retain Claude as the different-family reviewer and
+  Fable only for explicit arbitration/final-copy work.
+- Finding disposition: janitor finding `1182` remains `hold` for the same
+  missing-clear-mechanism limitation, with Lead authorization and no DB write.

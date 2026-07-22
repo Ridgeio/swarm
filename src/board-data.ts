@@ -180,6 +180,8 @@ export interface BoardDebrisFinding {
 }
 
 export interface BoardTimelineEvent {
+  /** task_events rowid — the client's since-you-left high-water mark. */
+  id: number;
   taskId: string;
   epoch: number;
   kind: string;
@@ -917,6 +919,7 @@ export function collectBoardData(
         ORDER BY id ASC
       `).all(swarmId, TIMELINE_LIMIT) as unknown as RawTaskEvent[];
       timeline = events.map(event => ({
+        id: event.id,
         taskId: event.task_id,
         epoch: event.epoch,
         kind: event.kind,

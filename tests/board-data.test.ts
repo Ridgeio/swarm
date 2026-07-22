@@ -362,6 +362,7 @@ describe('V1-A shared board data projection', () => {
 
       assert.strictEqual(data.timeline.length, 200);
       assert.deepStrictEqual(data.timeline[0], {
+        id: data.timeline[0].id,
         taskId: 'open-task',
         epoch: 0,
         kind: 'note',
@@ -369,6 +370,11 @@ describe('V1-A shared board data projection', () => {
         at: iso(199),
         summary: 'note=event 5 continued',
       });
+      // Timeline events carry their rowid, strictly ascending — the client's
+      // since-you-left high-water mark depends on it.
+      assert.ok(Number.isInteger(data.timeline[0].id) && data.timeline[0].id > 0);
+      assert.ok(data.timeline.every((event, index) =>
+        index === 0 || event.id > data.timeline[index - 1].id));
       assert.strictEqual(data.timeline.at(-1)?.at, iso(0));
       assert.strictEqual(data.timeline.at(-1)?.summary, 'note=event 204 continued');
       assert.ok(data.timeline.every(event => !/[\r\n]/.test(event.summary)));

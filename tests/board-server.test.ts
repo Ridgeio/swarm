@@ -20,6 +20,8 @@ import { getDbAt, type SwarmDb } from '../src/db.js';
 
 const ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 
+const EXPECTED_CSP = "default-src 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'; object-src 'none'";
+
 function boardFixture(): BoardData {
   return {
     generatedAt: '2026-07-19T12:00:00.000Z',
@@ -126,7 +128,7 @@ describe('V1-B served board', () => {
       const response = await request(running, '/api/board');
       assert.strictEqual(response.status, 401);
       assert.strictEqual(response.headers['cache-control'], 'no-store');
-      assert.strictEqual(response.headers['content-security-policy'], "default-src 'self'");
+      assert.strictEqual(response.headers['content-security-policy'], EXPECTED_CSP);
       assert.strictEqual(response.headers['x-content-type-options'], 'nosniff');
     } finally {
       await running.close();
@@ -146,7 +148,7 @@ describe('V1-B served board', () => {
         token: running.token,
       });
       assert.strictEqual(response.status, 403);
-      assert.strictEqual(response.headers['content-security-policy'], "default-src 'self'");
+      assert.strictEqual(response.headers['content-security-policy'], EXPECTED_CSP);
     } finally {
       await running.close();
     }
@@ -160,15 +162,17 @@ describe('V1-B served board', () => {
     });
     if (!running) return;
     try {
-      const known = await request(running, '/assets/board.js');
-      const echarts = await request(running, '/assets/echarts.min.js');
+      const known = await request(running, '/assets/app.js');
+      const vendor = await request(running, '/assets/vendor/preact-10.29.7.module.js');
       const traversal = await request(running, '/assets/../../package.json');
       const encodedTraversal = await request(running, '/assets/%2e%2e/%2e%2e/package.json');
       const unknown = await request(running, '/assets/unknown.js');
       assert.strictEqual(known.status, 200);
       assert.match(String(known.headers['content-type']), /^text\/javascript/);
-      assert.strictEqual(echarts.status, 200);
-      assert.match(String(echarts.headers['content-type']), /^text\/javascript/);
+      assert.strictEqual(vendor.status, 200);
+      assert.match(String(vendor.headers['content-type']), /^text\/javascript/);
+      const legacy = await request(running, '/assets/echarts.min.js');
+      assert.strictEqual(legacy.status, 404);
       assert.strictEqual(traversal.status, 404);
       assert.strictEqual(encodedTraversal.status, 404);
       assert.strictEqual(unknown.status, 404);
@@ -473,25 +477,85 @@ describe('V1-C focus-agent endpoint', () => {
   });
 });
 
-describe('V1-B static board assets', () => {
-  test('all web files are local-only and HTML references only the asset route', () => {
-    const expected = ['board.html', 'board.css', 'board.js', 'board-elements.js'];
+describe('board v2 static assets', () => {
+  test('all web files are local-only; HTML loads only module assets from the asset route', () => {
+    const expected = ['board.html', 'board.css', 'app.js', 'store.js', 'api.js', 'views.js'];
     for (const name of expected) {
       const contents = fs.readFileSync(path.join(ROOT, 'web', name), 'utf-8');
       assert.doesNotMatch(contents, /https?:\/\//, `${name} contains an external URL`);
+      if (name.endsWith('.js')) {
+        assert.doesNotMatch(contents, /innerHTML/, `${name} must not use innerHTML`);
+        assert.doesNotMatch(contents, /\beval\s*\(/, `${name} must not eval`);
+      }
     }
     const html = fs.readFileSync(path.join(ROOT, 'web', 'board.html'), 'utf-8');
     const references = [...html.matchAll(/(?:src|href)="([^"]+)"/g)].map(match => match[1]);
     assert.ok(references.length > 0);
     assert.ok(references.every(reference => reference.startsWith('./assets/')));
-    assert.doesNotMatch(html, /type="module"/);
-    assert.match(html, /assets\/echarts\.min\.js/);
-    const boardScript = fs.readFileSync(path.join(ROOT, 'web', 'board.js'), 'utf-8');
-    assert.doesNotMatch(boardScript, /innerHTML/);
-    assert.match(boardScript, /'Claim kind'/);
-    assert.match(boardScript, /'Not established'/);
-    assert.match(boardScript, /'Close evidence'/);
-    assert.match(boardScript, /'GATE OVERRIDES'/);
-    assert.match(boardScript, /'Grant usage'/);
+    assert.match(html, /type="module"/);
+    // Every static import in the web modules must resolve inside /assets/.
+    for (const name of ['app.js', 'store.js', 'api.js', 'views.js']) {
+      const contents = fs.readFileSync(path.join(ROOT, 'web', name), 'utf-8');
+      const imports = [...contents.matchAll(/from '([^']+)'/g)].map(match => match[1]);
+      assert.ok(imports.every(spec => spec.startsWith('./')), `${name} imports must be relative`);
+    }
+    // Vendored modules referenced by the code must exist with pinned names.
+    for (const vendorFile of [
+      'preact-10.29.7.module.js', 'preact-hooks-10.29.7.module.js', 'htm-3.1.1.module.js',
+    ]) {
+      assert.ok(fs.existsSync(path.join(ROOT, 'vendor', vendorFile)), vendorFile);
+    }
+  });
+});
+
+describe('board v2 SSE stream', () => {
+  test('requires a token, then streams an initial snapshot frame with epoch and seq', async context => {
+    const fixture = boardFixture();
+    const running = await startOrSkip(context, {
+      db: null,
+      swarmId: 'default',
+      projection: () => fixture,
+    });
+    if (!running) return;
+    try {
+      const denied = await request(running, '/api/events');
+      assert.strictEqual(denied.status, 401);
+
+      const frame = await new Promise<{ status: number; contentType: string; chunk: string }>((resolve, reject) => {
+        const outgoing = http.request({
+          hostname: '127.0.0.1',
+          port: running.port,
+          path: `/api/events?token=${encodeURIComponent(running.token)}`,
+          headers: { Host: `127.0.0.1:${running.port}` },
+        }, response => {
+          response.setEncoding('utf-8');
+          let buffered = '';
+          response.on('data', piece => {
+            buffered += piece;
+            if (buffered.includes('\n\n')) {
+              resolve({
+                status: response.statusCode ?? 0,
+                contentType: String(response.headers['content-type']),
+                chunk: buffered,
+              });
+              outgoing.destroy();
+            }
+          });
+          response.on('error', () => { /* destroyed after resolve */ });
+        });
+        outgoing.on('error', reject);
+        outgoing.end();
+      });
+      assert.strictEqual(frame.status, 200);
+      assert.match(frame.contentType, /^text\/event-stream/);
+      assert.match(frame.chunk, /^id: 1\n/);
+      assert.match(frame.chunk, /event: snapshot\n/);
+      const payload = JSON.parse(frame.chunk.split('data: ')[1].split('\n')[0]);
+      assert.match(payload.streamId, /^[a-f0-9]{16}$/);
+      assert.strictEqual(payload.seq, 1);
+      assert.deepStrictEqual(payload.board, fixture);
+    } finally {
+      await running.close();
+    }
   });
 });

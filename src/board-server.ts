@@ -84,38 +84,45 @@ function defaultAssetRoots(): BoardAssetRoots {
   };
 }
 
+const JS = 'text/javascript; charset=utf-8';
+
 function assetAllowlist(roots: BoardAssetRoots): ReadonlyMap<string, StaticAsset> {
   return new Map([
-    ['/assets/cytoscape.min.js', {
-      filePath: path.join(roots.vendor, 'cytoscape.min.js'),
-      contentType: 'text/javascript; charset=utf-8',
+    ['/assets/board.css', { filePath: path.join(roots.web, 'board.css'), contentType: 'text/css; charset=utf-8' }],
+    ['/assets/app.js', { filePath: path.join(roots.web, 'app.js'), contentType: JS }],
+    ['/assets/store.js', { filePath: path.join(roots.web, 'store.js'), contentType: JS }],
+    ['/assets/api.js', { filePath: path.join(roots.web, 'api.js'), contentType: JS }],
+    ['/assets/views.js', { filePath: path.join(roots.web, 'views.js'), contentType: JS }],
+    ['/assets/vendor/preact-10.29.7.module.js', {
+      filePath: path.join(roots.vendor, 'preact-10.29.7.module.js'), contentType: JS,
     }],
-    ['/assets/cytoscape-dagre.min.js', {
-      filePath: path.join(roots.vendor, 'cytoscape-dagre.min.js'),
-      contentType: 'text/javascript; charset=utf-8',
+    ['/assets/vendor/preact-hooks-10.29.7.module.js', {
+      filePath: path.join(roots.vendor, 'preact-hooks-10.29.7.module.js'), contentType: JS,
     }],
-    ['/assets/echarts.min.js', {
-      filePath: path.join(roots.vendor, 'echarts.min.js'),
-      contentType: 'text/javascript; charset=utf-8',
-    }],
-    ['/assets/board.css', {
-      filePath: path.join(roots.web, 'board.css'),
-      contentType: 'text/css; charset=utf-8',
-    }],
-    ['/assets/board-elements.js', {
-      filePath: path.join(roots.web, 'board-elements.js'),
-      contentType: 'text/javascript; charset=utf-8',
-    }],
-    ['/assets/board.js', {
-      filePath: path.join(roots.web, 'board.js'),
-      contentType: 'text/javascript; charset=utf-8',
+    ['/assets/vendor/htm-3.1.1.module.js', {
+      filePath: path.join(roots.vendor, 'htm-3.1.1.module.js'), contentType: JS,
     }],
   ]);
 }
 
 function commonHeaders(): Record<string, string> {
   return {
-    'Content-Security-Policy': "default-src 'self'",
+    // v2 tightened from default-src 'self': no inline anything, no eval, no
+    // remote hosts, no framing. The virtualizer positions rows via DOM style
+    // PROPERTIES, which style-src-attr 'none' still allows.
+    'Content-Security-Policy': [
+      "default-src 'none'",
+      "script-src 'self'",
+      "script-src-attr 'none'",
+      "style-src 'self'",
+      "style-src-attr 'none'",
+      "img-src 'self' data:",
+      "connect-src 'self'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+    ].join('; '),
     'X-Content-Type-Options': 'nosniff',
   };
 }
@@ -308,15 +315,44 @@ function readJsonBody(request: IncomingMessage): Promise<unknown> {
   });
 }
 
+export const BOARD_SERVER_MAX_SSE_CLIENTS = 8;
+const SSE_HEARTBEAT_MS = 12_000;
+const SSE_POLL_MS = 1_000;
+const SSE_FORCED_SNAPSHOT_MS = 30_000;
+
+interface ChangeStamp { events: number; messages: number; heartbeat: string }
+
+function changeStamp(db: SwarmDb | null, swarmId: string): ChangeStamp | null {
+  try {
+    const row = db?.prepare(`
+      SELECT
+        (SELECT COALESCE(MAX(id), 0) FROM task_events WHERE swarm_id = ?) AS events,
+        (SELECT COALESCE(MAX(id), 0) FROM messages WHERE swarm_id = ?) AS messages,
+        (SELECT COALESCE(MAX(last_heartbeat), '') FROM agents WHERE swarm_id = ?) AS heartbeat
+    `).get(swarmId, swarmId, swarmId) as ChangeStamp | undefined;
+    return row ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function stampsEqual(a: ChangeStamp | null, b: ChangeStamp | null): boolean {
+  return a !== null && b !== null &&
+    a.events === b.events && a.messages === b.messages && a.heartbeat === b.heartbeat;
+}
+
 function makeRequestHandler(
   options: StartBoardServerOptions,
   token: string,
-  getPort: () => number
+  getPort: () => number,
+  sseClients: Set<ServerResponse>
 ): (request: IncomingMessage, response: ServerResponse) => void {
   const roots = options.assetRoots ?? defaultAssetRoots();
   const assets = assetAllowlist(roots);
   const projection = options.projection ?? collectBoardData;
   const now = options.now ?? Date.now;
+  const streamId = randomBytes(8).toString('hex');
+  let seq = 0;
 
   return async (request, response) => {
     if (!hostAllowed(request.headers.host, getPort())) {
@@ -343,6 +379,70 @@ function makeRequestHandler(
         }), { 'Cache-Control': 'no-store' });
         return;
       }
+    }
+
+    if (rawPath === '/api/events') {
+      if (request.method !== 'GET') {
+        sendText(response, 405, 'Method not allowed.');
+        return;
+      }
+      if (sseClients.size >= BOARD_SERVER_MAX_SSE_CLIENTS) {
+        send(response, 503, 'application/json; charset=utf-8', JSON.stringify({
+          error: `Too many live board connections (max ${BOARD_SERVER_MAX_SSE_CLIENTS}).`,
+        }), { 'Cache-Control': 'no-store' });
+        return;
+      }
+      response.writeHead(200, {
+        ...commonHeaders(),
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-store',
+        Connection: 'keep-alive',
+      });
+      sseClients.add(response);
+
+      const emitSnapshot = (): void => {
+        try {
+          const board = projection(options.db, options.swarmId, { now: now() });
+          seq += 1;
+          const frame = JSON.stringify({ streamId, seq, board });
+          if (Buffer.byteLength(frame, 'utf-8') > BOARD_SERVER_MAX_JSON_BYTES) return;
+          // A slow client that cannot drain gets disconnected rather than
+          // buffered without bound (research: SSE backpressure is ours to own).
+          const writable = response.write(`id: ${seq}\nevent: snapshot\ndata: ${frame}\n\n`);
+          if (!writable && response.writableLength > BOARD_SERVER_MAX_JSON_BYTES * 2) {
+            response.destroy();
+          }
+        } catch {
+          // Projection failures are transient (e.g. mid-migration); the next
+          // tick retries and heartbeats keep the stream alive meanwhile.
+        }
+      };
+
+      let lastStamp = changeStamp(options.db, options.swarmId);
+      let lastEmit = Date.now();
+      emitSnapshot();
+
+      const poller = setInterval(() => {
+        const stamp = changeStamp(options.db, options.swarmId);
+        const forced = Date.now() - lastEmit >= SSE_FORCED_SNAPSHOT_MS;
+        if (forced || !stampsEqual(stamp, lastStamp)) {
+          lastStamp = stamp;
+          lastEmit = Date.now();
+          emitSnapshot();
+        }
+      }, SSE_POLL_MS);
+      const heartbeat = setInterval(() => {
+        response.write(`: heartbeat ${seq}\n\n`);
+      }, SSE_HEARTBEAT_MS);
+
+      const cleanup = (): void => {
+        clearInterval(poller);
+        clearInterval(heartbeat);
+        sseClients.delete(response);
+      };
+      request.on('close', cleanup);
+      response.on('close', cleanup);
+      return;
     }
 
     if (rawPath === '/api/focus-agent') {
@@ -449,7 +549,8 @@ export async function startBoardServer(
 
   const token = randomBytes(32).toString('hex');
   let boundPort = requestedPort;
-  const server = http.createServer(makeRequestHandler(options, token, () => boundPort));
+  const sseClients = new Set<ServerResponse>();
+  const server = http.createServer(makeRequestHandler(options, token, () => boundPort, sseClients));
 
   await new Promise<void>((resolve, reject) => {
     const onError = (error: NodeJS.ErrnoException): void => {
@@ -485,6 +586,9 @@ export async function startBoardServer(
         resolve();
         return;
       }
+      // Live SSE streams never end on their own; destroy them or close() hangs.
+      for (const client of sseClients) client.destroy();
+      sseClients.clear();
       server.close(error => error ? reject(error) : resolve());
     });
     return closePromise;

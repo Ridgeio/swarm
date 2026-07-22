@@ -1,24 +1,26 @@
 # vendor/ — pinned, self-hosted browser libraries
 
-Minified UMD builds served by `swarm board --serve` and copied beside generated
-board HTML, so the visualizer works offline and never loads from a CDN
-(docs/design/SWARM-VISUALIZER.md §2, §9). UMD (classic `<script>`) is required:
-ES-module imports are blocked over `file://` by browser CORS rules.
+Pinned browser libraries, self-hosted so the board works offline and never
+loads from a CDN.
 
-Provenance: fetched 2026-07-19 via `npm pack` from the npm registry (not a CDN),
-dist files copied verbatim. Licenses: mermaid MIT · cytoscape.js MIT ·
-cytoscape-dagre MIT (bundles dagre/graphlib internally — no separate dagre file
-needed) · echarts Apache-2.0.
+- `mermaid.min.js` — UMD, used by `swarm board --graph` file output only
+  (classic `<script>`; ES-module imports are blocked over `file://`).
+- `preact-*.module.js`, `htm-*.module.js` — browser ES modules served by
+  `swarm board --serve` for the v2 board (docs/design/SWARM-BOARD-V2.md).
+  Board v1's cytoscape/echarts bundles were removed with the v2 rewrite.
+  preact-hooks has ONE deliberate edit: its bare `from"preact"` import is
+  rewritten to `from"./preact-10.29.7.module.js"` so it resolves in-browser.
+
+Provenance: fetched 2026-07-19 (mermaid) and 2026-07-22 (preact/htm) via
+`npm pack` from the npm registry, dist files copied verbatim except the noted
+hooks import rewrite. Licenses: mermaid MIT · preact MIT · htm Apache-2.0.
 
 | File | Package | Version | SHA-256 |
 |---|---|---|---|
 | mermaid.min.js | mermaid | 11.16.0 | 74d7c46dabca328c2294733910a8aa1ed0c37451776e8d5295da38a2b758fb9b |
-| cytoscape.min.js | cytoscape | 3.34.0 | 9c2a3bf2592e0b14a1f7bec07c03a54f16dedf32af9cd0af155c716aa6c87bc3 |
-| cytoscape-dagre.min.js | cytoscape-dagre | 4.0.0 | b9e9d704119970f4255c035baa98d778e94af4b2efd2bdba20a601a869417223 |
-| echarts.min.js | echarts | 5.6.0 | bf4a223524e40b77c304bec67e1222cf551f14880cf42c69dc046558e11c07b1 |
-
-Note: cytoscape-dagre 4.0.0's dist banner self-reports "3.0.0" — stale banner in
-the published tarball; the package.json version is 4.0.0.
+| preact-10.29.7.module.js | preact | 10.29.7 | 850dcba8ed3535b0a3611495c405551b9887724885d3b8482207a03de365d64e |
+| preact-hooks-10.29.7.module.js | preact (hooks dist) | 10.29.7 | 0b3a11f9f2fe079d7ca267eb53b37533dced0664485c7529a13daa6b1bfa3afe |
+| htm-3.1.1.module.js | htm | 3.1.1 | ab33dd3f38059b9be4d5f5350128eefb2356639c4e0bbe9d9e8b3ba75847e9e4 |
 
 ## Update procedure
 

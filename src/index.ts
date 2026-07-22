@@ -191,6 +191,12 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+// Quote only when the token needs it — model names are usually plain and
+// quoting them garbles the typed TUI command shown to the operator.
+function shellToken(value: string): string {
+  return /^[A-Za-z0-9@%_+=:,./-]+$/.test(value) ? value : shellQuote(value);
+}
+
 function oneLineForCli(value: string, limit: number = 160): string {
   const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   return flattened.length <= limit ? flattened : `${flattened.slice(0, limit - 1)}\u2026`;
@@ -397,11 +403,16 @@ Local Agents:
     [--interactive-permissions]                      dialogs SKIPPED by default — unattended
                                                      workers can't click "allow"; this flag
                                                      restores dialogs)
-    [--agent claude|codex|grok] [--name <name>]
+    [--agent claude|codex|grok|gemini] [--name <name>]
+    [--model <model>]                                (claude defaults to opus — Fable is
+                                                      never a default, always an explicit
+                                                      --model choice; other CLIs use their
+                                                      own default unless --model is given)
     [--split [left|right|up|down] | --new-workspace <name>]
     [--terminal auto|cmux|warp]                      (default: auto; permissive adds
                                                       --dangerously-skip-permissions for claude,
-                                                      --yolo for codex, --always-approve for grok)
+                                                      --yolo for codex/gemini, --always-approve
+                                                      for grok)
 
 Cmux-only:
   swarm read <agent> [--lines <n>]                 Read agent's terminal
@@ -1802,6 +1813,10 @@ async function main() {
         // stall, not a safeguard, on this trusted machine. --interactive-permissions
         // opts back into dialogs; --autonomous is retained as a compat no-op.
         const permissive = !hasFlag('--interactive-permissions');
+        // Fable is never a default (Tom, 2026-07-22): a spawned claude worker
+        // rides the workhorse tier unless a model is explicitly chosen —
+        // reviewer/builder seats need the FAMILY, not the frontier tier.
+        const modelFlag = getFlag('--model');
         const agentFlag = (getFlag('--agent') || (hasFlag('--codex') ? 'codex' : 'claude')).toLowerCase();
         const terminalFlag = (getFlag('--terminal') || 'auto').toLowerCase();
         let selectedTerminal: 'cmux' | 'warp';
@@ -1825,7 +1840,8 @@ async function main() {
         // Agents that receive join instructions as their initial prompt (no post-spawn /join-swarm).
         let joinViaPrompt = false;
         if (agentFlag === 'claude') {
-          agentCmd = permissive ? 'claude --dangerously-skip-permissions' : 'claude';
+          const model = ` --model ${shellToken(modelFlag ?? 'opus')}`;
+          agentCmd = permissive ? `claude${model} --dangerously-skip-permissions` : `claude${model}`;
           agentLabel = 'Claude Code';
         } else if (agentFlag === 'codex') {
           // Pre-trust the cwd in ~/.codex/config.toml so spawned codex
@@ -1844,12 +1860,13 @@ async function main() {
           // instructions as Codex's initial prompt instead of relying on
           // a post-spawn keystroke.
           const perms = permissive ? ' --yolo' : '';
+          const model = modelFlag ? ` -m ${shellToken(modelFlag)}` : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
           const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
             ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
             : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
-          agentCmd = `codex --cd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
+          agentCmd = `codex --cd ${shellQuote(absoluteCwd)}${perms}${model} ${shellQuote(joinInstruction)}`;
           agentLabel = 'Codex CLI';
           joinViaPrompt = true;
         } else if (agentFlag === 'grok') {
@@ -1858,12 +1875,13 @@ async function main() {
           // for interactive use, but spawn shouldn't depend on TUI boot timing.
           const absoluteCwd = path.resolve(cwd);
           const perms = permissive ? ' --always-approve' : '';
+          const model = modelFlag ? ` -m ${shellToken(modelFlag)}` : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
           const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
             ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
             : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
-          agentCmd = `grok --cwd ${shellQuote(absoluteCwd)}${perms} ${shellQuote(joinInstruction)}`;
+          agentCmd = `grok --cwd ${shellQuote(absoluteCwd)}${perms}${model} ${shellQuote(joinInstruction)}`;
           agentLabel = 'Grok CLI';
           joinViaPrompt = true;
         } else if (agentFlag === 'gemini' || agentFlag === 'agy') {
@@ -1871,12 +1889,13 @@ async function main() {
           // approval dialogs (unattended workers cannot click "allow").
           const absoluteCwd = path.resolve(cwd);
           const perms = permissive ? ' --yolo' : '';
+          const model = modelFlag ? ` -m ${shellToken(modelFlag)}` : '';
           const swarmBin = path.resolve(path.dirname(new URL(import.meta.url).pathname), '..', 'bin', 'swarm');
           const swarmFlag = `--swarm ${swarm.name}`;
           const joinInstruction = name
             ? `Join the local swarm as "${name}" by running: ${swarmBin} join "${name}" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`
             : `Join the local swarm. First run ${swarmBin} members ${swarmFlag}. If there are no agents, join as "Lead"; otherwise choose a short unique creative name. Join by running ${swarmBin} join "<chosen-name>" ${swarmFlag}. Then run ${swarmBin} inbox and ${swarmBin} members ${swarmFlag}. Stay available for swarm messages and respond using ${swarmBin} send <agent> "<message>".`;
-          agentCmd = `gemini${perms} -i ${shellQuote(joinInstruction)}`;
+          agentCmd = `gemini${perms}${model} -i ${shellQuote(joinInstruction)}`;
           agentLabel = 'Gemini CLI';
           joinViaPrompt = true;
         } else {

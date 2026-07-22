@@ -137,6 +137,37 @@ describe('T8 CLI cmux layout discipline', () => {
     }
   });
 
+  test('claude spawns default to opus; --model passes through (Fable is explicit-only)', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-spawn-model-'));
+    const fixture = fakeCmux(root);
+    const readPayloads = () => fs.readFileSync(fixture.log, 'utf-8').split('\n')
+      .map(line => line.match(/^send .*?--surface \S+ (.*)$/)?.[1] ?? '')
+      .join('');
+    try {
+      const opus = runCli(path.join(root, 'home'), [
+        'spawn', '--agent', 'claude', '--terminal', 'cmux',
+      ], { PATH: fixture.pathValue, SWARM_T8_CMUX_LOG: fixture.log });
+      assert.strictEqual(opus.status, 0, opus.stderr || opus.stdout);
+      assert.ok(readPayloads().includes('--model opus'), 'claude spawn must default to --model opus');
+
+      fs.writeFileSync(fixture.log, '');
+      const explicit = runCli(path.join(root, 'home'), [
+        'spawn', '--agent', 'claude', '--terminal', 'cmux', '--model', 'fable',
+      ], { PATH: fixture.pathValue, SWARM_T8_CMUX_LOG: fixture.log });
+      assert.strictEqual(explicit.status, 0, explicit.stderr || explicit.stdout);
+      assert.ok(readPayloads().includes('--model fable'), '--model must pass through for claude');
+
+      fs.writeFileSync(fixture.log, '');
+      const codex = runCli(path.join(root, 'home'), [
+        'spawn', '--agent', 'codex', '--terminal', 'cmux', '--model', 'gpt-5.6-sol',
+      ], { PATH: fixture.pathValue, SWARM_T8_CMUX_LOG: fixture.log });
+      assert.strictEqual(codex.status, 0, codex.stderr || codex.stdout);
+      assert.ok(readPayloads().includes('-m gpt-5.6-sol'), '--model must pass through as -m for codex');
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test('spawn default remains a surface in the caller workspace', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-spawn-tab-'));
     const fixture = fakeCmux(root);

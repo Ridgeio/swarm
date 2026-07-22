@@ -509,6 +509,127 @@ describe('board v2 static assets', () => {
 });
 
 describe('board v2 SSE stream', () => {
+  test('rejects a bad Host header and accepts the page-minted cookie', async context => {
+    const running = await startOrSkip(context, {
+      db: null,
+      swarmId: 'default',
+      projection: () => boardFixture(),
+    });
+    if (!running) return;
+    try {
+      const badHost = await request(running, '/api/events', { host: 'attacker.test', token: running.token });
+      assert.strictEqual(badHost.status, 403);
+
+      const page = await request(running, '/');
+      const cookie = String(page.headers['set-cookie'] ?? '');
+      assert.match(cookie, /swarm_board=[a-f0-9]{64}; HttpOnly; SameSite=Strict/);
+
+      const viaCookie = await new Promise<number>((resolve, reject) => {
+        const outgoing = http.request({
+          hostname: '127.0.0.1',
+          port: running.port,
+          path: '/api/events',
+          headers: {
+            Host: `127.0.0.1:${running.port}`,
+            Cookie: `swarm_board=${running.token}`,
+          },
+        }, response => {
+          resolve(response.statusCode ?? 0);
+          outgoing.destroy();
+        });
+        outgoing.on('error', reject);
+        outgoing.end();
+      });
+      assert.strictEqual(viaCookie, 200);
+    } finally {
+      await running.close();
+    }
+  });
+
+  test('emits a second snapshot when the change stamp moves, with per-connection seq', async context => {
+    let stamp = 'a';
+    let generation = 0;
+    const running = await startOrSkip(context, {
+      db: null,
+      swarmId: 'default',
+      projection: () => ({ ...boardFixture(), generatedAt: `gen-${generation}` }),
+    });
+    if (!running) return;
+    // Drive the stamp via a fake db-less projection: with db null, changeStamp
+    // returns null every tick, which the server treats as "cannot compare" and
+    // re-emits — so a second frame MUST arrive within ~2s.
+    void stamp;
+    try {
+      const frames = await new Promise<string[]>((resolve, reject) => {
+        const seen: string[] = [];
+        const outgoing = http.request({
+          hostname: '127.0.0.1',
+          port: running.port,
+          path: `/api/events?token=${encodeURIComponent(running.token)}`,
+          headers: { Host: `127.0.0.1:${running.port}` },
+        }, response => {
+          response.setEncoding('utf-8');
+          let buffered = '';
+          response.on('data', piece => {
+            buffered += piece;
+            generation += 1;
+            const matches = [...buffered.matchAll(/data: (\{.*\})\n/g)];
+            if (matches.length >= 2) {
+              resolve(matches.slice(0, 2).map(match => match[1]));
+              outgoing.destroy();
+            }
+          });
+          response.on('error', () => { /* destroyed after resolve */ });
+        });
+        outgoing.on('error', reject);
+        outgoing.end();
+        setTimeout(() => reject(new Error('no second frame within 8s')), 8_000);
+      });
+      const first = JSON.parse(frames[0]);
+      const second = JSON.parse(frames[1]);
+      assert.strictEqual(first.seq, 1);
+      assert.strictEqual(second.seq, 2);
+      assert.strictEqual(first.streamId, second.streamId);
+    } finally {
+      await running.close();
+    }
+  });
+
+  test('caps concurrent SSE clients and close() does not hang on open streams', async context => {
+    const running = await startOrSkip(context, {
+      db: null,
+      swarmId: 'default',
+      projection: () => boardFixture(),
+    });
+    if (!running) return;
+    const sockets: http.ClientRequest[] = [];
+    const openStream = () => new Promise<number>((resolve, reject) => {
+      const outgoing = http.request({
+        hostname: '127.0.0.1',
+        port: running.port,
+        path: `/api/events?token=${encodeURIComponent(running.token)}`,
+        headers: { Host: `127.0.0.1:${running.port}` },
+      }, response => resolve(response.statusCode ?? 0));
+      outgoing.on('error', reject);
+      outgoing.end();
+      sockets.push(outgoing);
+    });
+    try {
+      const statuses: number[] = [];
+      for (let index = 0; index < 9; index += 1) statuses.push(await openStream());
+      assert.deepStrictEqual(statuses.slice(0, 8), Array(8).fill(200));
+      assert.strictEqual(statuses[8], 503);
+      // close() must destroy the 8 live streams instead of waiting forever.
+      await Promise.race([
+        running.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('close() hung on SSE streams')), 5_000)),
+      ]);
+    } finally {
+      for (const socket of sockets) socket.destroy();
+      await running.close().catch(() => undefined);
+    }
+  });
+
   test('requires a token, then streams an initial snapshot frame with epoch and seq', async context => {
     const fixture = boardFixture();
     const running = await startOrSkip(context, {

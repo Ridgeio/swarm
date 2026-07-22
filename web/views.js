@@ -38,9 +38,9 @@ export function App({ state, actions }) {
     ${NeedsYou({ state, actions })}
     ${Roster({ state, actions })}
     ${Lanes({ state, actions })}
-    ${state.selection ? Inspector({ state, actions }) : null}
-    ${state.paletteOpen ? Palette({ state, actions }) : null}
-    ${state.helpOpen ? HelpOverlay({ actions }) : null}
+    ${state.selection ? html`<${Inspector} state=${state} actions=${actions} />` : null}
+    ${state.paletteOpen ? html`<${Palette} state=${state} actions=${actions} />` : null}
+    ${state.helpOpen ? html`<${HelpOverlay} actions=${actions} />` : null}
   </div>`;
 }
 
@@ -90,7 +90,7 @@ function NeedsYou({ state, actions }) {
           onClick=${() => actions.jumpToNeed(need)}>
         <span class="kind">${NEED_KIND_LABELS[need.kind] ?? need.kind}</span>
         <span class="label">${need.label}</span>
-        <span class="age">↵</span>
+        <span class="age num">${need.at ? ageLabel(need.at) : ''}${need.target ? ' ↵' : ''}</span>
       </button>`)}
     </div>
   </section>`;
@@ -255,7 +255,7 @@ export function Inspector({ state, actions }) {
       <div class="inspector-body">
         ${agent ? AgentDetail({ agent }) : TaskDetail({ task })}
         <h3>Events (${events.length})</h3>
-        ${EventFeed({ events })}
+        <${EventFeed} key=${selection.kind + ':' + selection.id} events=${events} />
       </div>
     </aside>
   <//>`;
@@ -305,6 +305,7 @@ export function EventFeed({ events }) {
   const [following, setFollowing] = useState(true);
   const [pendingCount, setPendingCount] = useState(0);
   const frame = useRef(0);
+  const lastMaxId = useRef(0);
 
   const recompute = () => {
     const viewport = viewportRef.current;
@@ -322,17 +323,22 @@ export function EventFeed({ events }) {
     frame.current = requestAnimationFrame(recompute);
   };
 
+  const maxId = events.reduce((max, event) => Math.max(max, event.id ?? 0), 0);
   useEffect(() => {
     const viewport = viewportRef.current;
     if (!viewport) return;
+    // Track appended events by ID, not by array length — the 200-event
+    // window can slide (drop head + append tail) at constant length.
+    const appended = events.filter(event => (event.id ?? 0) > lastMaxId.current).length;
+    lastMaxId.current = maxId;
     if (following) {
       viewport.scrollTop = viewport.scrollHeight;
-    } else {
-      setPendingCount(count => count + 1);
+    } else if (appended > 0) {
+      setPendingCount(count => count + appended);
     }
     recompute();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [events.length]);
+  }, [maxId, events.length]);
 
   const resume = () => {
     const viewport = viewportRef.current;
@@ -408,7 +414,7 @@ export function HelpOverlay({ actions }) {
         <tr><td>/</td><td>jump palette</td></tr>
         <tr><td>j / k</td><td>move cursor</td></tr>
         <tr><td>Enter</td><td>open inspector</td></tr>
-        <tr><td>Tab</td><td>next section</td></tr>
+        <tr><td>s</td><td>next section</td></tr>
         <tr><td>f</td><td>toggle flow lens</td></tr>
         <tr><td>Esc</td><td>close / back</td></tr>
         <tr><td>?</td><td>this help</td></tr>

@@ -168,6 +168,10 @@ export interface BoardNeedData {
   kind: string;
   label: string;
   refId: string;
+  /** Typed navigation target — the board jumps here on activation. */
+  target: { kind: 'agent' | 'task'; id: string } | null;
+  /** When the underlying condition arose, when knowable. */
+  at: string | null;
 }
 
 export interface BoardDebrisFinding {
@@ -688,7 +692,7 @@ export function collectBoardData(
   if (available('messages', 'message_deliveries', 'agents')) {
     try {
       const deliveries = database!.prepare(`
-        SELECT m.id, m.kind, m.from_agent, m.body, COALESCE(d.recipient, m.to_agent) AS recipient
+        SELECT m.id, m.kind, m.from_agent, m.body, m.created_at, COALESCE(d.recipient, m.to_agent) AS recipient
         FROM messages m
         LEFT JOIN message_deliveries d
           ON m.id = d.message_id AND m.swarm_id = d.swarm_id
@@ -707,6 +711,7 @@ export function collectBoardData(
         kind: string;
         from_agent: string;
         body: string;
+        created_at: string;
         recipient: string;
       }>;
       for (const delivery of deliveries) {
@@ -715,6 +720,8 @@ export function collectBoardData(
           label: `message #${delivery.id} [${delivery.kind}] for ${delivery.recipient} from ${delivery.from_agent} \u2014 ` +
             flattenLine(delivery.body),
           refId: String(delivery.id),
+          target: { kind: 'agent', id: delivery.recipient },
+          at: delivery.created_at,
         });
       }
     } catch {
@@ -746,6 +753,10 @@ export function collectBoardData(
           label: `grant #${grant.id} ${grant.op} on ${grant.resource} expires in ${expiresIn}m — ` +
             `to ${grant.granted_to ?? 'any'}`,
           refId: String(grant.id),
+          target: tasks.some(task => task.id === grant.resource)
+            ? { kind: 'task', id: grant.resource }
+            : null,
+          at: null,
         });
       }
     } catch {
@@ -759,6 +770,8 @@ export function collectBoardData(
         kind: 'awaiting_review',
         label: `task ${task.id} awaits review \u2014 ${task.owner ?? 'unowned'}(${task.leaseEpoch})`,
         refId: task.id,
+        target: { kind: 'task', id: task.id },
+        at: null,
       });
     }
     const activeByCreatedAt = tasks
@@ -772,6 +785,8 @@ export function collectBoardData(
         kind: 'stalled',
         label: `task ${task.id} stalled \u2014 ${evidence}`,
         refId: task.id,
+        target: { kind: 'task', id: task.id },
+        at: task.checkpoint?.path ? null : task.createdAt,
       });
     }
   }
@@ -792,6 +807,8 @@ export function collectBoardData(
             kind: 'janitor_stale',
             label: `janitor heartbeat stale \u2014 tick ${boardAgeLabel(janitor.last_tick_at, now)} ago`,
             refId: 'janitor',
+            target: null,
+            at: janitor.last_tick_at,
           });
         }
       }
@@ -835,18 +852,24 @@ export function collectBoardData(
               `${String(detail.from ?? 'unknown')} → ${String(detail.to ?? 'unknown')} — ` +
               `requalify via ${String(detail.runbook ?? 'docs/runbooks/requalify-worker.md')}`,
             refId: finding.path,
+            target: null,
+            at: finding.lastSeenAt,
           });
         } else if (finding.kind === 'control-retest-due') {
           needsYou.push({
             kind: finding.kind,
             label: `control ${String(detail.id ?? finding.path)} retest due ${String(detail.retest_by ?? 'unknown')}`,
             refId: finding.path,
+            target: null,
+            at: finding.lastSeenAt,
           });
         } else if (finding.kind === 'controls-file-invalid') {
           needsYou.push({
             kind: finding.kind,
             label: `controls registry invalid — ${finding.path}`,
             refId: finding.path,
+            target: null,
+            at: finding.lastSeenAt,
           });
         }
       }

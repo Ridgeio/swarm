@@ -35,8 +35,12 @@ export function createStore() {
 // ── status derivation (P2: tiny vocabulary) ───────────────
 
 export function agentStatus(agent, needsYou, now = Date.now()) {
-  const needsRefs = new Set((needsYou ?? []).map(need => need.refId));
-  if (needsRefs.has(agent.name) || agent.unackedCount > 0) return 'needs-you';
+  // Only needs with a TYPED agent target mark the agent (an untyped refId
+  // like message id "42" must never light up an agent named "42"). Unread
+  // mail alone renders as the mail chip, not as needs-you.
+  const targeted = (needsYou ?? []).some(need =>
+    need.target?.kind === 'agent' && need.target.id === agent.name);
+  if (targeted) return 'needs-you';
   const heartbeatAgeMin = ageMinutes(agent.lastHeartbeat, now);
   if (agent.agentType === 'cmux' && heartbeatAgeMin !== null && heartbeatAgeMin > STALE_HEARTBEAT_MIN) {
     return 'stale';
@@ -57,12 +61,15 @@ export function rosterRows(board, selection, now = Date.now()) {
   decorated.sort((a, b) =>
     (STATUS_RANK[a.status] - STATUS_RANK[b.status]) ||
     a.agent.name.localeCompare(b.agent.name));
-  const idle = decorated.filter(row => row.status === 'idle' &&
-    !(selection?.kind === 'agent' && selection.id === row.agent.name));
+  // Threshold on the TOTAL idle count (a selected idle agent keeps its own
+  // row but still counts toward the threshold, so the rest stay collapsed).
+  const idle = decorated.filter(row => row.status === 'idle');
   if (idle.length > IDLE_COLLAPSE_THRESHOLD) {
+    const hidden = idle.filter(row =>
+      !(selection?.kind === 'agent' && selection.id === row.agent.name));
     return {
-      rows: decorated.filter(row => !idle.includes(row)),
-      collapsedIdle: idle.map(row => row.agent.name),
+      rows: decorated.filter(row => !hidden.includes(row)),
+      collapsedIdle: hidden.map(row => row.agent.name),
     };
   }
   return { rows: decorated, collapsedIdle: [] };
@@ -70,26 +77,39 @@ export function rosterRows(board, selection, now = Date.now()) {
 
 // ── timeline semantics (P4: group spans) ──────────────────
 
-const SPAN_GROUPS = [
-  { match: kind => kind === 'refused_stale_epoch' || kind.startsWith('refused'), out: 'refused', shape: 'dot' },
-  { match: kind => kind === 'handoff' || kind === 'escalated', out: 'handoff', shape: 'dot' },
-  { match: kind => kind === 'review_requested' || kind === 'review_verdict', out: 'review', shape: 'bar' },
-  { match: kind => kind === 'closed', out: 'closed', shape: 'bar' },
-  { match: () => true, out: 'progress', shape: 'bar' },
-];
-
-/** Compress a task's raw events into Temporal-style outcome spans. */
+/**
+ * Temporal-style semantic compression: ONE bar per lease epoch (attempt),
+ * colored by that attempt's outcome (closed > review > progress), with
+ * refusals and handoffs/escalations as aggregated dots beside it. Chronology
+ * reads left-to-right by epoch, not by raw event adjacency.
+ */
 export function taskSpans(events) {
-  const spans = [];
+  const epochs = new Map();
   for (const event of events) {
-    const group = SPAN_GROUPS.find(candidate => candidate.match(event.kind));
-    const last = spans[spans.length - 1];
-    if (last && last.group === group.out) {
-      last.count += 1;
-      last.lastAt = event.at;
-    } else {
-      spans.push({ group: group.out, shape: group.shape, count: 1, firstAt: event.at, lastAt: event.at });
+    const key = event.epoch ?? 0;
+    if (!epochs.has(key)) {
+      epochs.set(key, { events: 0, refused: 0, handoff: 0, review: false, closed: false, firstAt: event.at, lastAt: event.at });
     }
+    const bucket = epochs.get(key);
+    bucket.events += 1;
+    bucket.lastAt = event.at;
+    if (event.kind.startsWith('refused')) bucket.refused += 1;
+    else if (event.kind === 'handoff' || event.kind === 'escalated') bucket.handoff += 1;
+    else if (event.kind === 'review_requested' || event.kind === 'review_verdict') bucket.review = true;
+    else if (event.kind === 'closed') bucket.closed = true;
+  }
+  const spans = [];
+  for (const [epoch, bucket] of [...epochs.entries()].sort((a, b) => a[0] - b[0])) {
+    spans.push({
+      group: bucket.closed ? 'closed' : bucket.review ? 'review' : 'progress',
+      shape: 'bar',
+      epoch,
+      count: bucket.events,
+      firstAt: bucket.firstAt,
+      lastAt: bucket.lastAt,
+    });
+    if (bucket.handoff > 0) spans.push({ group: 'handoff', shape: 'dot', epoch, count: bucket.handoff, firstAt: bucket.lastAt, lastAt: bucket.lastAt });
+    if (bucket.refused > 0) spans.push({ group: 'refused', shape: 'dot', epoch, count: bucket.refused, firstAt: bucket.lastAt, lastAt: bucket.lastAt });
   }
   return spans;
 }
@@ -165,8 +185,10 @@ export function flowGraph(board, taskId) {
     }
   }
   for (const claim of board.edges.claims.filter(edge => edge.taskId === taskId)) {
-    if (!left.some(node => node.id === claim.from) && !right.some(node => node.id === claim.from)) {
-      right.push({ id: claim.from, label: claim.from, role: 'claimant' });
+    // Projection semantics: {from: previous owner, to: claimant}.
+    if (claim.to && claim.to !== task.owner &&
+        !left.some(node => node.id === claim.to) && !right.some(node => node.id === claim.to)) {
+      right.push({ id: claim.to, label: claim.to, role: 'claimant' });
     }
   }
   const edges = [

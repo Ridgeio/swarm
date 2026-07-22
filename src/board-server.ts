@@ -320,25 +320,27 @@ const SSE_HEARTBEAT_MS = 12_000;
 const SSE_POLL_MS = 1_000;
 const SSE_FORCED_SNAPSHOT_MS = 30_000;
 
-interface ChangeStamp { events: number; messages: number; heartbeat: string }
-
-function changeStamp(db: SwarmDb | null, swarmId: string): ChangeStamp | null {
-  try {
-    const row = db?.prepare(`
-      SELECT
-        (SELECT COALESCE(MAX(id), 0) FROM task_events WHERE swarm_id = ?) AS events,
-        (SELECT COALESCE(MAX(id), 0) FROM messages WHERE swarm_id = ?) AS messages,
-        (SELECT COALESCE(MAX(last_heartbeat), '') FROM agents WHERE swarm_id = ?) AS heartbeat
-    `).get(swarmId, swarmId, swarmId) as ChangeStamp | undefined;
-    return row ?? null;
-  } catch {
-    return null;
-  }
-}
-
-function stampsEqual(a: ChangeStamp | null, b: ChangeStamp | null): boolean {
-  return a !== null && b !== null &&
-    a.events === b.events && a.messages === b.messages && a.heartbeat === b.heartbeat;
+/** One value per projected source; any table absence degrades to a constant. */
+function changeStamp(db: SwarmDb | null, swarmId: string): string | null {
+  const scalar = (sql: string, ...params: string[]): string => {
+    try {
+      const row = db?.prepare(sql).get(...params) as Record<string, unknown> | undefined;
+      return String(row ? Object.values(row)[0] : '');
+    } catch {
+      return '';
+    }
+  };
+  if (!db) return null;
+  const parts = [
+    scalar('SELECT COALESCE(MAX(id), 0) FROM task_events WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COALESCE(MAX(id), 0) FROM messages WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COALESCE(MAX(last_heartbeat), \'\') FROM agents WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COUNT(*) FROM agents WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COALESCE(MAX(acked_at), \'\') FROM message_deliveries WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COALESCE(MAX(id), 0) || \':\' || COALESCE(MAX(revoked_at), \'\') FROM grants WHERE swarm_id = ?', swarmId),
+    scalar('SELECT COALESCE(MAX(last_tick_at), \'\') FROM janitor_status'),
+  ];
+  return parts.join('|');
 }
 
 function makeRequestHandler(
@@ -352,7 +354,6 @@ function makeRequestHandler(
   const projection = options.projection ?? collectBoardData;
   const now = options.now ?? Date.now;
   const streamId = randomBytes(8).toString('hex');
-  let seq = 0;
 
   return async (request, response) => {
     if (!hostAllowed(request.headers.host, getPort())) {
@@ -373,7 +374,13 @@ function makeRequestHandler(
       const header = request.headers['x-swarm-token'];
       const headerToken = Array.isArray(header) ? null : header;
       const queryToken = parsed.searchParams.get('token');
-      if (!tokenMatches(headerToken, token) && !tokenMatches(queryToken, token)) {
+      // Cookie auth exists for EventSource, which cannot set headers; the
+      // cookie is minted by the / page (HttpOnly, SameSite=Strict) so the
+      // token stays out of stream URLs and network diagnostics.
+      const cookieHeader = request.headers.cookie ?? '';
+      const cookieToken = /(?:^|;\s*)swarm_board=([a-f0-9]+)/.exec(cookieHeader)?.[1] ?? null;
+      if (!tokenMatches(headerToken, token) && !tokenMatches(queryToken, token) &&
+          !tokenMatches(cookieToken, token)) {
         send(response, 401, 'application/json; charset=utf-8', JSON.stringify({
           error: 'Missing or invalid swarm board token.',
         }), { 'Cache-Control': 'no-store' });
@@ -400,39 +407,58 @@ function makeRequestHandler(
       });
       sseClients.add(response);
 
-      const emitSnapshot = (): void => {
+      // Snapshot-stream contract (design Addendum A): every frame is a FULL
+      // self-superseding snapshot, so there is no replay ring and no `after`
+      // cursor — reconnect correctness is "adopt the next snapshot". seq is
+      // per-connection (ordering within this stream only); streamId is the
+      // server epoch so clients can detect a daemon restart.
+      let seq = 0;
+      const emitSnapshot = (): boolean => {
         try {
           const board = projection(options.db, options.swarmId, { now: now() });
+          const frame = JSON.stringify({ streamId, seq: seq + 1, board });
+          if (Buffer.byteLength(frame, 'utf-8') > BOARD_SERVER_MAX_JSON_BYTES) return false;
           seq += 1;
-          const frame = JSON.stringify({ streamId, seq, board });
-          if (Buffer.byteLength(frame, 'utf-8') > BOARD_SERVER_MAX_JSON_BYTES) return;
           // A slow client that cannot drain gets disconnected rather than
           // buffered without bound (research: SSE backpressure is ours to own).
           const writable = response.write(`id: ${seq}\nevent: snapshot\ndata: ${frame}\n\n`);
           if (!writable && response.writableLength > BOARD_SERVER_MAX_JSON_BYTES * 2) {
             response.destroy();
+            return false;
           }
+          return true;
         } catch {
-          // Projection failures are transient (e.g. mid-migration); the next
-          // tick retries and heartbeats keep the stream alive meanwhile.
+          // Projection failures are transient (e.g. mid-migration); returning
+          // false leaves the change pending so the next tick retries.
+          return false;
         }
       };
 
-      let lastStamp = changeStamp(options.db, options.swarmId);
-      let lastEmit = Date.now();
-      emitSnapshot();
+      let lastStamp: string | null = null;
+      let lastEmit = 0;
+      if (emitSnapshot()) {
+        lastStamp = changeStamp(options.db, options.swarmId);
+        lastEmit = Date.now();
+      }
 
       const poller = setInterval(() => {
         const stamp = changeStamp(options.db, options.swarmId);
         const forced = Date.now() - lastEmit >= SSE_FORCED_SNAPSHOT_MS;
-        if (forced || !stampsEqual(stamp, lastStamp)) {
-          lastStamp = stamp;
-          lastEmit = Date.now();
-          emitSnapshot();
+        if (forced || stamp === null || stamp !== lastStamp) {
+          // Advance the high-water marks only when the emit succeeded, so a
+          // transient projection failure retries instead of losing the change.
+          if (emitSnapshot()) {
+            lastStamp = stamp;
+            lastEmit = Date.now();
+          }
         }
       }, SSE_POLL_MS);
       const heartbeat = setInterval(() => {
-        response.write(`: heartbeat ${seq}\n\n`);
+        try {
+          response.write(`: heartbeat ${seq}\n\n`);
+        } catch {
+          response.destroy();
+        }
       }, SSE_HEARTBEAT_MS);
 
       const cleanup = (): void => {
@@ -497,7 +523,12 @@ function makeRequestHandler(
           throw new Error('board token placeholder is missing');
         }
         const html = template.replaceAll(BOARD_SERVER_TOKEN_PLACEHOLDER, token);
-        send(response, 200, 'text/html; charset=utf-8', html, { 'Cache-Control': 'no-store' });
+        send(response, 200, 'text/html; charset=utf-8', html, {
+          'Cache-Control': 'no-store',
+          // EventSource cannot set headers; this cookie authenticates the
+          // stream without putting the token in the URL.
+          'Set-Cookie': `swarm_board=${token}; HttpOnly; SameSite=Strict; Path=/`,
+        });
       } catch {
         sendText(response, 500, 'Board page is unavailable. Reinstall or rebuild swarm.');
       }

@@ -13,7 +13,7 @@ Replaces the v1 served board (Cytoscape graph + right rail + ECharts timeline), 
 ## Design principles (from research synthesis)
 
 - **P1 Attention first.** The board's job, in priority order: (1) what needs the human NOW, (2) what changed since they last looked, (3) what is everyone doing, (4) archaeology. Layout and sort order follow that priority everywhere.
-- **P2 Tiny status vocabulary.** Exactly five agent states: `working / needs-you / failed / done / idle`. One color each, used identically in every view. No second palette.
+- **P2 Tiny status vocabulary.** Agents have exactly four states: `working / needs-you / stale / idle` (agents have no data source for "failed"/"done" — those are TASK outcomes, which keep their own chip vocabulary). One color each, used identically in every view; status is always hue + text, never hue alone, at every width. (Amended post-review r1: the original five-state list mixed agent and task vocabularies.)
 - **P3 Idle-collapse.** Idle agents collapse to one "N idle" row when >3; working/failed/selected rows never collapse (Claude Code agent-panel mechanics, copied deliberately).
 - **P4 Semantic compression on timelines.** Task events group into outcome-colored spans (started→checkpoints→closed = one bar; refusals = attempt-count badge; instantaneous events = dots) — Temporal's group-span model. Raw events one click below.
 - **P5 One surface, two lenses.** Structure (who owns what, handoffs) and execution (what's happening) are toggled lenses over the same selection state, never separate pages. Selecting a task in ANY lens selects it everywhere.
@@ -87,10 +87,20 @@ Dark-first, terminal-adjacent: monospace numerals, high-contrast status hues on 
 ## Addendum A — stack (locked 2026-07-22, per OUT-ui-frontend.md)
 
 - **UI:** Preact 10.29.x + HTM 3.1.1, vendored browser ES modules, no build step, no JSX. One normalized store; render notifications batched to requestAnimationFrame.
-- **Transport:** ONE multiplexed SSE stream (`/api/events?after=<seq>`) with epoch (`streamId`) + monotonic `seq`, comment heartbeats ~12s, bounded server replay ring; snapshot via `/api/board`; commands stay plain POST. Client: snapshot → open stream at snapshot.seq; discard `seq <= lastSeq`; refetch on gap/reset/epoch change; native EventSource reconnect (no second instance while CONNECTING). Polling fallback 2s visible / 20s hidden, AbortController, no overlap.
+- **Transport (snapshot-stream contract, amended post-review r1):** ONE SSE stream (`/api/events`), authenticated by an HttpOnly SameSite=Strict cookie minted by the `/` page (EventSource cannot set headers; the token never appears in URLs). Every frame is a FULL self-superseding board snapshot — deliberately NOT a delta/replay protocol: at fleet scale (<50 agents) a coalesced snapshot every ≥1s is smaller than the machinery to patch, and reconnect correctness is simply "adopt the next snapshot". `streamId` = server epoch (daemon restart detection); `seq` is per-connection and strictly monotonic (stale-duplicate guard only). Comment heartbeats ~12s; slow clients are disconnected rather than buffered; change detection covers every projected source (task events, messages, deliveries/acks, agent heartbeats and membership, grants, janitor ticks) and only advances its high-water mark on successful emits. Polling fallback (2s visible / 20s hidden, single generation, no overlap) engages when EventSource is missing, throws, closes, or goes silent past the 45s watchdog. The `after=<seq>` replay-ring design is the documented escalation if fleet size ever makes full snapshots expensive.
 - **CSS:** hand-written dark-first tokens (Open Props borrowed as reference, not vendored wholesale); system fonts; 26px fixed rows; tabular numerals; `color-scheme`; status = hue + text/icon (never hue alone); `prefers-reduced-motion` honored.
 - **Timeline:** CSS Grid swimlanes (chronology) — NOT a graph widget. Per-task flow lens: hand-laid SVG (<10 nodes, 3-column layered); d3-dag is the named escalation if topology grows.
 - **Feed:** hand-rolled fixed-row virtualizer (spacer + translateY, rAF-coalesced passive scroll, keyed by event id, ring-buffer bounded); tail-follow releases when scrolled up ("N new events" resume chip); log text rendered as text nodes only (no innerHTML); TanStack Virtual is the named escalation for variable-height rows.
 - **CSP (tightened from v1):** default-src 'none'; script-src 'self'; script-src-attr 'none'; style-src 'self'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'. No inline anything; virtualizer positions via DOM style properties (allowed under style-src-attr 'none').
 - **Vendoring:** vendor-lock manifest with upstream URL + SHA-256 per artifact; release script scans built assets for http(s):// references; no service worker.
 - **Authorship (model inversion):** claude authors; codex (gpt-5.6-sol xhigh) adversarial-reviews with the claude-author prior (hunt missing behavior first).
+
+## Known limits (accepted post-review r1, revisit if felt)
+
+- Feed anchor preservation across head-eviction of the 200-event window is not
+  implemented (appended-count tracking is): a scrolled-up reader can see a
+  one-row shift when the window slides. Escalation: anchor by top-visible
+  event id.
+- Cursor navigation (j/k) skips the collapsed-idle row; native Tab reaches it.
+- Digest scope is the 200-event window; a very long absence shows needs-you
+  items plus the newest events only (truncation is not yet labeled).

@@ -552,7 +552,10 @@ button:focus-visible, [tabindex]:focus-visible, a:focus-visible {
   .agent-row .summary { display: none; }
   .lane-head .meta { margin-left: 0; width: 100%; }
   .inspector { width: 100vw; }
-  .status-word { display: none; }
+  /* Status stays hue + WORD even when narrow (never hue alone); the
+     agent-type metadata is what gets dropped instead. */
+  .status-word { width: auto; }
+  .agent-row .meta { display: none; }
 }
 
 @media (prefers-reduced-motion: no-preference) {

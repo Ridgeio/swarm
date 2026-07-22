@@ -540,6 +540,8 @@ describe('T2.5 board projection', () => {
         kind: 'escalation',
         label: `message #${Number(escalation.lastInsertRowid)} [escalation] for Lead from Lead — /tmp/pointer-only.md`,
         refId: String(escalation.lastInsertRowid),
+        target: { kind: 'agent', id: 'Lead' },
+        at: new Date(NOW - 500).toISOString(),
       });
       const grantNeeds = data.needsYou.filter(item => item.kind === 'grant_expiring');
       assert.strictEqual(grantNeeds.length, 1);

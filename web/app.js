@@ -15,7 +15,12 @@ function parseHash() {
   const raw = location.hash.replace(/^#/, '');
   if (!raw) return null;
   const [kind, ...rest] = raw.split(':');
-  const id = decodeURIComponent(rest.join(':'));
+  let id;
+  try {
+    id = decodeURIComponent(rest.join(':'));
+  } catch {
+    return null; // malformed percent-escapes must not abort snapshot handling
+  }
   return (kind === 'agent' || kind === 'task') && id ? { kind, id } : null;
 }
 
@@ -50,9 +55,9 @@ const actions = {
     store.update({ lens: store.get().lens === 'flow' ? 'spans' : 'flow' });
   },
   jumpToNeed(need) {
-    const board = store.get().board;
-    if (board?.agents.some(agent => agent.name === need.refId)) actions.selectAgent(need.refId);
-    else if (board?.tasks.some(task => task.id === need.refId)) actions.selectTask(need.refId);
+    // Typed navigation target from the projection — never guessed from refId.
+    if (need.target?.kind === 'agent') actions.selectAgent(need.target.id);
+    else if (need.target?.kind === 'task') actions.selectTask(need.target.id);
   },
   async focusAgent(name) {
     const result = await postFocusAgent(token, name);
@@ -162,7 +167,9 @@ document.addEventListener('keydown', event => {
     case '?': actions.openHelp(); break;
     case 'j': case 'ArrowDown': moveCursor(1); event.preventDefault(); break;
     case 'k': case 'ArrowUp': moveCursor(-1); event.preventDefault(); break;
-    case 'Tab': nextSection(); event.preventDefault(); break;
+    // Native Tab stays native — buttons and inspector actions must remain
+    // reachable by keyboard. Section jump lives on 's'.
+    case 's': nextSection(); break;
     case 'Enter': activateCursor(); break;
     case 'f': if (state.selection?.kind === 'task') actions.toggleLens(); break;
     case 'Escape': actions.closeInspector(); break;
@@ -170,10 +177,42 @@ document.addEventListener('keydown', event => {
   }
 });
 
+// Keep the keyboard cursor visible as it moves.
+store.subscribe(state => {
+  if (!state.cursor) return;
+  requestAnimationFrame(() => {
+    document.querySelector('.is-cursor')?.scrollIntoView({ block: 'nearest' });
+  });
+});
+
 // ── transport wiring ──────────────────────────────────────
 
-const lastSeen = loadLastSeen(localStorage);
+// Property ACCESS on localStorage can itself throw (SecurityError in some
+// embeddings); the board must still render storage-free.
+let storage = null;
+try { storage = window.localStorage; } catch { storage = null; }
+
+let lastSeen = storage ? loadLastSeen(storage) : null;
 let digestComputed = false;
+
+// P8: "last seen" advances only while the tab is VISIBLE — a hidden tab
+// receiving snapshots must not erase what the operator hasn't seen. On
+// return from >10 min hidden, the digest recomputes against the frozen
+// cursor.
+function markSeen(board) {
+  if (document.visibilityState !== 'visible' || !storage) return;
+  saveLastSeen(storage, maxEventId(board));
+  lastSeen = { at: Date.now(), maxEventId: maxEventId(board) };
+}
+
+document.addEventListener('visibilitychange', () => {
+  const state = store.get();
+  if (document.visibilityState === 'visible' && state.board) {
+    const digest = computeDigest(state.board, lastSeen);
+    if (digest) store.update({ digest, digestDismissed: false });
+    markSeen(state.board);
+  }
+});
 
 connectLive({
   token,
@@ -186,7 +225,7 @@ connectLive({
       if (initial) patch.selection = initial;
     }
     store.update(patch);
-    saveLastSeen(localStorage, maxEventId(board));
+    markSeen(board);
   },
   onStatus(connection) {
     if (connection !== store.get().connection) store.update({ connection });
@@ -194,8 +233,9 @@ connectLive({
 });
 
 window.addEventListener('hashchange', () => {
-  const selection = parseHash();
-  if (selection) store.update({ selection });
+  // Apply the parsed value INCLUDING null so clearing the hash clears the
+  // selection.
+  store.update({ selection: parseHash() });
 });
 
 // ── render loop (one paint per frame) ─────────────────────
@@ -207,9 +247,11 @@ function paint() {
   render(h(App, { state: store.get(), actions }), root);
 }
 store.subscribe(() => {
-  if (!scheduled) {
-    scheduled = true;
-    requestAnimationFrame(paint);
-  }
+  if (scheduled) return;
+  scheduled = true;
+  // rAF never fires in hidden tabs, which would freeze the DOM until the tab
+  // is next visible; fall back to a timer so background tabs stay current.
+  if (document.visibilityState === 'hidden') setTimeout(paint, 150);
+  else requestAnimationFrame(paint);
 });
 paint();

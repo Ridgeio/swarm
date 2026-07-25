@@ -17,9 +17,21 @@ export function resolveCmux(): string {
 
   // 1. Check PATH
   try {
-    cachedCmuxPath = execFileSync('which', ['cmux']).toString().trim();
+    cachedCmuxPath = execFileSync('which', ['cmux'], {
+      timeout: 5_000,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }).toString().trim();
+    if (!cachedCmuxPath) throw new Error('which returned empty');
     return cachedCmuxPath;
-  } catch {}
+  } catch (err: any) {
+    if (err?.code === 'ETIMEDOUT') {
+      throw new Error(
+        'Timed out resolving cmux on PATH after 5s (possible hanging which/shim). ' +
+        'Not falling back to the bundled binary — fix PATH or set an explicit cmux path. ' +
+        `PATH=${process.env.PATH}`
+      );
+    }
+  }
 
   // 2. Known macOS app bundle path
   const bundled = '/Applications/cmux.app/Contents/Resources/bin/cmux';

@@ -1,5 +1,6 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert';
+import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -10,6 +11,137 @@ import {
   spawnSplitInWorkspace,
 } from '../src/transport.js';
 import { buildPushText, enterCountForDelivery, prefersNotifyDelivery, isCodexScreenIdle, PUSH_MAX_CHARS } from '../src/cmux-transport.js';
+
+const transportModuleUrl = new URL('../src/transport.ts', import.meta.url).href;
+
+function runTransportScript(script: string, pathValue: string, timeout: number) {
+  return spawnSync(
+    process.execPath,
+    ['--import', 'tsx', '--input-type=module', '--eval', script],
+    {
+      cwd: process.cwd(),
+      env: { ...process.env, PATH: pathValue },
+      encoding: 'utf8',
+      timeout,
+    }
+  );
+}
+
+function resolveCmuxInChild(pathValue: string, timeout: number = 9_000) {
+  return runTransportScript(`
+    const { resolveCmux } = await import(${JSON.stringify(transportModuleUrl)});
+    try {
+      const first = resolveCmux();
+      const second = resolveCmux();
+      process.stdout.write(first + '\\n' + second);
+    } catch (error) {
+      process.stderr.write(error instanceof Error ? error.message : String(error));
+      process.exitCode = 17;
+    }
+  `, pathValue, timeout);
+}
+
+describe('cmux subprocess bounds', () => {
+  test('a looping which fails loudly after five seconds without bundled fallback', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'swarm-looping-which-'));
+    const whichPath = join(fixtureDir, 'which');
+    writeFileSync(whichPath, '#!/bin/sh\nwhile :; do /bin/sleep 1; done\n');
+    chmodSync(whichPath, 0o755);
+
+    try {
+      const poisonedPath = `${fixtureDir}:${process.env.PATH ?? ''}`;
+      const startedAt = Date.now();
+      const result = resolveCmuxInChild(poisonedPath);
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.ifError(result.error);
+      assert.strictEqual(result.status, 17);
+      assert.ok(elapsedMs >= 4_000 && elapsedMs < 8_000, `elapsed ${elapsedMs}ms`);
+      assert.match(result.stderr, /Timed out resolving cmux/);
+      assert.ok(result.stderr.includes(`PATH=${poisonedPath}`), result.stderr);
+      assert.doesNotMatch(result.stdout, /Applications\/cmux\.app/);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a timeout is not cached and a subsequent resolution can succeed', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'swarm-recovering-which-'));
+    const whichPath = join(fixtureDir, 'which');
+    const invocationMarker = join(fixtureDir, 'first-invocation');
+    const recoveredCmuxPath = join(fixtureDir, 'recovered-cmux');
+    writeFileSync(whichPath, [
+      '#!/bin/sh',
+      `if test ! -e '${invocationMarker}'; then`,
+      `  /usr/bin/touch '${invocationMarker}'`,
+      '  while :; do /bin/sleep 1; done',
+      'fi',
+      `printf '%s\\n' '${recoveredCmuxPath}'`,
+      '',
+    ].join('\n'));
+    chmodSync(whichPath, 0o755);
+
+    try {
+      const poisonedPath = `${fixtureDir}:${process.env.PATH ?? ''}`;
+      const result = runTransportScript(`
+        const { resolveCmux } = await import(${JSON.stringify(transportModuleUrl)});
+        try {
+          resolveCmux();
+        } catch (error) {
+          process.stderr.write((error instanceof Error ? error.message : String(error)) + '\\n');
+        }
+        process.stdout.write(resolveCmux());
+      `, poisonedPath, 9_000);
+
+      assert.ifError(result.error);
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.strictEqual(result.stdout, recoveredCmuxPath);
+      assert.match(result.stderr, /Timed out resolving cmux/);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a non-timeout which failure still falls through to bundled resolution', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'swarm-failing-which-'));
+    const whichPath = join(fixtureDir, 'which');
+    writeFileSync(whichPath, '#!/bin/sh\nexit 1\n');
+    chmodSync(whichPath, 0o755);
+
+    try {
+      const result = resolveCmuxInChild(`${fixtureDir}:${process.env.PATH ?? ''}`, 3_000);
+
+      assert.ifError(result.error);
+      if (result.status === 0) {
+        const bundled = '/Applications/cmux.app/Contents/Resources/bin/cmux';
+        assert.strictEqual(result.stdout, `${bundled}\n${bundled}`);
+      } else {
+        assert.strictEqual(result.status, 17);
+        assert.match(result.stderr, /cmux not found/);
+        assert.doesNotMatch(result.stderr, /Command failed/);
+      }
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+
+  test('a sane PATH resolves and caches the same cmux executable', () => {
+    const fixtureDir = mkdtempSync(join(tmpdir(), 'swarm-cmux-path-'));
+    const cmuxPath = join(fixtureDir, 'cmux');
+    writeFileSync(cmuxPath, '#!/bin/sh\nexit 0\n');
+    chmodSync(cmuxPath, 0o755);
+
+    try {
+      const result = resolveCmuxInChild(`${fixtureDir}:${process.env.PATH ?? ''}`, 3_000);
+
+      assert.ifError(result.error);
+      assert.strictEqual(result.status, 0, result.stderr);
+      assert.strictEqual(result.stdout, `${cmuxPath}\n${cmuxPath}`);
+    } finally {
+      rmSync(fixtureDir, { recursive: true, force: true });
+    }
+  });
+});
 
 // The transient/gone classification decides whether a failed cmux send is retried
 // (busy surface) or treated as a dead surface (which lets cleanupStale prune the

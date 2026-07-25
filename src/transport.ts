@@ -59,7 +59,10 @@ export function sanitize(text: string): string {
 }
 
 const CHUNK_SIZE = 60;
-const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe'] } = { stdio: ['pipe', 'pipe', 'pipe'] };
+const STDIO_OPTS: { stdio: ['pipe', 'pipe', 'pipe']; timeout: number } = {
+  stdio: ['pipe', 'pipe', 'pipe'],
+  timeout: 30_000,
+};
 const MAX_SEND_ATTEMPTS = 5;
 const SEND_BACKOFF_BASE_S = 0.3;
 

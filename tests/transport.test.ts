@@ -201,7 +201,11 @@ describe('T8 spawnSplitInWorkspace', () => {
       {
         resolveBinary: () => '/fixture/cmux',
         wait: () => {},
-        runner: (_binary, args) => {
+        runner: (_binary, args, options) => {
+          assert.deepStrictEqual(options, {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            timeout: 30_000,
+          });
           calls.push(args);
           if (args[0] === 'list-pane-surfaces') {
             listCount += 1;

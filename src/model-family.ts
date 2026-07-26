@@ -41,16 +41,22 @@ export function parseModelFamily(value: string | null | undefined): ModelFamily 
 /**
  * What an agent IS.
  *
- * A KNOWN harness wins, because it is a live observation and a harness only ever runs
- * its own vendor's models. The stored column is refreshed at join but `host_agent` is
- * re-detected on every command, so preferring the column would let a stale value from
- * an earlier join outrank what the agent demonstrably is now — and route a same-family
- * seat as the cross-family reviewer, which is the exact failure this axis exists to
- * prevent. The declaration is the fallback, for A2A agents that have no harness to read.
+ * For a LOCAL agent (cmux/headless) a known harness wins: the row describes the process
+ * running here, `host_agent` is re-detected every command, and preferring the column
+ * would let a value cached at join outrank what the agent demonstrably is now.
+ *
+ * For an A2A agent it is the opposite, and getting this backwards is a wrong-family bug
+ * rather than an unknown-family one. The row describes a REMOTE agent, so `host_agent`
+ * is not an observation of it — it is whatever local process last acted under that
+ * identity, which is forgeable by anyone who can set SWARM_AGENT_NAME. Trusting it let a
+ * declared-claude seat read as openai and be accepted as an inverted reviewer for a
+ * Claude author. Only the declaration speaks for a remote agent; absent one it is
+ * unknown, which refuses.
  */
 export function agentModelFamily(
-  agent: { host_agent?: string | null; model_family?: string | null }
+  agent: { host_agent?: string | null; model_family?: string | null; agent_type?: string | null }
 ): ModelFamily {
+  if (agent.agent_type === 'a2a') return parseModelFamily(agent.model_family) ?? 'unknown';
   const fromHarness = deriveModelFamily(agent.host_agent);
   if (fromHarness !== 'unknown') return fromHarness;
   return parseModelFamily(agent.model_family) ?? 'unknown';

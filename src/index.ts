@@ -295,7 +295,11 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
   // Persist host harness when known so delivery can apply host-specific quirks
   // (e.g. Grok double-Enter). Refreshes existing sessions that joined before
   // host_agent was recorded.
-  const host = detectHost();
+  // Never stamp the CALLER's harness onto an A2A row. That row describes a remote agent;
+  // a local process acting under its identity (SWARM_AGENT_NAME) is not that agent, and
+  // writing host_agent here relabelled a declared-claude seat as codex — a WRONG family,
+  // which approves, rather than an unknown one, which refuses.
+  const host = self.agent_type === 'a2a' ? null : detectHost();
   if (host && self.host_agent !== host) {
     updateHostAgent(db, self.swarm_id, self.surface_id, host);
     self.host_agent = host;

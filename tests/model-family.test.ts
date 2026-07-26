@@ -17,6 +17,7 @@ import {
   joinAgent,
   joinHeadlessAgent,
   setModelFamily,
+  updateHostAgent,
 } from '../src/registry.js';
 import { requestTaskReview } from '../src/reviews.js';
 import { startTask } from '../src/tasks.js';
@@ -88,6 +89,42 @@ describe('model family is stated, never guessed', () => {
       agentModelFamily(getAgent(db, swarm.id, 'Odd')!),
       'claude',
       'the live harness is authoritative over the cached column'
+    );
+  });
+
+  /**
+   * Found by Ledger (codex) in cross-family review. An A2A row describes a REMOTE agent,
+   * so host_agent is not an observation of it — any local process running as that
+   * identity (SWARM_AGENT_NAME) stamps its own harness there. Letting that outrank the
+   * declaration produced a WRONG family, which approves, rather than unknown, which
+   * refuses: a declared-claude seat read as openai and would be accepted as an inverted
+   * reviewer for a Claude author.
+   */
+  test('an A2A declaration is NOT overridden by a host_agent written by some local caller', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'claude');
+    const before = getAgent(db, swarm.id, 'Remote')!;
+    assert.strictEqual(agentModelFamily(before), 'claude');
+
+    updateHostAgent(db, swarm.id, before.surface_id, 'codex');
+    const after = getAgent(db, swarm.id, 'Remote')!;
+    assert.strictEqual(after.host_agent, 'codex', 'precondition: the column really was written');
+    assert.strictEqual(
+      agentModelFamily(after),
+      'claude',
+      'only the declaration speaks for a remote agent'
+    );
+  });
+
+  test('an UNDECLARED A2A agent stays unknown even when a caller stamps a harness', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    joinA2AAgent(db, swarm.id, 'Bare', 'http://127.0.0.1:2/');
+    const bare = getAgent(db, swarm.id, 'Bare')!;
+    updateHostAgent(db, swarm.id, bare.surface_id, 'codex');
+    assert.strictEqual(
+      agentModelFamily(getAgent(db, swarm.id, 'Bare')!),
+      'unknown',
+      'a borrowed harness must never manufacture a family — unknown refuses, wrong approves'
     );
   });
 

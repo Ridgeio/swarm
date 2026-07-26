@@ -165,6 +165,7 @@ describe('T6 model-inversion review routing', () => {
       // overridden — the same event kind now also covers unknown-family overrides,
       // which previously bypassed the control without writing anything at all.
       assert.deepStrictEqual(JSON.parse(event.data), {
+        gate: 'same-family',
         gates: ['same-family'],
         reviewer: 'Same',
         reviewer_family: 'claude',

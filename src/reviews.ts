@@ -299,6 +299,10 @@ export async function requestTaskReview(
         INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
         VALUES (?, ?, ?, 'same_family_review', ?, ?, ?)
       `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
+        // `gate` is kept alongside `gates` so existing auditors reading the scalar keep
+        // working: promising compatibility and then changing the payload shape would
+        // make them silently read undefined. `gates` is the complete list.
+        gate: overriddenGates[0],
         gates: overriddenGates,
         reviewer: reviewer.name,
         reviewer_family: reviewerFamily,

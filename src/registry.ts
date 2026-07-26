@@ -225,7 +225,14 @@ export function setActiveHeadlessSwarm(swarmId: string): boolean {
   return true;
 }
 
-/** Every swarm this TTY holds a headless marker for. */
+/**
+ * Every swarm this TTY holds a headless marker for.
+ *
+ * Call it WITHOUT `agentName` to get this terminal's membership set: the marker files are
+ * already per-TTY, so all of them belong to this session — and each membership may use a
+ * DIFFERENT name (that is the documented contract). Filtering by the active name hid
+ * every membership registered under another one.
+ */
 export function listHeadlessMarkers(agentName?: string): SessionMarker[] {
   const markerPath = getSessionMarkerPath();
   if (!markerPath) return [];
@@ -757,9 +764,15 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
     // unless the operator happened to guess the surviving swarm's name. Cmux already
     // ignores a pointer with no live membership; headless must behave the same.
     if (resolvedSwarmId) return null;
-    for (const scoped of listHeadlessMarkers(activeMarker.agent_name)) {
+    // Unfiltered: each membership on this TTY may use a different name, so filtering by
+    // the active marker's name would hide the very survivors we are looking for.
+    for (const scoped of listHeadlessMarkers()) {
       const survivor = lookup(scoped.swarm_id, scoped);
-      if (survivor) return survivor;
+      if (!survivor) continue;
+      // Repoint the active marker, or every later command repeats this search and
+      // `whoami` keeps reporting a swarm that no longer exists as the default.
+      setActiveHeadlessSwarm(scoped.swarm_id);
+      return survivor;
     }
     return null;
   }

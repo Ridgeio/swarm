@@ -524,6 +524,49 @@ function swarmNameFor(db: ReturnType<typeof getDb>, swarmId: string): string {
   return getSwarmById(db, swarmId)?.name ?? swarmId;
 }
 
+/**
+ * This TTY's headless memberships, validated against live rows.
+ *
+ * Markers are per-TTY, so ALL of them belong to this session — never filter by the
+ * active name, because each membership may use a different one. Each is then checked
+ * against the database: `swarm reset`/`delete` removes rows without touching markers, so
+ * a raw marker list would report a deleted swarm as a live membership.
+ */
+function headlessMemberships(
+  db: ReturnType<typeof getDb>
+): Array<{ swarm_id: string; name: string }> {
+  return listHeadlessMarkers()
+    .filter(marker => getAgent(db, marker.swarm_id, marker.agent_name)?.agent_type === 'headless')
+    .map(marker => ({ swarm_id: marker.swarm_id, name: marker.agent_name }));
+}
+
+/**
+ * `--swarm` selects a swarm only BEFORE the message; inside a command's free-text tail
+ * (see FREE_TEXT_TAIL_AT) it is literal text. Now that one terminal can sit in several
+ * swarms, a trailing selector delivers to the DEFAULT swarm while looking like it was
+ * routed — a silent misroute. Shared by `send` and `broadcast`: broadcast is the more
+ * dangerous of the two, because every recipient is then in the wrong swarm.
+ */
+function refuseTrailingSelector(
+  db: ReturnType<typeof getDb>,
+  currentSwarmId: string,
+  message: string,
+  commandHint: string
+): void {
+  // Start-or-whitespace: requiring leading whitespace missed the minimal case, a body
+  // that IS the selector (`swarm send Bob --swarm docs`) — exactly what this refuses.
+  const match = /(?:^|\s)--swarm(?:=|\s+)([^\s]+)$/.exec(message);
+  if (!match) return;
+  const named = getSwarm(db, match[1]);
+  if (!named || named.id === currentSwarmId) return;
+  console.error(
+    `Refusing: "--swarm ${match[1]}" came after the message, so it is message text, not a swarm ` +
+    `selector — this would have gone to "${swarmNameFor(db, currentSwarmId)}". ` +
+    `Put the selector first: swarm --swarm ${match[1]} ${commandHint} "<message>"`
+  );
+  process.exit(1);
+}
+
 function printHookContext(): void {
   const { db, self, swarm } = requireSelf();
 
@@ -570,7 +613,7 @@ function printHookContext(): void {
   // aggregation exists to prevent.
   const otherMemberships: Array<{ swarm_id: string; name: string }> = self.agent_type === 'cmux'
     ? listSurfaceMemberships(db, self.surface_id)
-    : listHeadlessMarkers(self.name).map(m => ({ swarm_id: m.swarm_id, name: m.agent_name }));
+    : headlessMemberships(db);
 
   const otherSection = self.agent_type !== 'a2a'
     ? otherMemberships
@@ -996,25 +1039,7 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
-        // `--swarm` is only a selector BEFORE the message; inside the free-text tail it is
-        // literal (see FREE_TEXT_TAIL_AT). Now that one terminal can sit in several swarms,
-        // a trailing selector would quietly send to the DEFAULT swarm — and if the same
-        // agent name exists in both, that is a silent misroute rather than a "not found".
-        // Start-or-whitespace boundary: requiring leading whitespace missed the minimal
-        // case — `swarm send Bob --swarm docs`, whose entire message body IS the
-        // selector — which is precisely the misuse this guard claims to refuse.
-        const trailingSelector = /(?:^|\s)--swarm(?:=|\s+)([^\s]+)$/.exec(message);
-        if (trailingSelector) {
-          const named = getSwarm(db, trailingSelector[1]);
-          if (named && named.id !== self.swarm_id) {
-            console.error(
-              `Refusing to send: "--swarm ${trailingSelector[1]}" came after the message, so it is part of the ` +
-              `message text, not a swarm selector — this would have gone to "${swarmNameFor(db, self.swarm_id)}". ` +
-              `Put the selector first: swarm --swarm ${trailingSelector[1]} send ${recipients.join(',')} "<message>"`
-            );
-            process.exit(1);
-          }
-        }
+        refuseTrailingSelector(db, self.swarm_id, message, `send ${recipients.join(',')}`);
 
         // Attempt every recipient even after a failure; exit nonzero if ANY failed.
         let anyFailed = false;
@@ -1051,6 +1076,7 @@ async function main() {
           tokens.push(rest[i]);
         }
         const message = tokens.join(' ');
+        refuseTrailingSelector(db, self.swarm_id, message, 'broadcast');
         if (!message) {
           console.error(usage);
           process.exit(1);
@@ -1918,7 +1944,7 @@ async function main() {
         if (self.agent_type !== 'a2a') {
           const memberships = self.agent_type === 'cmux'
             ? listSurfaceMemberships(db, self.surface_id)
-            : listHeadlessMarkers(self.name).map(m => ({ swarm_id: m.swarm_id, name: m.agent_name }));
+            : headlessMemberships(db);
           if (memberships.length > 1) {
             // The default is whatever the pointer names — NOT self.swarm_id, which is
             // the swarm this invocation selected via --swarm/SWARM_ID and would

@@ -295,17 +295,22 @@ describe('pushed-message swarm attribution', () => {
     assert.strictEqual(swarmTagFor(db, dual, alpha.id), ' in alpha');
   });
 
-  test('a single-swarm headless target is not tagged, a multi-swarm one is', () => {
+  test('headless targets are not tagged — a name is not a session identity', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     const beta = getOrCreateSwarm(db, 'beta');
     const headless = joinHeadlessAgent(db, alpha.id, 'Worker');
-    assert.strictEqual(swarmTagFor(db, headless, alpha.id), '', 'one swarm keeps the original format');
+    assert.strictEqual(swarmTagFor(db, headless, alpha.id), '');
 
-    // The same identity joins a second swarm; an untagged push is now ambiguous, which
-    // is the entire reason the tag exists. Asserting headless is NEVER tagged cemented
-    // that ambiguity as intended behaviour.
+    // Counting same-name headless rows was tried as a proxy for "this TTY is in several
+    // swarms" and is wrong both ways: names are unique only within a swarm, so one TTY
+    // under two names goes untagged while two unrelated TTYs sharing a name get tagged
+    // for a membership neither holds. A confidently wrong swarm name is worse than none.
     joinHeadlessAgent(db, beta.id, 'Worker');
-    assert.strictEqual(swarmTagFor(db, headless, alpha.id), ' in alpha');
+    assert.strictEqual(
+      swarmTagFor(db, headless, alpha.id),
+      '',
+      'no tag until there is a durable per-session key to key it on'
+    );
   });
 });
 

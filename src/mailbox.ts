@@ -18,15 +18,15 @@ export function swarmTagFor(db: SwarmDb, target: Agent, swarmId: string): string
     return listSurfaceMemberships(db, target.surface_id).length < 2 ? '' : ` in ${swarmName}`;
   }
 
-  // Headless surfaces are synthetic per-swarm strings (`headless:<swarm>:<name>`), so
-  // membership cannot be counted from surface_id. Fall back to same-name headless rows
-  // across swarms: for a TTY that joined several swarms under one identity — the case
-  // that makes an untagged push ambiguous — that is exactly the set we need.
-  const sameName = db.prepare(`
-    SELECT COUNT(*) AS n FROM agents
-    WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'
-  `).get(target.name) as { n: number };
-  return sameName.n < 2 ? '' : ` in ${swarmName}`;
+  // Headless targets are NOT tagged, and this is a known gap rather than an oversight.
+  // Their surface_id is synthetic and per-swarm (`headless:<swarm>:<name>`), so it cannot
+  // identify a terminal. Counting same-NAME rows across swarms was tried and is wrong in
+  // both directions: names are only unique within a swarm, so one TTY joined under two
+  // different names goes untagged, while two unrelated TTYs sharing a name get tagged for
+  // a membership neither has. A name is not a session identity. Correctly tagging these
+  // needs a durable per-session key on the row; until then, no tag — ambiguous is
+  // recoverable, a confidently wrong swarm name is not.
+  return '';
 }
 
 export interface Message {

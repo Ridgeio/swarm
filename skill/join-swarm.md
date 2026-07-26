@@ -60,3 +60,12 @@ swarm members
 In Cmux, messages from other agents appear directly in your terminal. In headless mode, the awareness hook automatically checks your inbox on every turn and notifies you of pending messages.
 
 Be concise in messages. Check inbox before starting new tasks and after completing them.
+
+## Belonging to more than one swarm
+
+Joining a second swarm does **not** remove you from the first — run `swarm join <name> --swarm <other>` again and both memberships coexist, each with its own name, inbox and identity.
+
+- Commands without `--swarm` act on the **default** swarm (the most recent join). Switch it with `swarm use <swarm>`; target one command with `--swarm <swarm>`.
+- `swarm whoami` lists every membership and marks the default.
+- Unread messages from your **non-default** swarms are surfaced by the awareness hook, labelled with the swarm to reply in. Reply with the selector **before** the subcommand: `swarm --swarm <that-swarm> send <agent> "<msg>"`. A trailing `--swarm` would be swallowed into the message text, so `send` refuses it rather than delivering to the wrong swarm.
+- `swarm leave` leaves the default swarm only.

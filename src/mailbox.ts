@@ -1,7 +1,22 @@
 import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { deliverToAgent } from './transport-router.js';
-import { getAgent, listAgents } from './registry.js';
+import { getAgent, getSwarmById, listAgents, listSurfaceMemberships, type Agent } from './registry.js';
 import type { DeliveryOptions } from './transport-interface.js';
+
+/**
+ * Pushed text is the recipient's only real-time cue, and `[SWARM from Bob]` alone is
+ * ambiguous once a terminal belongs to several swarms — a reply would go to whichever
+ * swarm happens to be the default. Name the swarm exactly when that ambiguity exists,
+ * so the single-swarm format (and everything parsing it) is untouched.
+ */
+export function swarmTagFor(db: SwarmDb, target: Agent, swarmId: string): string {
+  // surface_id is a true terminal identity only for cmux rows; headless surfaces are
+  // synthetic per-swarm strings, so there is no reliable multi-membership signal there.
+  if (target.agent_type !== 'cmux') return '';
+  if (listSurfaceMemberships(db, target.surface_id).length < 2) return '';
+  const swarmName = getSwarmById(db, swarmId)?.name;
+  return swarmName ? ` in ${swarmName}` : '';
+}
 
 export interface Message {
   id: number;
@@ -105,7 +120,7 @@ export async function sendMessage(
   }
 
   const now = new Date().toISOString();
-  const formatted = `[SWARM from ${fromName}]: ${body}`;
+  const formatted = `[SWARM from ${fromName}${swarmTagFor(db, target, swarmId)}]: ${body}`;
 
   // Store the canonical registered name (getAgent matches case-insensitively).
   // messages.to_agent is compared case-sensitively in getInbox, so persisting the
@@ -145,14 +160,21 @@ export async function broadcastMessage(
   }
 
   const now = new Date().toISOString();
-  const formatted = `[SWARM from ${fromName}]: ${body}`;
 
   // Insert message row first (one broadcast row, to_agent = NULL)
   const msgId = insertMessage(db, swarmId, fromName, null, body, now, kind ?? null, supersedes);
 
-  // Deliver to all recipients in parallel
+  // Deliver to all recipients in parallel. The swarm tag is per-recipient — only the
+  // ones sitting in several swarms need disambiguating.
   const results = await Promise.all(
-    recipients.map(async agent => ({ agent, result: await deliverToAgent(agent, formatted, options) }))
+    recipients.map(async agent => ({
+      agent,
+      result: await deliverToAgent(
+        agent,
+        `[SWARM from ${fromName}${swarmTagFor(db, agent, swarmId)}]: ${body}`,
+        options
+      ),
+    }))
   );
 
   let sent = 0;

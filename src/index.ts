@@ -7,6 +7,7 @@ import { getDb, getDbReadOnly } from './db.js';
 import {
   Agent,
   Swarm,
+  clearActiveSwarmId,
   deleteSwarm,
   findSwarmForCwd,
   forceReap,
@@ -25,13 +26,18 @@ import {
   leaveHeadlessAgent,
   listAgents,
   listAgentsSync,
+  listSurfaceMemberships,
   listSwarms,
   reapAll,
   reapIfDead,
+  readActiveSwarmId,
+  setActiveHeadlessSwarm,
+  touchSurfaceMemberships,
   updateHeartbeat,
   updateHostAgent,
   updateStatus,
   updateWorkspace,
+  writeActiveSwarmId,
 } from './registry.js';
 import {
   acknowledgeAllMessages,
@@ -283,6 +289,9 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
   }
 
   updateHeartbeat(db, self.swarm_id, self.surface_id);
+  // Keep this surface's OTHER memberships alive too — the terminal being up is a fact
+  // about the terminal, not about the swarm whose command happened to run.
+  if (self.agent_type === 'cmux') touchSurfaceMemberships(db, self.surface_id);
   // Persist host harness when known so delivery can apply host-specific quirks
   // (e.g. Grok double-Enter). Refreshes existing sessions that joined before
   // host_agent was recorded.
@@ -307,6 +316,8 @@ function printHelp() {
 
 Swarm Selection:
   --swarm <name>, -s <name>                       Run the command in a named swarm
+  swarm use <swarm>                               Set which joined swarm unqualified
+                                                    commands act on (this surface only)
 
 Swarm Management:
   swarm create <name> [--root <path>]             Create or update a named swarm
@@ -320,6 +331,8 @@ Agent Management:
     [--root <path>]                                  Force headless / Warp push / reclaim name /
                                                      take surface / set root
   swarm leave                                      Deregister from the current swarm
+                                                     (one swarm only — other
+                                                      memberships on this surface survive)
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>] [--force]
   swarm unregister-a2a <name>                      Remove an A2A agent
@@ -498,6 +511,10 @@ function reclaimHeadlessNameOrExit(
   console.log(`Reclaimed headless registration "${existing.name}" from a prior session.`);
 }
 
+function swarmNameFor(db: ReturnType<typeof getDb>, swarmId: string): string {
+  return getSwarmById(db, swarmId)?.name ?? swarmId;
+}
+
 function printHookContext(): void {
   const { db, self, swarm } = requireSelf();
 
@@ -534,10 +551,40 @@ function printHookContext(): void {
   const updateBanner = formatSwarmUpdateBanner(getSwarmVersionCache(db));
   const updateSection = updateBanner ? `\n${updateBanner}` : '';
 
+  // A surface can hold memberships in several swarms. Only one is "active", but a
+  // message waiting in any of the others is just as real — and invisible unless it
+  // is pulled in here, because nothing else polls them. Silence in a joined swarm
+  // must never be an artefact of which swarm happens to be selected.
+  const otherSection = self.agent_type === 'cmux'
+    ? listSurfaceMemberships(db, self.surface_id)
+      .filter(m => m.swarm_id !== self.swarm_id)
+      .map(m => {
+        const otherSwarm = getSwarmById(db, m.swarm_id);
+        const otherName = otherSwarm?.name ?? m.swarm_id;
+        const pending = getInbox(db, m.swarm_id, m.name, true);
+        const injected = recordHookInjections(db, m.swarm_id, m.name, pending);
+        if (injected.length === 0) return '';
+        const lines = injected.map(entry => {
+          const { message: msg } = entry;
+          if (entry.collapsed) {
+            // Name the command that actually clears it: --recent is a replay that never
+            // advances delivery state, so omitting ack leaves the line nagging forever.
+            return `(#${msg.id} from ${msg.from_agent}, unacked for ${entry.unackedMinutes}m — swarm inbox --recent --swarm ${otherName} to review, swarm ack ${msg.id} --swarm ${otherName} to clear)`;
+          }
+          const time = new Date(msg.created_at).toLocaleTimeString();
+          return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
+        });
+        // Selector goes BEFORE `send` — after the message it is literal text.
+        return `\nNEW MESSAGES in swarm "${otherName}" (you are "${m.name}" there; reply with: swarm --swarm ${otherName} send <agent> "<msg>"):\n${lines.join('\n')}`;
+      })
+      .join('')
+    : '';
+
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | inbox [--wait N] | members | status --set "<desc>" | task start/checkpoint/close | board --tab${readCommand} | help --agent (full map)
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${updateSection}${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond.
+[SWARM from <name> in <swarm>] came from another swarm — reply with: swarm --swarm <swarm> send <name> "<msg>" (selector BEFORE send).${taskSection}${janitorSection}${updateSection}${inboxSection}${otherSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
@@ -660,6 +707,8 @@ async function main() {
                 `on Cmux surface "${agent.surface_takeover.surface_id}" via --force-surface.`
               );
             }
+            // The swarm just joined becomes the default for unqualified commands.
+            writeActiveSwarmId(surfaceId, swarm.id);
             renameTab(surfaceId, `${swarm.name}/${name}`, workspaceId);
             // Refresh host session files (critical for Codex: stale
             // ~/.codex/swarm-session.md otherwise points at a previous agent name).
@@ -668,6 +717,18 @@ async function main() {
             }
             const hostLabel = host ? ` [${host}]` : '';
             console.log(`Joined swarm "${swarm.name}" as "${agent.name}" (surface: ${agent.surface_id})${hostLabel}`);
+            // Joining no longer removes this surface from its other swarms, so say
+            // plainly which one plain commands will now act on.
+            const others = listSurfaceMemberships(db, surfaceId).filter(m => m.swarm_id !== swarm.id);
+            if (others.length > 0) {
+              const names = others
+                .map(m => `${getSwarmById(db, m.swarm_id)?.name ?? m.swarm_id} (as ${m.name})`)
+                .join(', ');
+              console.log(
+                `Still a member of: ${names}. Commands without --swarm act on "${swarm.name}"; ` +
+                `switch the default with "swarm use <swarm>".`
+              );
+            }
           }
         }
         handleJoinUpdateAwareness(db);
@@ -685,8 +746,36 @@ async function main() {
           }
         } else {
           leaveAgent(db, self.swarm_id, self.surface_id);
+          clearActiveSwarmId(self.surface_id, self.swarm_id);
         }
         console.log(`Left swarm "${swarm.name}" (was "${self.name}")`);
+        // Leaving is scoped to one swarm. Name what survives, and re-point the default
+        // ONLY if it was the swarm just left — `swarm leave --swarm <other>` must not
+        // move a default the agent chose deliberately with `swarm use`.
+        if (self.agent_type !== 'headless') {
+          const remaining = listSurfaceMemberships(db, self.surface_id);
+          if (remaining.length > 0) {
+            const stillPointed = readActiveSwarmId(self.surface_id);
+            const pointerIsLive = stillPointed !== null
+              && remaining.some(m => m.swarm_id === stillPointed);
+            if (!pointerIsLive) {
+              const next = remaining[remaining.length - 1];
+              const nextSwarm = getSwarmById(db, next.swarm_id);
+              writeActiveSwarmId(self.surface_id, next.swarm_id);
+              console.log(
+                `Still a member of ${remaining.length} swarm(s); ` +
+                `commands without --swarm now act on "${nextSwarm?.name ?? next.swarm_id}" (as ${next.name}).`
+              );
+            } else {
+              const kept = remaining.find(m => m.swarm_id === stillPointed)!;
+              const keptSwarm = getSwarmById(db, kept.swarm_id);
+              console.log(
+                `Still a member of ${remaining.length} swarm(s); ` +
+                `commands without --swarm still act on "${keptSwarm?.name ?? kept.swarm_id}" (as ${kept.name}).`
+              );
+            }
+          }
+        }
         break;
       }
 
@@ -874,6 +963,23 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
+        // `--swarm` is only a selector BEFORE the message; inside the free-text tail it is
+        // literal (see FREE_TEXT_TAIL_AT). Now that one terminal can sit in several swarms,
+        // a trailing selector would quietly send to the DEFAULT swarm — and if the same
+        // agent name exists in both, that is a silent misroute rather than a "not found".
+        const trailingSelector = /\s--swarm(?:=|\s+)([^\s]+)$/.exec(message);
+        if (trailingSelector) {
+          const named = getSwarm(db, trailingSelector[1]);
+          if (named && named.id !== self.swarm_id) {
+            console.error(
+              `Refusing to send: "--swarm ${trailingSelector[1]}" came after the message, so it is part of the ` +
+              `message text, not a swarm selector — this would have gone to "${swarmNameFor(db, self.swarm_id)}". ` +
+              `Put the selector first: swarm --swarm ${trailingSelector[1]} send ${recipients.join(',')} "<message>"`
+            );
+            process.exit(1);
+          }
+        }
+
         // Attempt every recipient even after a failure; exit nonzero if ANY failed.
         let anyFailed = false;
         let anyQueued = false;
@@ -1746,7 +1852,7 @@ async function main() {
       }
 
       case 'whoami': {
-        const { self, swarm } = requireSelf();
+        const { db, self, swarm } = requireSelf();
         console.log(`Name: ${self.name}`);
         console.log(`Swarm: ${swarm.name}`);
         console.log(`Swarm ID: ${self.swarm_id}`);
@@ -1757,6 +1863,69 @@ async function main() {
         console.log(`Joined: ${self.joined_at}`);
         if (self.description) console.log(`Status: ${self.description}`);
         if (self.endpoint_url) console.log(`Endpoint: ${self.endpoint_url}`);
+        if (self.agent_type === 'cmux') {
+          const memberships = listSurfaceMemberships(db, self.surface_id);
+          if (memberships.length > 1) {
+            // The default is whatever the pointer names — NOT self.swarm_id, which is
+            // the swarm this invocation selected via --swarm/SWARM_ID and would
+            // mislabel the default whenever those are used.
+            const pointed = readActiveSwarmId(self.surface_id);
+            const defaultSwarmId = memberships.some(m => m.swarm_id === pointed)
+              ? pointed
+              : memberships[memberships.length - 1].swarm_id;
+            console.log(`\nMemberships (${memberships.length}) — this surface is in more than one swarm:`);
+            for (const m of memberships) {
+              const mSwarm = getSwarmById(db, m.swarm_id);
+              const marker = m.swarm_id === defaultSwarmId ? ' <- default for commands without --swarm' : '';
+              console.log(`  ${mSwarm?.name ?? m.swarm_id} — as "${m.name}"${marker}`);
+            }
+            console.log('Switch the default with "swarm use <swarm>"; target one command with --swarm <swarm>.');
+          }
+        }
+        break;
+      }
+
+      case 'use': {
+        // Sets which swarm unqualified commands act on for THIS surface.
+        const target = args[1] ?? explicitSwarmName;
+        if (!target) {
+          console.error('Usage: swarm use <swarm>');
+          process.exit(1);
+        }
+        const db = getDb();
+        const targetSwarm = getSwarm(db, target);
+        if (!targetSwarm) {
+          console.error(`Error: Swarm "${target}" not found.`);
+          process.exit(1);
+        }
+        // Resolve who is actually calling. CMUX_SURFACE_ID is inherited by every child
+        // process of a tab, so trusting it alone would let a scripted subprocess
+        // retarget the parent agent's default swarm.
+        const { self: caller } = requireSelf();
+        if (caller.agent_type === 'headless') {
+          if (!setActiveHeadlessSwarm(targetSwarm.id)) {
+            console.error(
+              `Error: this session has no headless membership in "${targetSwarm.name}". ` +
+              `Run "swarm join <name> --swarm ${targetSwarm.name}" first.`
+            );
+            process.exit(1);
+          }
+          console.log(`Default swarm is now "${targetSwarm.name}".`);
+          break;
+        }
+        // Refuse to point the default at a swarm this surface has not joined —
+        // otherwise every later command fails with a confusing "not joined".
+        const membership = listSurfaceMemberships(db, caller.surface_id)
+          .find(m => m.swarm_id === targetSwarm.id);
+        if (!membership) {
+          console.error(
+            `Error: this surface is not a member of "${targetSwarm.name}". ` +
+            `Run "swarm join <name> --swarm ${targetSwarm.name}" first.`
+          );
+          process.exit(1);
+        }
+        writeActiveSwarmId(caller.surface_id, targetSwarm.id);
+        console.log(`Default swarm is now "${targetSwarm.name}" (you are "${membership.name}" there).`);
         break;
       }
 

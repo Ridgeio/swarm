@@ -12,7 +12,14 @@ import {
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
 
-const SWARM_DIR = path.join(os.homedir(), '.swarm');
+/**
+ * Resolved per call rather than at module load: the state directory follows the
+ * current HOME, which keeps session-marker and pointer files under test control
+ * instead of writing into the real ~/.swarm.
+ */
+function swarmDir(): string {
+  return path.join(os.homedir(), '.swarm');
+}
 
 export interface Swarm {
   id: string;
@@ -128,7 +135,7 @@ function getSessionMarkerPath(): string | null {
     for (let i = 0; i < 5 && pid; i++) {
       const tty = execFileSync('ps', ['-o', 'tty=', '-p', pid], { encoding: 'utf-8' }).trim();
       if (tty && tty !== '??' && tty !== '') {
-        return path.join(SWARM_DIR, `headless-${tty}`);
+        return path.join(swarmDir(), `headless-${tty}`);
       }
       pid = execFileSync('ps', ['-o', 'ppid=', '-p', pid], { encoding: 'utf-8' }).trim();
     }
@@ -137,10 +144,17 @@ function getSessionMarkerPath(): string | null {
   return null;
 }
 
-function readSessionMarker(): SessionMarker | null {
-  const markerPath = getSessionMarkerPath();
-  if (!markerPath || !fs.existsSync(markerPath)) return null;
+/**
+ * A headless TTY can hold a membership per swarm, so each one needs its own
+ * token file. The UNSCOPED path stays the "active" marker — which swarm an
+ * unqualified command means — so single-swarm sessions behave exactly as before.
+ */
+function scopedSessionMarkerPath(basePath: string, swarmId: string): string {
+  return `${basePath}.${createHash('sha256').update(swarmId).digest('hex').slice(0, 16)}`;
+}
 
+function parseTtySessionMarker(markerPath: string): SessionMarker | null {
+  if (!fs.existsSync(markerPath)) return null;
   const raw = fs.readFileSync(markerPath, 'utf-8').trim();
   if (!raw) return null;
 
@@ -160,25 +174,85 @@ function readSessionMarker(): SessionMarker | null {
   return { swarm_id: DEFAULT_SWARM_ID, agent_name: raw, session_token: null };
 }
 
+/**
+ * With no swarmId: the active marker (this TTY's default swarm).
+ * With a swarmId: that swarm's own marker, falling back to the active marker
+ * when it already names that swarm — which is every pre-upgrade session.
+ */
+function readSessionMarker(swarmId?: string): SessionMarker | null {
+  const markerPath = getSessionMarkerPath();
+  if (!markerPath) return null;
+  if (!swarmId) return parseTtySessionMarker(markerPath);
+
+  const scoped = parseTtySessionMarker(scopedSessionMarkerPath(markerPath, swarmId));
+  if (scoped) return scoped;
+  const active = parseTtySessionMarker(markerPath);
+  return active?.swarm_id === swarmId ? active : null;
+}
+
 function writeSessionMarker(swarmId: string, agentName: string, sessionToken: string): void {
   const markerPath = getSessionMarkerPath();
   if (!markerPath) return;
 
-  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
-  fs.writeFileSync(
-    markerPath,
-    JSON.stringify({ swarm_id: swarmId, agent_name: agentName, session_token: sessionToken }, null, 2),
-    { encoding: 'utf-8', mode: 0o600 }
+  const payload = JSON.stringify(
+    { swarm_id: swarmId, agent_name: agentName, session_token: sessionToken },
+    null,
+    2
   );
+  fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+  // Per-swarm marker authenticates this membership; the unscoped one makes it active.
+  fs.writeFileSync(scopedSessionMarkerPath(markerPath, swarmId), payload, { encoding: 'utf-8', mode: 0o600 });
+  fs.writeFileSync(markerPath, payload, { encoding: 'utf-8', mode: 0o600 });
 }
 
-function surfaceSessionMarkerPath(surfaceId: string): string {
+/** Point this TTY's unqualified commands at a swarm it already has a marker for. */
+export function setActiveHeadlessSwarm(swarmId: string): boolean {
+  const markerPath = getSessionMarkerPath();
+  if (!markerPath) return false;
+  const scoped = parseTtySessionMarker(scopedSessionMarkerPath(markerPath, swarmId));
+  if (!scoped) return false;
+  fs.writeFileSync(markerPath, JSON.stringify(scoped, null, 2), { encoding: 'utf-8', mode: 0o600 });
+  return true;
+}
+
+/** Every swarm this TTY holds a headless marker for. */
+export function listHeadlessMarkers(agentName?: string): SessionMarker[] {
+  const markerPath = getSessionMarkerPath();
+  if (!markerPath) return [];
+  const dir = path.dirname(markerPath);
+  const base = path.basename(markerPath);
+  if (!fs.existsSync(dir)) return [];
+  const markers: SessionMarker[] = [];
+  for (const file of fs.readdirSync(dir)) {
+    // Scoped markers only: "<base>.<16 hex>" — never the unscoped active marker.
+    if (!file.startsWith(`${base}.`) || !/^[0-9a-f]{16}$/.test(file.slice(base.length + 1))) continue;
+    const marker = parseTtySessionMarker(path.join(dir, file));
+    if (!marker) continue;
+    if (agentName && marker.agent_name.toLowerCase() !== agentName.toLowerCase()) continue;
+    markers.push(marker);
+  }
+  return markers;
+}
+
+/**
+ * Session markers are keyed by (surface, swarm), not by surface alone: one Cmux
+ * surface may hold a membership in several swarms at once, and each membership
+ * mints its own token. A surface-only key would let the newest join overwrite the
+ * older swarm's token, and `getAuthenticatedSelf` would then throw on the swarm
+ * the agent never left.
+ */
+function surfaceSessionMarkerPath(surfaceId: string, swarmId: string): string {
+  const key = createHash('sha256').update(`${surfaceId}\u0000${swarmId}`).digest('hex');
+  return path.join(swarmDir(), 'sessions', `cmux-${key}.json`);
+}
+
+/** Pre-multi-swarm layout: one marker per surface. Read-only, for migration. */
+function legacySurfaceSessionMarkerPath(surfaceId: string): string {
   const key = createHash('sha256').update(surfaceId).digest('hex');
-  return path.join(SWARM_DIR, 'sessions', `cmux-${key}.json`);
+  return path.join(swarmDir(), 'sessions', `cmux-${key}.json`);
 }
 
-function readSurfaceSessionMarker(surfaceId: string): SessionMarker | null {
-  const markerPath = surfaceSessionMarkerPath(surfaceId);
+function parseSessionMarkerFile(markerPath: string): SessionMarker | null {
   if (!fs.existsSync(markerPath)) return null;
   try {
     const parsed = JSON.parse(fs.readFileSync(markerPath, 'utf-8')) as Partial<SessionMarker>;
@@ -193,30 +267,112 @@ function readSurfaceSessionMarker(surfaceId: string): SessionMarker | null {
   }
 }
 
-function writeSurfaceSessionMarker(agent: Agent): void {
-  if (!agent.session_token) return;
-  const markerPath = surfaceSessionMarkerPath(agent.surface_id);
+function writeSessionMarkerFile(markerPath: string, marker: SessionMarker): void {
   fs.mkdirSync(path.dirname(markerPath), { recursive: true });
   fs.writeFileSync(markerPath, JSON.stringify({
-    swarm_id: agent.swarm_id,
-    agent_name: agent.name,
-    session_token: agent.session_token,
+    swarm_id: marker.swarm_id,
+    agent_name: marker.agent_name,
+    session_token: marker.session_token,
   }, null, 2), { encoding: 'utf-8', mode: 0o600 });
 }
 
+function readSurfaceSessionMarker(surfaceId: string, swarmId: string): SessionMarker | null {
+  const scoped = parseSessionMarkerFile(surfaceSessionMarkerPath(surfaceId, swarmId));
+  if (scoped) return scoped;
+
+  // Upgrade path: a session that joined before markers were swarm-scoped still has
+  // its token in the legacy surface-only file. Adopt it forward exactly once, so an
+  // in-flight agent is not silently logged out by installing this version.
+  const legacy = parseSessionMarkerFile(legacySurfaceSessionMarkerPath(surfaceId));
+  if (legacy?.swarm_id !== swarmId) return null;
+  writeSessionMarkerFile(surfaceSessionMarkerPath(surfaceId, swarmId), legacy);
+  return legacy;
+}
+
+function writeSurfaceSessionMarker(agent: Agent): void {
+  if (!agent.session_token) return;
+  writeSessionMarkerFile(surfaceSessionMarkerPath(agent.surface_id, agent.swarm_id), {
+    swarm_id: agent.swarm_id,
+    agent_name: agent.name,
+    session_token: agent.session_token,
+  });
+}
+
 function removeSurfaceSessionMarker(swarmId: string, surfaceId: string): void {
-  const markerPath = surfaceSessionMarkerPath(surfaceId);
-  const marker = readSurfaceSessionMarker(surfaceId);
-  if (marker?.swarm_id === swarmId) fs.rmSync(markerPath, { force: true });
+  fs.rmSync(surfaceSessionMarkerPath(surfaceId, swarmId), { force: true });
+  // Only reclaim the legacy file when it belongs to the swarm being left; another
+  // swarm's membership may still be relying on it until its own next join.
+  const legacyPath = legacySurfaceSessionMarkerPath(surfaceId);
+  if (parseSessionMarkerFile(legacyPath)?.swarm_id === swarmId) {
+    fs.rmSync(legacyPath, { force: true });
+  }
+}
+
+/**
+ * Which swarm an unqualified command means when this surface belongs to several.
+ * Held in a file rather than inferred, because the alternative — "most recent join
+ * wins" — makes `swarm send` target a swarm the agent cannot see it picked.
+ */
+function activeSwarmPointerPath(surfaceId: string): string {
+  const key = createHash('sha256').update(surfaceId).digest('hex');
+  return path.join(swarmDir(), 'sessions', `active-${key}.json`);
+}
+
+export function readActiveSwarmId(surfaceId: string): string | null {
+  const pointerPath = activeSwarmPointerPath(surfaceId);
+  if (!fs.existsSync(pointerPath)) return null;
+  try {
+    const parsed = JSON.parse(fs.readFileSync(pointerPath, 'utf-8')) as { swarm_id?: string };
+    return typeof parsed.swarm_id === 'string' ? parsed.swarm_id : null;
+  } catch {
+    return null;
+  }
+}
+
+export function writeActiveSwarmId(surfaceId: string, swarmId: string): void {
+  const pointerPath = activeSwarmPointerPath(surfaceId);
+  fs.mkdirSync(path.dirname(pointerPath), { recursive: true });
+  fs.writeFileSync(pointerPath, JSON.stringify({ swarm_id: swarmId }, null, 2), {
+    encoding: 'utf-8',
+    mode: 0o600,
+  });
+}
+
+/** Drop the pointer only when it still names the swarm being left. */
+export function clearActiveSwarmId(surfaceId: string, swarmId: string): void {
+  if (readActiveSwarmId(surfaceId) === swarmId) {
+    fs.rmSync(activeSwarmPointerPath(surfaceId), { force: true });
+  }
+}
+
+/** Every swarm this Cmux surface currently holds a membership in. */
+export function listSurfaceMemberships(db: SwarmDb, surfaceId: string): Agent[] {
+  return db.prepare(`
+    SELECT * FROM agents
+    WHERE surface_id = ? AND agent_type = 'cmux'
+    ORDER BY joined_at ASC
+  `).all(surfaceId) as unknown as Agent[];
 }
 
 function removeSessionMarker(swarmId: string, agentName: string): void {
   const markerPath = getSessionMarkerPath();
-  if (!markerPath || !fs.existsSync(markerPath)) return;
+  if (!markerPath) return;
 
-  const marker = readSessionMarker();
-  if (marker && marker.swarm_id === swarmId && marker.agent_name.toLowerCase() === agentName.toLowerCase()) {
-    fs.unlinkSync(markerPath);
+  // Drop this swarm's own marker unconditionally...
+  const scopedPath = scopedSessionMarkerPath(markerPath, swarmId);
+  const scoped = parseTtySessionMarker(scopedPath);
+  if (scoped && scoped.agent_name.toLowerCase() === agentName.toLowerCase()) {
+    fs.rmSync(scopedPath, { force: true });
+  }
+
+  // ...but the active marker only when it is the membership being removed; it may
+  // name a different swarm this TTY is still joined to.
+  const active = parseTtySessionMarker(markerPath);
+  if (active && active.swarm_id === swarmId && active.agent_name.toLowerCase() === agentName.toLowerCase()) {
+    fs.rmSync(markerPath, { force: true });
+    // Re-point at a surviving membership so the next unqualified command still resolves.
+    const survivor = listHeadlessMarkers()[0];
+    if (survivor) setActiveHeadlessSwarm(survivor.swarm_id);
   }
 }
 
@@ -352,8 +508,11 @@ export function joinAgent(
           surface_id: surfaceId,
         };
       }
-      db.prepare("DELETE FROM agents WHERE surface_id = ? AND swarm_id != ? AND agent_type = 'cmux'")
-        .run(surfaceId, swarmId);
+      // A surface may hold one cmux membership per swarm and belong to many swarms.
+      // This previously deleted the surface's rows in every OTHER swarm, so joining a
+      // second swarm silently dropped the first — no warning, and the only symptom was
+      // a roster the agent had no reason to re-read. Memberships are now independent;
+      // `swarm leave` (scoped to one swarm) is the only way out of one.
     }
 
     db.prepare(`
@@ -438,12 +597,15 @@ export function joinHeadlessAgent(
   } = {}
 ): Agent {
   if (options.trackSession) {
-    // This TTY previously joined under a different identity — reap it so a
+    // This TTY previously joined THIS swarm under a different name — reap that row so a
     // single interactive session never leaves a ghost behind after a rename.
-    const currentMarker = readSessionMarker();
-    if (currentMarker && (currentMarker.swarm_id !== swarmId || currentMarker.agent_name.toLowerCase() !== name.toLowerCase())) {
+    // Scoped to the same swarm on purpose: a marker naming a DIFFERENT swarm is a
+    // separate membership this TTY still holds, and deleting it was the silent
+    // cross-swarm drop that multi-swarm membership exists to prevent.
+    const currentMarker = readSessionMarker(swarmId);
+    if (currentMarker && currentMarker.agent_name.toLowerCase() !== name.toLowerCase()) {
       db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'")
-        .run(currentMarker.swarm_id, currentMarker.agent_name);
+        .run(swarmId, currentMarker.agent_name);
     }
   }
 
@@ -491,13 +653,24 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
     // A concrete registration for the current Cmux surface is authoritative.
     // Child processes can stamp the shared TTY's headless marker, so that
     // marker is only a fallback when this selected swarm has no surface row.
+    if (!resolvedSwarmId) {
+      // This surface may be in several swarms. Honour the explicit active pointer
+      // before falling back to recency, and only if it names a live membership.
+      const activeSwarmId = readActiveSwarmId(surfaceId);
+      if (activeSwarmId) {
+        const active = db.prepare(
+          "SELECT 1 FROM agents WHERE swarm_id = ? AND surface_id = ? AND agent_type = 'cmux' LIMIT 1"
+        ).get(activeSwarmId, surfaceId);
+        if (active) resolvedSwarmId = activeSwarmId;
+      }
+    }
     const sql = resolvedSwarmId
       ? 'SELECT * FROM agents WHERE swarm_id = ? AND surface_id = ? ORDER BY joined_at DESC LIMIT 1'
       : 'SELECT * FROM agents WHERE surface_id = ? ORDER BY joined_at DESC LIMIT 1';
     const params = resolvedSwarmId ? [resolvedSwarmId, surfaceId] : [surfaceId];
     const bySurface = db.prepare(sql).get(...params) as Agent | undefined;
     if (bySurface) {
-      const marker = readSurfaceSessionMarker(surfaceId);
+      const marker = readSurfaceSessionMarker(surfaceId, bySurface.swarm_id);
       return {
         agent: bySurface,
         presentedToken:
@@ -527,9 +700,14 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
     };
   }
 
-  const marker = readSessionMarker();
-  if (marker) {
-    const markerSwarmId = resolvedSwarmId || marker.swarm_id;
+  const activeMarker = readSessionMarker();
+  if (activeMarker) {
+    const markerSwarmId = resolvedSwarmId || activeMarker.swarm_id;
+    // Authenticate against the marker for the swarm actually being addressed. Using the
+    // active marker's token here would reject every command aimed at a second swarm,
+    // since each membership mints its own token.
+    const marker = readSessionMarker(markerSwarmId);
+    if (!marker) return null;
     const byMarker = db.prepare(`
       SELECT * FROM agents
       WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
@@ -631,6 +809,19 @@ export function updateHeartbeat(db: SwarmDb, swarmId: string, surfaceId: string)
   const now = nowIso();
   db.prepare('UPDATE agents SET last_heartbeat = ? WHERE swarm_id = ? AND surface_id = ?').run(now, swarmId, surfaceId);
   db.prepare('UPDATE swarms SET last_active_at = ? WHERE id = ?').run(now, swarmId);
+}
+
+/**
+ * A heartbeat records that the TERMINAL is alive, which is true for every swarm the
+ * surface belongs to — not only the one whose command happened to run. Without this,
+ * non-default memberships keep a heartbeat frozen at join time, and cleanupStale's
+ * `heartbeatAge <= STALE_THRESHOLD_MS` grace clause — the only thing standing between
+ * a false-negative liveness probe and deletion — is permanently disarmed for them.
+ */
+export function touchSurfaceMemberships(db: SwarmDb, surfaceId: string): void {
+  const now = nowIso();
+  db.prepare("UPDATE agents SET last_heartbeat = ? WHERE surface_id = ? AND agent_type = 'cmux'")
+    .run(now, surfaceId);
 }
 
 const STALE_THRESHOLD_MS = 30 * 60 * 1000; // 30 minutes

@@ -5,7 +5,7 @@ import path from 'path';
 import os from 'os';
 import { deliverToAgent } from './transport-router.js';
 import { getAgent } from './registry.js';
-import type { Message } from './mailbox.js';
+import { swarmTagFor, type Message } from './mailbox.js';
 
 // A queued (push-failed) message is only worth re-pushing while the conversation
 // that produced it is still live. Past this window the work has moved on — the
@@ -81,7 +81,7 @@ export async function redeliverPending(
     }
 
     result.attempted++;
-    const formatted = `[SWARM from ${msg.from_agent}]: ${msg.body}`;
+    const formatted = `[SWARM from ${msg.from_agent}${swarmTagFor(db, target, msg.swarm_id)}]: ${msg.body}`;
     try {
       const delivery = await deliver(target, formatted);
       if (delivery.delivered) {

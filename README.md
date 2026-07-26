@@ -102,6 +102,23 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 `swarm reset` clears only the selected/current swarm. Use `swarm reset --all` only when you explicitly want to wipe every swarm.
 
+### Being in more than one swarm at once
+
+One terminal can hold a membership in several swarms — join each one and they coexist:
+
+```bash
+swarm join Quarry --swarm ridge
+swarm join Quarry --swarm docs     # ridge membership survives
+```
+
+- **One swarm is the default.** Commands without `--swarm` act on it; the newest join becomes the default. Switch with `swarm use <swarm>`, or target a single command with `--swarm <swarm>`.
+- **`swarm whoami` lists every membership** and marks which one is the default.
+- **Messages from every swarm reach you.** The awareness hook pulls unread messages from your non-default swarms too, labelled with the swarm to reply in — a message never goes unseen because it arrived in the swarm you were not looking at. Pushed messages from another swarm read `[SWARM from Bob in docs]`.
+- **Put `--swarm` before `send`**, not after: `swarm --swarm docs send Bob "hi"`. A message body is a free-text tail, so a trailing `--swarm docs` is part of the message rather than a selector. `swarm send` refuses that case rather than delivering to the wrong swarm.
+- **`swarm leave` leaves one swarm**, not all of them; the remaining memberships keep their identities and the default re-points to a survivor.
+
+Each membership is independent: separate name, separate inbox, separate session token. Agent names only need to be unique *within* a swarm, so you can be `Quarry` in one and `Lead` in another.
+
 ## Task-based operation
 
 Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
@@ -154,6 +171,8 @@ Claude Code and Grok CLI expose these as slash commands (`/join-swarm`, etc.). C
 ```
 Swarm selection:
   --swarm <name>, -s <name>                  Run the command in a named swarm
+  swarm use <swarm>                          Set the default swarm for this terminal
+                                             (when it belongs to several)
 
 Swarm management:
   swarm create <name> [--root <path>]        Create/update a named swarm
@@ -224,7 +243,8 @@ Operator visibility:
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
         [--headless] [--push] [--force] [--force-surface] [--swarm <name>]
-  swarm leave                                 Deregister from the current swarm
+  swarm leave                                 Deregister from the current swarm only
+                                              (other memberships here survive)
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read an agent's terminal screen
 

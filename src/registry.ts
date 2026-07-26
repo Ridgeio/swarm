@@ -10,6 +10,7 @@ import {
   type CmuxLivenessObserver,
 } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
+import { MODEL_FAMILY_MAP as HOST_MODEL_FAMILY } from './model-family.js';
 import type { AgentType } from './transport-interface.js';
 
 /**
@@ -61,6 +62,8 @@ export interface Agent {
   /** Host harness that owns this terminal. */
   host_agent: HostAgentKind | null;
   worker_version: string | null;
+  /** Declared model family ('claude' | 'openai' | 'xai' | 'google'); null = undeclared. */
+  model_family: string | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -474,8 +477,12 @@ export function joinAgent(
   const workerVersion = agentType === 'a2a'
     ? null
     : captureWorkerVersion(host, versionRunner);
+  // Record the family a local harness implies, so the roster states it rather than every
+  // reader re-deriving it. A2A rows stay null until they declare one.
+  const impliedFamily = host ? HOST_MODEL_FAMILY[host] ?? null : null;
 
   let surfaceTakeover: JoinedAgent['surface_takeover'];
+  let persistedFamily: string | null = impliedFamily;
   withImmediateTransaction(db, () => {
     const existing = getAgent(db, swarmId, name);
     if (existing && existing.surface_id !== surfaceId) {
@@ -519,12 +526,17 @@ export function joinAgent(
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
         joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
-        worker_version
+        worker_version, model_family
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid,
-      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion
+      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion,
+      // INSERT OR REPLACE rewrites the whole row, so without this a re-registration
+      // that says nothing about family would silently erase a previous declaration and
+      // quietly demote the agent to UNKNOWN. A harness-implied family still wins, since
+      // that is a fresh observation of what the agent actually is.
+      (persistedFamily = impliedFamily ?? existing?.model_family ?? null)
     );
 
     db.prepare(`
@@ -546,6 +558,9 @@ export function joinAgent(
     endpoint_url: endpointUrl ?? null,
     host_agent: host,
     worker_version: workerVersion,
+    // Must match what the INSERT above persisted, including a preserved declaration —
+    // a returned object that disagrees with its own row is a trap for every caller.
+    model_family: persistedFamily,
     surface_id: surfaceId,
     workspace_id: workspaceId ?? null,
     ppid,
@@ -564,14 +579,23 @@ export function joinA2AAgent(
   swarmId: string,
   name: string,
   endpointUrl: string,
-  description?: string
+  description?: string,
+  modelFamily?: string | null
 ): Agent {
   const existing = getAgent(db, swarmId, name);
   if (existing && existing.agent_type === 'cmux') {
     throw new Error(`Agent "${name}" is already registered as a Cmux agent in this swarm. Choose a different name or remove the existing agent first.`);
   }
   const syntheticSurfaceId = `a2a:${swarmId}:${name}`;
-  return joinAgent(db, swarmId, name, syntheticSurfaceId, undefined, 0, description, 'a2a', endpointUrl);
+  const agent = joinAgent(db, swarmId, name, syntheticSurfaceId, undefined, 0, description, 'a2a', endpointUrl);
+  if (modelFamily) setModelFamily(db, swarmId, name, modelFamily);
+  return getAgent(db, swarmId, name) ?? agent;
+}
+
+/** Record what an agent says it is. Local agents get this from their harness at join. */
+export function setModelFamily(db: SwarmDb, swarmId: string, name: string, family: string): void {
+  db.prepare('UPDATE agents SET model_family = ? WHERE swarm_id = ? AND name = ? COLLATE NOCASE')
+    .run(family, swarmId, name);
 }
 
 export function leaveAgent(db: SwarmDb, swarmId: string, surfaceId: string): boolean {

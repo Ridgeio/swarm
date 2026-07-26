@@ -86,6 +86,7 @@ function createCurrentTables(db: SwarmDb): void {
       host_agent TEXT,
       session_token TEXT,
       worker_version TEXT,
+      model_family TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       UNIQUE (swarm_id, name)
     );
@@ -395,6 +396,19 @@ function ensureAgentWorkerVersionColumn(db: SwarmDb): void {
   }
 }
 
+/**
+ * Declared model family. Local agents derive it from their harness, but an A2A agent
+ * has no harness we can inspect, so it must be able to SAY what it is — otherwise
+ * cross-family review routing has to guess, and a guess is what it must never do.
+ */
+function ensureAgentModelFamilyColumn(db: SwarmDb): void {
+  if (!tableExists(db, 'agents')) return;
+  const columns = tableColumns(db, 'agents');
+  if (!columns.has('model_family')) {
+    db.exec('ALTER TABLE agents ADD COLUMN model_family TEXT');
+  }
+}
+
 function migrate(db: SwarmDb): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -406,6 +420,7 @@ function migrate(db: SwarmDb): void {
   ensureTaskClaimKindColumn(db);
   ensureAgentSessionTokenColumn(db);
   ensureAgentWorkerVersionColumn(db);
+  ensureAgentModelFamilyColumn(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);

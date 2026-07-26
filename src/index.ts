@@ -129,7 +129,7 @@ import {
 } from './board-server.js';
 import { createGrant, listGrants, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
-import { requestTaskReview } from './reviews.js';
+import { agentModelFamily, MODEL_FAMILIES, parseModelFamily, requestTaskReview } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
 import { renderAgentHelp } from './agent-help.js';
 
@@ -334,7 +334,10 @@ Agent Management:
                                                      (one swarm only — other
                                                       memberships on this surface survive)
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
-    [--description <text>] [--force]
+    [--description <text>] [--force]                 (--family declares the model family;
+    [--family <claude|openai|xai|google>]             without it the agent counts as
+                                                      UNKNOWN and cannot review
+                                                      across families)
   swarm unregister-a2a <name>                      Remove an A2A agent
   swarm discover <url>                             Fetch and display an A2A agent card
   swarm serve [--name <agent>] [--port <n>]        Expose a local agent's inbox as an A2A
@@ -837,7 +840,23 @@ async function main() {
           console.log(`Reaped stale "${reaped.name}" (${reaped.agent_type}) from swarm "${swarm.name}" — surface was dead.`);
         }
         reclaimHeadlessNameOrExit(db, swarm, getAgent(db, swarm.id, name), hasFlag('--force'));
-        const agent = joinA2AAgent(db, swarm.id, name, endpoint, agentDescription);
+        // Declared family: an A2A agent has no inspectable harness, so without this it
+        // stays UNKNOWN and cannot serve as a cross-family reviewer.
+        const familyFlag = getFlag('--family');
+        if (familyFlag && !parseModelFamily(familyFlag)) {
+          console.error(`Invalid --family "${familyFlag}". Expected one of: ${MODEL_FAMILIES.join(', ')}.`);
+          process.exit(1);
+        }
+        const agent = joinA2AAgent(db, swarm.id, name, endpoint, agentDescription, parseModelFamily(familyFlag));
+        // Warn on the RESULT, not on the flag: a re-registration without --family keeps
+        // any previous declaration, and warning there would report a demotion that did
+        // not happen.
+        if (agentModelFamily(agent) === 'unknown') {
+          console.warn(
+            `Note: "${name}" has no declared model family, so it does NOT count as a cross-family reviewer. ` +
+            `Re-register with --family <${MODEL_FAMILIES.join('|')}> --force to declare it.`
+          );
+        }
         console.log(`Registered A2A agent "${agent.name}" in swarm "${swarm.name}" @ ${endpoint}`);
         break;
       }
@@ -1796,14 +1815,29 @@ async function main() {
             const you = self && agent.name.toLowerCase() === self.name.toLowerCase() ? ' (you)' : '';
             const desc = agent.description ? ` — ${agent.description}` : '';
             const host = agent.host_agent ? `/${agent.host_agent}` : '';
+            // Show the model family on the roster. Cross-family review is the fleet's
+            // main control, and deciding it required inferring family from the harness
+            // string — impossible for a2a seats, which read as "some other family" by
+            // default. Print it, and print UNKNOWN as a word rather than an absence.
+            const family = agentModelFamily(agent);
+            const familyLabel = family === 'unknown' ? ' family=UNKNOWN' : ` family=${family}`;
             const type = agent.agent_type === 'a2a'
               ? ` [a2a] @ ${agent.endpoint_url}`
               : agent.agent_type === 'headless'
                 ? ` [headless${host}]`
                 : ` [cmux${host}]`;
-            console.log(`  ${agent.name}${type}${you}${desc}`);
+            console.log(`  ${agent.name}${type}${familyLabel}${you}${desc}`);
           }
           console.log(`\n${agents.length} agent(s)`);
+          const families = new Set(agents.map(a => agentModelFamily(a)).filter(f => f !== 'unknown'));
+          const unknownCount = agents.filter(a => agentModelFamily(a) === 'unknown').length;
+          if (families.size < 2) {
+            console.log(
+              `Model families live: ${families.size === 0 ? 'none known' : [...families].join(', ')}` +
+              `${unknownCount > 0 ? ` (+${unknownCount} UNKNOWN, which cannot review across families)` : ''}` +
+              ` — cross-family review is NOT available in this swarm.`
+            );
+          }
         }
         if (agents.some(agent => agent.agent_type !== 'headless') && !isCmuxObserverCompetent()) {
           console.warn(CMUX_LIVENESS_UNKNOWN_MESSAGE);
@@ -1858,6 +1892,7 @@ async function main() {
         console.log(`Swarm ID: ${self.swarm_id}`);
         console.log(`Type: ${self.agent_type}`);
         if (self.host_agent) console.log(`Host: ${self.host_agent}`);
+        console.log(`Model family: ${agentModelFamily(self)}`);
         console.log(`Surface: ${self.surface_id}`);
         console.log(`Workspace: ${self.workspace_id ?? 'N/A'}`);
         console.log(`Joined: ${self.joined_at}`);

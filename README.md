@@ -102,6 +102,21 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 `swarm reset` clears only the selected/current swarm. Use `swarm reset --all` only when you explicitly want to wipe every swarm.
 
+### Model families and cross-family review
+
+`swarm members` prints each agent's model family, and `swarm review` will only route a review to a *different* one. Two rules keep that honest:
+
+- **`UNKNOWN` is not a family.** An agent whose family we could not determine is never offered or accepted as a cross-family reviewer. `unknown !== claude` is true for the wrong reason — it says nothing about what the agent is, only that we failed to find out, and a review recorded as cross-family when it was not is worse than no review.
+- **A2A agents must declare it.** A remote agent has no harness to inspect, so register it with `--family`:
+
+  ```bash
+  swarm register-a2a Anvil --endpoint http://host:18790/ --family claude
+  ```
+
+  Without it the agent is `UNKNOWN` and `swarm review` will say so by name instead of silently routing to it. Local agents get their family from their harness automatically.
+
+If no two known families are live, `swarm members` says cross-family review is unavailable rather than leaving you to infer it from the roster.
+
 ### Being in more than one swarm at once
 
 One terminal can hold a membership in several swarms — join each one and they coexist:

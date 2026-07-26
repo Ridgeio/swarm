@@ -161,9 +161,14 @@ describe('T6 model-inversion review routing', () => {
         SELECT data FROM task_events
         WHERE task_id = 'same-family' AND kind = 'same_family_review'
       `).get() as { data: string };
+      // `gate` and `author_family` were added so the record says WHICH refusal was
+      // overridden — the same event kind now also covers unknown-family overrides,
+      // which previously bypassed the control without writing anything at all.
       assert.deepStrictEqual(JSON.parse(event.data), {
+        gate: 'same-family',
         reviewer: 'Same',
         reviewer_family: 'claude',
+        author_family: 'claude',
         reason: 'Only reviewer with domain context',
       });
     } finally {

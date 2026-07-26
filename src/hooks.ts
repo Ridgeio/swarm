@@ -18,6 +18,13 @@ export function detectHost(): HostAgent | null {
   if (process.env.CODEX_CLI || process.env.CODEX_CI || process.env.CODEX_THREAD_ID || process.env.CODEX_MANAGED_BY_NPM) {
     return 'codex';
   }
+  // NOTE: process.env.CLAUDE_CODE is not actually set by Claude Code (measured: it
+  // exports CLAUDE_CODE_ENTRYPOINT instead), so this branch rarely fires and a Claude
+  // session outside Cmux can end up with host_agent NULL and an UNKNOWN model family.
+  // Do NOT "fix" it by also testing CLAUDE_CODE_ENTRYPOINT: that variable is inherited
+  // by every child process, so a codex or grok agent spawned from a Claude session
+  // would be misdetected as claude-code — mislabelling a family is worse than not
+  // knowing it. A correct fix needs a signal that does not leak across spawns.
   if (process.env.CLAUDE_CODE) return 'claude-code';
   // Cmux labels the launch kind for every agent it starts; Bash subshells of a
   // Claude Code session carry this even when CLAUDE_CODE itself is not exported

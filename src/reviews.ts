@@ -13,14 +13,17 @@ import {
   type Task,
 } from './tasks.js';
 
-export type ModelFamily = 'claude' | 'openai' | 'xai' | 'google' | 'unknown';
-
-export const MODEL_FAMILY_MAP: Readonly<Record<string, ModelFamily>> = Object.freeze({
-  'claude-code': 'claude',
-  codex: 'openai',
-  grok: 'xai',
-  gemini: 'google',
-});
+// Canonical definitions live in model-family.ts (shared with the registry); re-exported
+// here so existing importers of these names keep working.
+export {
+  agentModelFamily,
+  deriveModelFamily,
+  MODEL_FAMILIES,
+  MODEL_FAMILY_MAP,
+  parseModelFamily,
+  type ModelFamily,
+} from './model-family.js';
+import { agentModelFamily, deriveModelFamily, type ModelFamily } from './model-family.js';
 
 export const REVIEW_PRIORS: Readonly<Record<ModelFamily, string>> = Object.freeze({
   claude: 'missing behavior (top), then semantic intent, error handling',
@@ -51,9 +54,6 @@ export interface ReviewResult {
   messageId: number | null;
 }
 
-export function deriveModelFamily(hostAgent: string | null | undefined): ModelFamily {
-  return hostAgent ? MODEL_FAMILY_MAP[hostAgent] ?? 'unknown' : 'unknown';
-}
 
 function sameName(left: string | null | undefined, right: string): boolean {
   return left?.toLowerCase() === right.toLowerCase();
@@ -86,8 +86,22 @@ function openReviewLoads(db: SwarmDb, swarmId: string): Map<string, number> {
   return loads;
 }
 
+/**
+ * Candidates that actually PROVE inversion. An agent of unknown family is excluded:
+ * "unknown !== claude" is true for the wrong reason — it says nothing about what the
+ * agent is, only that we failed to find out. Counting it would let the cross-family
+ * control be satisfied by a seat that may well be the same family as the author,
+ * which is the one thing the control exists to prevent.
+ */
 function differentFamilyAgents(agents: Agent[], authorFamily: ModelFamily): Agent[] {
-  return agents.filter(agent => deriveModelFamily(agent.host_agent) !== authorFamily);
+  return agents.filter(agent => {
+    const family = agentModelFamily(agent);
+    return family !== 'unknown' && family !== authorFamily;
+  });
+}
+
+function unknownFamilyAgents(agents: Agent[]): Agent[] {
+  return agents.filter(agent => agentModelFamily(agent) === 'unknown');
 }
 
 function sameFamilyRefusal(
@@ -102,6 +116,34 @@ function sameFamilyRefusal(
     `model inversion requires a reviewer from a different model family. Live different-family members: ${names}. ` +
     `Choose one with --to <agent>, or audit the exception with --to ${reviewer.name} ` +
     `--same-family-ok --reason "<text>".`;
+}
+
+/**
+ * How to make a specific agent's family known. An A2A agent re-registers with its
+ * endpoint; a local agent has no such command — telling it to run `register-a2a` would
+ * either fail on the missing --endpoint or convert a live local seat into an A2A row.
+ */
+function declareFamilyHint(agent: Agent): string {
+  if (agent.agent_type === 'a2a') {
+    return `re-register it with a declared family: swarm register-a2a ${agent.name} ` +
+      `--endpoint ${agent.endpoint_url ?? '<url>'} --family <claude|openai|xai|google> --force`;
+  }
+  return `have "${agent.name}" rejoin from a terminal whose harness is detected ` +
+    `(swarm join ${agent.name}) so its family is recorded`;
+}
+
+function unknownFamilyRefusal(
+  slug: string,
+  reviewer: Agent,
+  alternatives: Agent[]
+): string {
+  const names = alternatives.length > 0
+    ? alternatives.map(agent => agent.name).join(', ')
+    : 'none currently live';
+  return `Refused review for task "${slug}" with reviewer "${reviewer.name}": its model family is UNKNOWN, ` +
+    `so routing to it would not establish inversion — it may be the same family as the author. ` +
+    `To fix, ${declareFamilyHint(reviewer)}; or pick a known different-family reviewer (${names}); ` +
+    `or audit the exception with --to ${reviewer.name} --same-family-ok --reason "<text>".`;
 }
 
 function reviewBody(
@@ -163,26 +205,54 @@ export async function requestTaskReview(
   const authority = requireTaskAuthority(db, swarmId, slug, actor, 'review');
   const task = authority.task;
   const author = task.owner_agent ? getAgent(db, swarmId, task.owner_agent) : null;
-  const authorFamily = deriveModelFamily(author?.host_agent);
+  const authorFamily = author ? agentModelFamily(author) : 'unknown';
   const liveAgents = await listAgents(db, swarmId);
   const alternatives = differentFamilyAgents(liveAgents, authorFamily);
+  const unknowns = unknownFamilyAgents(liveAgents);
   let reviewer: Agent;
+  // Which refusal --same-family-ok actually suppressed; null when nothing was bypassed.
+  let overriddenGate: 'same-family' | 'unknown-reviewer' | 'unknown-author' | null = null;
+
+  // An unknown AUTHOR family makes inversion unprovable in the other direction too:
+  // "different from unknown" is not a statement about anything.
+  if (authorFamily === 'unknown' && options.sameFamilyOk) {
+    overriddenGate = 'unknown-author';
+  }
+  if (authorFamily === 'unknown' && !options.sameFamilyOk) {
+    throw new Error(
+      `Cannot establish model inversion for task "${slug}": the author's model family is UNKNOWN` +
+      `${author ? ` ("${author.name}" declares no family and has no detected harness)` : ' (no owner recorded)'}. ` +
+      `${author ? `To fix, ${declareFamilyHint(author)}; or ` : ''}` +
+      `audit the exception with --to <agent> --same-family-ok --reason "<text>".`
+    );
+  }
 
   if (options.to) {
     const target = liveAgents.find(agent => sameName(agent.name, options.to!));
     if (!target) {
       throw new Error(`Reviewer "${options.to}" is not live in this swarm. Run "swarm members", then retry --to or spawn a reviewer.`);
     }
-    const reviewerFamily = deriveModelFamily(target.host_agent);
-    if (reviewerFamily === authorFamily && !options.sameFamilyOk) {
-      throw new Error(sameFamilyRefusal(slug, target, alternatives));
+    const reviewerFamily = agentModelFamily(target);
+    // Unknown is refused as loudly as same-family: an unverified inversion recorded as
+    // satisfied is worse than no review, because it stops anyone looking for a real one.
+    if (reviewerFamily === 'unknown') {
+      if (!options.sameFamilyOk) throw new Error(unknownFamilyRefusal(slug, target, alternatives));
+      overriddenGate = overriddenGate ?? 'unknown-reviewer';
+    }
+    if (reviewerFamily === authorFamily) {
+      if (!options.sameFamilyOk) throw new Error(sameFamilyRefusal(slug, target, alternatives));
+      overriddenGate = 'same-family';
     }
     reviewer = target;
   } else {
     if (alternatives.length === 0) {
+      const unknownNote = unknowns.length > 0
+        ? ` ${unknowns.length} live agent(s) have an UNKNOWN family and do not count: ` +
+          `${unknowns.map(a => a.name).join(', ')} — declare with --family to make them eligible.`
+        : '';
       throw new Error(
-        `No live cross-family reviewer is available for task "${slug}" (author family: ${authorFamily}). ` +
-        `Spawn a reviewer from a different model family, then re-run swarm review ${slug}.`
+        `No live cross-family reviewer is available for task "${slug}" (author family: ${authorFamily}).` +
+        `${unknownNote} Spawn a reviewer from a different model family, then re-run swarm review ${slug}.`
       );
     }
     const loads = openReviewLoads(db, swarmId);
@@ -193,7 +263,7 @@ export async function requestTaskReview(
     });
   }
 
-  const reviewerFamily = deriveModelFamily(reviewer.host_agent);
+  const reviewerFamily = agentModelFamily(reviewer);
   const now = options.now ?? new Date();
   const briefDir = path.join(options.homeDir ?? os.homedir(), '.swarm', 'briefs', 'reviews');
   fs.mkdirSync(briefDir, { recursive: true });
@@ -212,13 +282,21 @@ export async function requestTaskReview(
       UPDATE tasks SET state = 'awaiting_review', updated_at = ?
       WHERE swarm_id = ? AND id = ?
     `).run(createdAt, swarmId, slug);
-    if (reviewerFamily === authorFamily && options.sameFamilyOk) {
+    // Audit EVERY use of the override, not only the same-family one. Gating this on
+    // family equality left the two unknown-family bypasses unrecorded: the ledger row
+    // was byte-identical to a legitimate cross-family review and the mandatory --reason
+    // was validated and then discarded, so an auditor counting exceptions saw zero while
+    // the control had in fact been bypassed. Kind stays `same_family_review` so existing
+    // auditors keep matching; `gate` says which refusal was overridden.
+    if (overriddenGate) {
       db.prepare(`
         INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
         VALUES (?, ?, ?, 'same_family_review', ?, ?, ?)
       `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
+        gate: overriddenGate,
         reviewer: reviewer.name,
         reviewer_family: reviewerFamily,
+        author_family: authorFamily,
         reason: options.reason!.trim(),
       }), createdAt);
     }

@@ -16,8 +16,10 @@ import {
   joinHeadlessAgent,
   leaveAgent,
   leaveHeadlessAgent,
+  listOwnedHeadlessMarkers,
   listSurfaceMemberships,
   readActiveSwarmId,
+  setActiveHeadlessSwarm,
   touchSurfaceMemberships,
   writeActiveSwarmId,
 } from '../src/registry.js';
@@ -444,6 +446,37 @@ describe('multi-swarm membership for headless sessions', () => {
     const resolved = getSelf(db);
     assert.ok(resolved, 'must not report "not joined" while beta is alive');
     assert.strictEqual(resolved!.swarm_id, beta.id, 'falls back to the surviving membership');
+  });
+
+  /**
+   * A marker names a swarm and an agent, and both survive that agent being replaced:
+   * another terminal can force-reclaim the name with a fresh token. Validating only that
+   * the ROW EXISTS is exactly what reclamation defeats — the stale session then reports
+   * the reclaimed seat as its own membership, can make it the default, and reads that
+   * agent's inbox. Only a token match distinguishes "mine" from "someone else's, same name".
+   */
+  test('a reclaimed seat is not reported as this session membership', (t) => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+    if (!hasTty()) return t.skip('no controlling TTY: headless session markers cannot be written');
+
+    joinHeadlessAgent(db, alpha.id, 'OldSeat', undefined, { trackSession: true });
+    joinHeadlessAgent(db, beta.id, 'Mine', undefined, { trackSession: true });
+    assert.strictEqual(listOwnedHeadlessMarkers(db).length, 2, 'precondition: both owned');
+
+    // Another terminal force-reclaims alpha/OldSeat, minting a new token. This session's
+    // alpha marker keeps the OLD one, so the row still exists under the same name.
+    db.prepare("UPDATE agents SET session_token = 'reclaimed-token' WHERE swarm_id = ? AND name = 'OldSeat'")
+      .run(alpha.id);
+
+    const owned = listOwnedHeadlessMarkers(db);
+    assert.strictEqual(owned.length, 1, 'the reclaimed seat is no longer ours');
+    assert.strictEqual(owned[0].swarm_id, beta.id);
+
+    // ...and it cannot be adopted as the default, which is how the stale session would
+    // have gone on to read the reclaimed agent's inbox.
+    assert.strictEqual(setActiveHeadlessSwarm(db, alpha.id), false, 'use must refuse a seat we do not own');
+    assert.strictEqual(setActiveHeadlessSwarm(db, beta.id), true, 'our own membership still works');
   });
 
   test('a same-swarm rename still reaps the old headless row', (t) => {

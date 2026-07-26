@@ -215,12 +215,38 @@ export function readActiveHeadlessSwarmId(): string | null {
   return parseTtySessionMarker(markerPath)?.swarm_id ?? null;
 }
 
-/** Point this TTY's unqualified commands at a swarm it already has a marker for. */
-export function setActiveHeadlessSwarm(swarmId: string): boolean {
+/**
+ * Does this marker still describe a membership this session owns?
+ *
+ * A marker names a swarm and an agent, and both survive the agent being replaced: another
+ * terminal can force-reclaim the name, minting a new token. The marker's token is the only
+ * thing that distinguishes "my membership" from "someone else's seat with the same name",
+ * so a row-exists check is not enough — it is exactly what reclamation defeats.
+ */
+function headlessMarkerOwnsRow(db: SwarmDb, marker: SessionMarker): boolean {
+  if (!marker.session_token) return false;
+  const row = db.prepare(`
+    SELECT session_token FROM agents
+    WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
+  `).get(marker.swarm_id, marker.agent_name) as { session_token: string | null } | undefined;
+  return !!row && row.session_token === marker.session_token;
+}
+
+/** This TTY's headless memberships, each proven by a token match against its live row. */
+export function listOwnedHeadlessMarkers(db: SwarmDb): SessionMarker[] {
+  return listHeadlessMarkers().filter(marker => headlessMarkerOwnsRow(db, marker));
+}
+
+/**
+ * Point this TTY's unqualified commands at a swarm it OWNS a membership in. Without the
+ * ownership check, a stale marker let a dead session adopt a reclaimed seat as its default
+ * and then read that agent's inbox.
+ */
+export function setActiveHeadlessSwarm(db: SwarmDb, swarmId: string): boolean {
   const markerPath = getSessionMarkerPath();
   if (!markerPath) return false;
   const scoped = parseTtySessionMarker(scopedSessionMarkerPath(markerPath, swarmId));
-  if (!scoped) return false;
+  if (!scoped || !headlessMarkerOwnsRow(db, scoped)) return false;
   fs.writeFileSync(markerPath, JSON.stringify(scoped, null, 2), { encoding: 'utf-8', mode: 0o600 });
   return true;
 }
@@ -371,7 +397,7 @@ export function listSurfaceMemberships(db: SwarmDb, surfaceId: string): Agent[] 
   `).all(surfaceId) as unknown as Agent[];
 }
 
-function removeSessionMarker(swarmId: string, agentName: string): void {
+function removeSessionMarker(db: SwarmDb, swarmId: string, agentName: string): void {
   const markerPath = getSessionMarkerPath();
   if (!markerPath) return;
 
@@ -388,8 +414,8 @@ function removeSessionMarker(swarmId: string, agentName: string): void {
   if (active && active.swarm_id === swarmId && active.agent_name.toLowerCase() === agentName.toLowerCase()) {
     fs.rmSync(markerPath, { force: true });
     // Re-point at a surviving membership so the next unqualified command still resolves.
-    const survivor = listHeadlessMarkers()[0];
-    if (survivor) setActiveHeadlessSwarm(survivor.swarm_id);
+    const survivor = listOwnedHeadlessMarkers(db)[0];
+    if (survivor) setActiveHeadlessSwarm(db, survivor.swarm_id);
   }
 }
 
@@ -680,7 +706,7 @@ export function leaveHeadlessAgent(
   const result = db.prepare("DELETE FROM agents WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'")
     .run(swarmId, name);
   if (options.trackSession) {
-    removeSessionMarker(swarmId, name);
+    removeSessionMarker(db, swarmId, name);
   }
   return Number(result.changes) > 0;
 }
@@ -779,7 +805,7 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
       if (!survivor) continue;
       // Repoint the active marker, or every later command repeats this search and
       // `whoami` keeps reporting a swarm that no longer exists as the default.
-      setActiveHeadlessSwarm(scoped.swarm_id);
+      setActiveHeadlessSwarm(db, scoped.swarm_id);
       return survivor;
     }
     return null;

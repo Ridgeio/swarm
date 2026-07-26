@@ -32,7 +32,7 @@ import {
   reapAll,
   reapIfDead,
   refreshHostAcrossMemberships,
-  listHeadlessMarkers,
+  listOwnedHeadlessMarkers,
   readActiveHeadlessSwarmId,
   readActiveSwarmId,
   setActiveHeadlessSwarm,
@@ -545,8 +545,9 @@ function swarmNameFor(db: ReturnType<typeof getDb>, swarmId: string): string {
 function headlessMemberships(
   db: ReturnType<typeof getDb>
 ): Array<{ swarm_id: string; name: string }> {
-  return listHeadlessMarkers()
-    .filter(marker => getAgent(db, marker.swarm_id, marker.agent_name)?.agent_type === 'headless')
+  // Ownership-checked, not merely row-exists: a name survives reclamation, so an
+  // existence check still lets a stale session claim a seat another terminal now owns.
+  return listOwnedHeadlessMarkers(db)
     .map(marker => ({ swarm_id: marker.swarm_id, name: marker.agent_name }));
 }
 
@@ -2013,7 +2014,7 @@ async function main() {
         // retarget the parent agent's default swarm.
         const { self: caller } = requireSelf();
         if (caller.agent_type === 'headless') {
-          if (!setActiveHeadlessSwarm(targetSwarm.id)) {
+          if (!setActiveHeadlessSwarm(db, targetSwarm.id)) {
             console.error(
               `Error: this session has no headless membership in "${targetSwarm.name}". ` +
               `Run "swarm join <name> --swarm ${targetSwarm.name}" first.`

@@ -3,6 +3,8 @@ import assert from 'node:assert';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { execFileSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { getDbAt } from '../src/db.js';
 import {
   agentModelFamily,
@@ -126,6 +128,46 @@ describe('model family is stated, never guessed', () => {
       'unknown',
       'a borrowed harness must never manufacture a family — unknown refuses, wrong approves'
     );
+  });
+
+  /**
+   * The two tests above call updateHostAgent directly, so they only prove the READ side
+   * ignores a corrupt host_agent — they still pass if requireSelf starts stamping A2A
+   * rows again. Caught in review. This one drives the real CLI so it covers the actual
+   * source of the corruption.
+   */
+  test('a CLI command run as an A2A identity does not stamp the caller harness on its row', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-a2a-e2e-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    try {
+      const swarm = getOrCreateSwarm(cliDb, 'default');
+      joinA2AAgent(cliDb, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'claude');
+      assert.strictEqual(getAgent(cliDb, swarm.id, 'Remote')!.host_agent, null);
+      cliDb.close();
+
+      const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'whoami'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          TMPDIR: path.join(home, 'tmp'),
+          SWARM_AGENT_NAME: 'Remote',   // act AS the remote identity, as anyone local can
+          CODEX_CI: '1',                // ...from a codex process
+          SWARM_TEST_DISABLE_BACKGROUND: '1',
+        },
+      });
+
+      const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+      const row = getAgent(after, swarm.id, 'Remote')!;
+      after.close();
+      assert.strictEqual(row.host_agent, null, 'a local caller must not write host_agent on an A2A row');
+      assert.strictEqual(agentModelFamily(row), 'claude');
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
   });
 
   test('the stored family is used only when no harness is detectable', () => {
@@ -269,7 +311,7 @@ describe('an unknown-family agent cannot satisfy cross-family review', () => {
     const events = overrideEvents('audit-unknown-reviewer');
     assert.strictEqual(events.length, 1, 'the override must be recorded');
     const data = JSON.parse(events[0].data);
-    assert.strictEqual(data.gate, 'unknown-reviewer');
+    assert.deepStrictEqual(data.gates, ['unknown-reviewer']);
     assert.strictEqual(data.reason, 'no other seat live', 'the mandatory reason must be persisted');
     assert.strictEqual(data.reviewer_family, 'unknown');
   });
@@ -288,7 +330,31 @@ describe('an unknown-family agent cannot satisfy cross-family review', () => {
 
     const events = overrideEvents('audit-unknown-author');
     assert.strictEqual(events.length, 1);
-    assert.strictEqual(JSON.parse(events[0].data).gate, 'unknown-author');
+    assert.deepStrictEqual(JSON.parse(events[0].data).gates, ['unknown-author']);
+  });
+
+  test('when BOTH sides are unknown, the audit names both gates and never claims same-family', async () => {
+    joinLocal('Ghost', null);
+    joinA2AAgent(fdb, 'default', 'Anvil', 'http://127.0.0.1:1/');
+    await startTask(fdb, 'default', 'Ghost', 'both-unknown', {
+      title: 'Both unknown', noWorktree: true, claimKind: 'analysis',
+    });
+
+    await requestTaskReview(fdb, 'default', 'Ghost', 'both-unknown', {
+      to: 'Anvil', sameFamilyOk: true, reason: 'nothing else live',
+      now: new Date(NOW), homeDir: home,
+    });
+
+    const data = JSON.parse(overrideEvents('both-unknown')[0].data);
+    // A single gate slot let the later check overwrite the earlier one, and
+    // `unknown === unknown` was read as family equality — asserting a fact never
+    // established while hiding that BOTH unknown controls had been bypassed.
+    assert.deepStrictEqual(
+      [...data.gates].sort(),
+      ['unknown-author', 'unknown-reviewer'],
+      'both bypassed gates must be named'
+    );
+    assert.ok(!data.gates.includes('same-family'), 'two unmeasured families are not "the same family"');
   });
 
   test('a clean cross-family review records NO override event', async () => {

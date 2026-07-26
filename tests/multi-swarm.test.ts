@@ -4,6 +4,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { createHash } from 'crypto';
+import { execFileSync } from 'child_process';
+import { fileURLToPath } from 'url';
 import { getDbAt } from '../src/db.js';
 import {
   clearActiveSwarmId,
@@ -228,6 +230,53 @@ describe('multi-swarm membership on one surface', () => {
   });
 });
 
+describe('a trailing --swarm selector is refused, not delivered elsewhere', () => {
+  /**
+   * The minimal misuse is `swarm send Bob --swarm docs`, where the ENTIRE message body
+   * is the selector. A guard requiring leading whitespace missed exactly that case and
+   * reported success while inserting into the default swarm — the silent misroute it
+   * exists to prevent. Driven through the real CLI because the guard lives there.
+   */
+  test('a message consisting only of the selector exits non-zero and delivers nothing', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-selector-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const def = getOrCreateSwarm(cliDb, 'default');
+    getOrCreateSwarm(cliDb, 'docs');
+    joinHeadlessAgent(cliDb, def.id, 'Alice', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
+    joinHeadlessAgent(cliDb, def.id, 'Bob', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
+    cliDb.close();
+
+    const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+    let status = 0;
+    try {
+      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'send', 'Bob', '--swarm', 'docs'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          TMPDIR: path.join(home, 'tmp'),
+          SWARM_AGENT_NAME: 'Alice',
+          SWARM_TEST_DISABLE_BACKGROUND: '1',
+        },
+      });
+    } catch (err: any) {
+      status = typeof err.status === 'number' ? err.status : 1;
+    }
+
+    const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const delivered = after.prepare(
+      "SELECT COUNT(*) AS n FROM messages WHERE to_agent = 'Bob'"
+    ).get() as { n: number };
+    after.close();
+    fs.rmSync(home, { recursive: true, force: true });
+
+    assert.notStrictEqual(status, 0, 'must fail loudly rather than deliver somewhere plausible');
+    assert.strictEqual(delivered.n, 0, 'nothing may be inserted into the default swarm');
+  });
+});
+
 describe('pushed-message swarm attribution', () => {
   test('single-swarm recipients keep the original envelope, multi-swarm ones name the swarm', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
@@ -246,10 +295,17 @@ describe('pushed-message swarm attribution', () => {
     assert.strictEqual(swarmTagFor(db, dual, alpha.id), ' in alpha');
   });
 
-  test('headless and a2a targets are never tagged (synthetic surfaces carry no signal)', () => {
+  test('a single-swarm headless target is not tagged, a multi-swarm one is', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
     const headless = joinHeadlessAgent(db, alpha.id, 'Worker');
-    assert.strictEqual(swarmTagFor(db, headless, alpha.id), '');
+    assert.strictEqual(swarmTagFor(db, headless, alpha.id), '', 'one swarm keeps the original format');
+
+    // The same identity joins a second swarm; an untagged push is now ambiguous, which
+    // is the entire reason the tag exists. Asserting headless is NEVER tagged cemented
+    // that ambiguity as intended behaviour.
+    joinHeadlessAgent(db, beta.id, 'Worker');
+    assert.strictEqual(swarmTagFor(db, headless, alpha.id), ' in alpha');
   });
 });
 
@@ -268,9 +324,18 @@ describe('multi-swarm membership for headless sessions', () => {
     return Boolean(resolved);
   })
 
-  test('joining a second swarm headless does not drop the first', (t) => {
+  test('joining a second swarm headless does not drop the first', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     const beta = getOrCreateSwarm(db, 'beta');
+
+    // Without a controlling TTY there is no marker, so the deletion this test exists to
+    // catch cannot fire and the assertions below pass no matter what the source does.
+    // FAIL loudly rather than report a green that proves nothing. (Caught in review: a
+    // mutation test only demonstrates a guard works in the environment it was run in.)
+    assert.ok(
+      hasTty(),
+      'no controlling TTY: the headless marker cannot resolve, so this test would pass vacuously'
+    );
 
     joinHeadlessAgent(db, alpha.id, 'Quarry', undefined, { trackSession: true });
     joinHeadlessAgent(db, beta.id, 'Quarry', undefined, { trackSession: true });
@@ -286,6 +351,29 @@ describe('multi-swarm membership for headless sessions', () => {
     assert.ok(inAlpha, 'alpha membership must SURVIVE the second headless join');
   });
 
+  /**
+   * `swarm reset`/`delete` removes agent rows without touching session markers, so the
+   * unscoped active marker can name a swarm that no longer exists. Reporting "not
+   * joined" then stranded every surviving membership unless the operator guessed the
+   * right swarm name. Cmux already ignored a pointer with no live membership.
+   */
+  test('deleting the active swarm falls back to a surviving headless membership', () => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+    assert.ok(hasTty(), 'no controlling TTY: headless markers cannot resolve');
+
+    joinHeadlessAgent(db, beta.id, 'Quarry', undefined, { trackSession: true });
+    joinHeadlessAgent(db, alpha.id, 'Quarry', undefined, { trackSession: true });
+    assert.strictEqual(getSelf(db)?.swarm_id, alpha.id, 'alpha is active');
+
+    // Exactly what reset/delete does: drop the rows, leave the markers.
+    db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(alpha.id);
+
+    const resolved = getSelf(db);
+    assert.ok(resolved, 'must not report "not joined" while beta is alive');
+    assert.strictEqual(resolved!.swarm_id, beta.id, 'falls back to the surviving membership');
+  });
+
   test('a same-swarm rename still reaps the old headless row', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     joinHeadlessAgent(db, alpha.id, 'OldName', undefined, { trackSession: true });
@@ -299,12 +387,7 @@ describe('multi-swarm membership for headless sessions', () => {
     ).get(alpha.id);
 
     assert.ok(current, 'renamed agent is registered');
-    // Only meaningful when this process has a TTY marker; without one there is
-    // nothing to reap from and the assertion would pass vacuously.
-    if (hasTty()) {
-      assert.strictEqual(ghost, undefined, 'the pre-rename row in the SAME swarm is reaped');
-    } else {
-      assert.ok(true, 'skipped: no controlling TTY, headless marker unavailable');
-    }
+    assert.ok(hasTty(), 'no controlling TTY: nothing to reap from, so this would pass vacuously');
+    assert.strictEqual(ghost, undefined, 'the pre-rename row in the SAME swarm is reaped');
   });
 });

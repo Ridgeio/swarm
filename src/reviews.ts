@@ -211,12 +211,14 @@ export async function requestTaskReview(
   const unknowns = unknownFamilyAgents(liveAgents);
   let reviewer: Agent;
   // Which refusal --same-family-ok actually suppressed; null when nothing was bypassed.
-  let overriddenGate: 'same-family' | 'unknown-reviewer' | 'unknown-author' | null = null;
+  // EVERY bypassed gate is recorded. A single slot let a later gate overwrite an earlier
+  // one, so an override that tripped both unknown gates was filed under one name.
+  const overriddenGates: Array<'same-family' | 'unknown-reviewer' | 'unknown-author'> = [];
 
   // An unknown AUTHOR family makes inversion unprovable in the other direction too:
   // "different from unknown" is not a statement about anything.
   if (authorFamily === 'unknown' && options.sameFamilyOk) {
-    overriddenGate = 'unknown-author';
+    overriddenGates.push('unknown-author');
   }
   if (authorFamily === 'unknown' && !options.sameFamilyOk) {
     throw new Error(
@@ -237,11 +239,15 @@ export async function requestTaskReview(
     // satisfied is worse than no review, because it stops anyone looking for a real one.
     if (reviewerFamily === 'unknown') {
       if (!options.sameFamilyOk) throw new Error(unknownFamilyRefusal(slug, target, alternatives));
-      overriddenGate = overriddenGate ?? 'unknown-reviewer';
+      overriddenGates.push('unknown-reviewer');
     }
-    if (reviewerFamily === authorFamily) {
+    // `unknown === unknown` is NOT same-family — it is two things nobody measured, and
+    // recording it as family equality would assert a fact never established. That is the
+    // same "true for the wrong reason" error this whole change exists to remove, so it
+    // must not be reintroduced in the audit trail itself.
+    if (reviewerFamily !== 'unknown' && reviewerFamily === authorFamily) {
       if (!options.sameFamilyOk) throw new Error(sameFamilyRefusal(slug, target, alternatives));
-      overriddenGate = 'same-family';
+      overriddenGates.push('same-family');
     }
     reviewer = target;
   } else {
@@ -288,12 +294,12 @@ export async function requestTaskReview(
     // was validated and then discarded, so an auditor counting exceptions saw zero while
     // the control had in fact been bypassed. Kind stays `same_family_review` so existing
     // auditors keep matching; `gate` says which refusal was overridden.
-    if (overriddenGate) {
+    if (overriddenGates.length > 0) {
       db.prepare(`
         INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
         VALUES (?, ?, ?, 'same_family_review', ?, ?, ?)
       `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
-        gate: overriddenGate,
+        gates: overriddenGates,
         reviewer: reviewer.name,
         reviewer_family: reviewerFamily,
         author_family: authorFamily,

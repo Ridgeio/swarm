@@ -30,6 +30,8 @@ import {
   listSwarms,
   reapAll,
   reapIfDead,
+  listHeadlessMarkers,
+  readActiveHeadlessSwarmId,
   readActiveSwarmId,
   setActiveHeadlessSwarm,
   touchSurfaceMemberships,
@@ -562,8 +564,16 @@ function printHookContext(): void {
   // message waiting in any of the others is just as real — and invisible unless it
   // is pulled in here, because nothing else polls them. Silence in a joined swarm
   // must never be an artefact of which swarm happens to be selected.
-  const otherSection = self.agent_type === 'cmux'
+  // Headless sessions can hold memberships in several swarms too (their markers are
+  // per-TTY-per-swarm), and nothing else polls the ones that are not active — so leaving
+  // them out here recreated, for headless, exactly the invisible-message failure this
+  // aggregation exists to prevent.
+  const otherMemberships: Array<{ swarm_id: string; name: string }> = self.agent_type === 'cmux'
     ? listSurfaceMemberships(db, self.surface_id)
+    : listHeadlessMarkers(self.name).map(m => ({ swarm_id: m.swarm_id, name: m.agent_name }));
+
+  const otherSection = self.agent_type !== 'a2a'
+    ? otherMemberships
       .filter(m => m.swarm_id !== self.swarm_id)
       .map(m => {
         const otherSwarm = getSwarmById(db, m.swarm_id);
@@ -990,7 +1000,10 @@ async function main() {
         // literal (see FREE_TEXT_TAIL_AT). Now that one terminal can sit in several swarms,
         // a trailing selector would quietly send to the DEFAULT swarm — and if the same
         // agent name exists in both, that is a silent misroute rather than a "not found".
-        const trailingSelector = /\s--swarm(?:=|\s+)([^\s]+)$/.exec(message);
+        // Start-or-whitespace boundary: requiring leading whitespace missed the minimal
+        // case — `swarm send Bob --swarm docs`, whose entire message body IS the
+        // selector — which is precisely the misuse this guard claims to refuse.
+        const trailingSelector = /(?:^|\s)--swarm(?:=|\s+)([^\s]+)$/.exec(message);
         if (trailingSelector) {
           const named = getSwarm(db, trailingSelector[1]);
           if (named && named.id !== self.swarm_id) {
@@ -1902,17 +1915,23 @@ async function main() {
         console.log(`Joined: ${self.joined_at}`);
         if (self.description) console.log(`Status: ${self.description}`);
         if (self.endpoint_url) console.log(`Endpoint: ${self.endpoint_url}`);
-        if (self.agent_type === 'cmux') {
-          const memberships = listSurfaceMemberships(db, self.surface_id);
+        if (self.agent_type !== 'a2a') {
+          const memberships = self.agent_type === 'cmux'
+            ? listSurfaceMemberships(db, self.surface_id)
+            : listHeadlessMarkers(self.name).map(m => ({ swarm_id: m.swarm_id, name: m.agent_name }));
           if (memberships.length > 1) {
             // The default is whatever the pointer names — NOT self.swarm_id, which is
             // the swarm this invocation selected via --swarm/SWARM_ID and would
             // mislabel the default whenever those are used.
-            const pointed = readActiveSwarmId(self.surface_id);
+            // Headless sessions carry their default in the unscoped TTY marker rather
+            // than the surface pointer, so ask the right one for this agent type.
+            const pointed = self.agent_type === 'cmux'
+              ? readActiveSwarmId(self.surface_id)
+              : readActiveHeadlessSwarmId();
             const defaultSwarmId = memberships.some(m => m.swarm_id === pointed)
               ? pointed
               : memberships[memberships.length - 1].swarm_id;
-            console.log(`\nMemberships (${memberships.length}) — this surface is in more than one swarm:`);
+            console.log(`\nMemberships (${memberships.length}) — this session is in more than one swarm:`);
             for (const m of memberships) {
               const mSwarm = getSwarmById(db, m.swarm_id);
               const marker = m.swarm_id === defaultSwarmId ? ' <- default for commands without --swarm' : '';

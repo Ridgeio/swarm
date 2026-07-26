@@ -10,12 +10,23 @@ import type { DeliveryOptions } from './transport-interface.js';
  * so the single-swarm format (and everything parsing it) is untouched.
  */
 export function swarmTagFor(db: SwarmDb, target: Agent, swarmId: string): string {
-  // surface_id is a true terminal identity only for cmux rows; headless surfaces are
-  // synthetic per-swarm strings, so there is no reliable multi-membership signal there.
-  if (target.agent_type !== 'cmux') return '';
-  if (listSurfaceMemberships(db, target.surface_id).length < 2) return '';
+  if (target.agent_type === 'a2a') return '';
   const swarmName = getSwarmById(db, swarmId)?.name;
-  return swarmName ? ` in ${swarmName}` : '';
+  if (!swarmName) return '';
+
+  if (target.agent_type === 'cmux') {
+    return listSurfaceMemberships(db, target.surface_id).length < 2 ? '' : ` in ${swarmName}`;
+  }
+
+  // Headless surfaces are synthetic per-swarm strings (`headless:<swarm>:<name>`), so
+  // membership cannot be counted from surface_id. Fall back to same-name headless rows
+  // across swarms: for a TTY that joined several swarms under one identity — the case
+  // that makes an untagged push ambiguous — that is exactly the set we need.
+  const sameName = db.prepare(`
+    SELECT COUNT(*) AS n FROM agents
+    WHERE name = ? COLLATE NOCASE AND agent_type = 'headless'
+  `).get(target.name) as { n: number };
+  return sameName.n < 2 ? '' : ` in ${swarmName}`;
 }
 
 export interface Message {

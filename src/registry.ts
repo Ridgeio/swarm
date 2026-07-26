@@ -208,6 +208,13 @@ function writeSessionMarker(swarmId: string, agentName: string, sessionToken: st
   fs.writeFileSync(markerPath, payload, { encoding: 'utf-8', mode: 0o600 });
 }
 
+/** Which swarm this TTY's unqualified commands currently target, if any. */
+export function readActiveHeadlessSwarmId(): string | null {
+  const markerPath = getSessionMarkerPath();
+  if (!markerPath) return null;
+  return parseTtySessionMarker(markerPath)?.swarm_id ?? null;
+}
+
 /** Point this TTY's unqualified commands at a swarm it already has a marker for. */
 export function setActiveHeadlessSwarm(swarmId: string): boolean {
   const markerPath = getSessionMarkerPath();
@@ -726,20 +733,35 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
 
   const activeMarker = readSessionMarker();
   if (activeMarker) {
+    const lookup = (swarmId: string, marker: SessionMarker | null): ResolvedSelf | null => {
+      if (!marker) return null;
+      const row = db.prepare(`
+        SELECT * FROM agents
+        WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
+        ORDER BY joined_at DESC
+        LIMIT 1
+      `).get(swarmId, marker.agent_name) as Agent | undefined;
+      return row ? { agent: row, presentedToken: marker.session_token } : null;
+    };
+
     const markerSwarmId = resolvedSwarmId || activeMarker.swarm_id;
     // Authenticate against the marker for the swarm actually being addressed. Using the
     // active marker's token here would reject every command aimed at a second swarm,
     // since each membership mints its own token.
-    const marker = readSessionMarker(markerSwarmId);
-    if (!marker) return null;
-    const byMarker = db.prepare(`
-      SELECT * FROM agents
-      WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
-      ORDER BY joined_at DESC
-      LIMIT 1
-    `).get(markerSwarmId, marker.agent_name) as Agent | undefined;
-    if (!byMarker) return null;
-    return { agent: byMarker, presentedToken: marker.session_token };
+    const resolved = lookup(markerSwarmId, readSessionMarker(markerSwarmId));
+    if (resolved) return resolved;
+
+    // The active marker can name a swarm whose row is gone — `swarm reset`/`delete`
+    // removes rows without touching markers. Without this fallback the session reported
+    // "not joined" while other memberships were alive and reachable, stranding them
+    // unless the operator happened to guess the surviving swarm's name. Cmux already
+    // ignores a pointer with no live membership; headless must behave the same.
+    if (resolvedSwarmId) return null;
+    for (const scoped of listHeadlessMarkers(activeMarker.agent_name)) {
+      const survivor = lookup(scoped.swarm_id, scoped);
+      if (survivor) return survivor;
+    }
+    return null;
   }
 
   return null;

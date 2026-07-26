@@ -479,6 +479,32 @@ describe('multi-swarm membership for headless sessions', () => {
     assert.strictEqual(setActiveHeadlessSwarm(db, beta.id), true, 'our own membership still works');
   });
 
+  /**
+   * The active swarm's row is gone (reset/delete) AND the only other marker names a seat
+   * another terminal reclaimed. The fallback must resolve to NOTHING rather than adopt
+   * the reclaimed identity — it previously looped raw markers and ignored the refused
+   * repoint, so it returned the reclaimed seat and every later command ran as that agent.
+   */
+  test('the fallback refuses a reclaimed seat when the active membership is dead', (t) => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+    if (!hasTty()) return t.skip('no controlling TTY: headless session markers cannot be written');
+
+    joinHeadlessAgent(db, alpha.id, 'OldSeat', undefined, { trackSession: true });
+    joinHeadlessAgent(db, beta.id, 'Mine', undefined, { trackSession: true });
+
+    // beta (active) is deleted, and alpha/OldSeat is reclaimed by someone else.
+    db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(beta.id);
+    db.prepare("UPDATE agents SET session_token = 'reclaimed-token' WHERE swarm_id = ? AND name = 'OldSeat'")
+      .run(alpha.id);
+
+    assert.strictEqual(
+      getSelf(db),
+      null,
+      'must report not-joined rather than resolve as an agent this session does not own'
+    );
+  });
+
   test('a same-swarm rename still reaps the old headless row', (t) => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     joinHeadlessAgent(db, alpha.id, 'OldName', undefined, { trackSession: true });

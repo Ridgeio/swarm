@@ -798,14 +798,18 @@ function resolveSelf(db: SwarmDb, swarmId?: string): ResolvedSelf | null {
     // unless the operator happened to guess the surviving swarm's name. Cmux already
     // ignores a pointer with no live membership; headless must behave the same.
     if (resolvedSwarmId) return null;
-    // Unfiltered: each membership on this TTY may use a different name, so filtering by
-    // the active marker's name would hide the very survivors we are looking for.
-    for (const scoped of listHeadlessMarkers()) {
+    // OWNED markers only, and never filtered by the active marker's name — each
+    // membership on this TTY may use a different one. Looping raw markers here bypassed
+    // the ownership check that every other consumer applies: the fallback would resolve
+    // as a seat another terminal had reclaimed, because `lookup` only asks whether a row
+    // exists under that name. Reclamation keeps the name.
+    for (const scoped of listOwnedHeadlessMarkers(db)) {
       const survivor = lookup(scoped.swarm_id, scoped);
       if (!survivor) continue;
       // Repoint the active marker, or every later command repeats this search and
-      // `whoami` keeps reporting a swarm that no longer exists as the default.
-      setActiveHeadlessSwarm(db, scoped.swarm_id);
+      // `whoami` keeps reporting a swarm that no longer exists as the default. If the
+      // repoint is refused, this membership is not ours to adopt — do not return it.
+      if (!setActiveHeadlessSwarm(db, scoped.swarm_id)) continue;
       return survivor;
     }
     return null;

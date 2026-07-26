@@ -256,3 +256,27 @@ Unique per-panelist insights worth re-reading there:
   broadcasts (backfill leak).
 - **grok:** the 60-char chunking is a deliberate dodge of Claude Code's paste-bracket
   detection (fragile by design).
+
+---
+
+## 8. `swarm inbox` advances the read cursor without authenticating
+
+**Status:** open, deliberately deferred out of `swarm/model-family-integrity`.
+**Raised by:** Ledger (codex) during cross-family review, 2026-07-26. Agreed by Quarry.
+
+`swarm inbox` resolves identity through the non-authenticating path (`requireSelf(false)`)
+and then **advances the read cursor**. Identity there can come from `SWARM_AGENT_NAME`,
+which any local process can set, so a caller who never proved ownership can read another
+agent's mailbox and mark its messages seen — the victim then never sees them, and the
+failure is silent on both sides.
+
+The neighbouring holes this pairs with were fixed in that branch (identity **writes** now
+require a token match, and marker consumers require the marker's token to equal the row's).
+This one was left open on purpose: requiring authentication here changes the contract for
+every headless agent that runs with only `SWARM_AGENT_NAME` set, so it needs its own
+blast-radius check rather than riding along inside a model-family change.
+
+**What a fix must establish before shipping:** which live agents currently invoke `inbox`
+without a token (OpenClaw/Hermes and any spawned worker are the ones to check), and whether
+they can present one. A cursor advance is state mutation; the rule that applies is the one
+already written at `isSelfTokenValid` — *a name is a claim, a token is proof*.

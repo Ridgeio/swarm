@@ -30,6 +30,7 @@ import {
   listSwarms,
   reapAll,
   reapIfDead,
+  refreshHostAcrossMemberships,
   listHeadlessMarkers,
   readActiveHeadlessSwarmId,
   readActiveSwarmId,
@@ -303,7 +304,9 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
   // which approves, rather than an unknown one, which refuses.
   const host = self.agent_type === 'a2a' ? null : detectHost();
   if (host && self.host_agent !== host) {
-    updateHostAgent(db, self.swarm_id, self.surface_id, host);
+    // Propagate to every membership this terminal holds, not just the selected swarm:
+    // a stale sibling would keep an old family and could be accepted as inverted.
+    refreshHostAcrossMemberships(db, self, host);
     self.host_agent = host;
   }
   const swarm = getSwarmById(db, self.swarm_id) ?? getOrCreateSwarm(db);
@@ -555,14 +558,26 @@ function refuseTrailingSelector(
 ): void {
   // Start-or-whitespace: requiring leading whitespace missed the minimal case, a body
   // that IS the selector (`swarm send Bob --swarm docs`) — exactly what this refuses.
-  const match = /(?:^|\s)--swarm(?:=|\s+)([^\s]+)$/.exec(message);
+  // `-s` is the advertised alias and parseGlobalFlags honours it before the free-text
+  // boundary, so a trailing `-s docs` is the same trap.
+  const match = /(?:^|\s)(?:--swarm[=\s]+|-s\s+)([^\s]+)$/.exec(message);
   if (!match) return;
-  const named = getSwarm(db, match[1]);
-  if (!named || named.id === currentSwarmId) return;
+  const target = match[1];
+
+  // Refuse on SYNTAX, not on whether the named swarm happens to exist. Checking the DB
+  // meant a typo ("--swarm dcos") sailed through and landed in the default swarm — the
+  // very outcome this prevents — and made identical argv safe or unsafe depending on
+  // current DB contents.
+  const named = getSwarm(db, target);
+  const current = swarmNameFor(db, currentSwarmId);
+  const detail = !named
+    ? `no swarm named "${target}" exists`
+    : named.id === currentSwarmId
+      ? `"${target}" is already the current swarm`
+      : `this would have gone to "${current}" instead of "${target}"`;
   console.error(
-    `Refusing: "--swarm ${match[1]}" came after the message, so it is message text, not a swarm ` +
-    `selector — this would have gone to "${swarmNameFor(db, currentSwarmId)}". ` +
-    `Put the selector first: swarm --swarm ${match[1]} ${commandHint} "<message>"`
+    `Refusing: the trailing "${match[0].trim()}" is message text, not a swarm selector — ${detail}. ` +
+    `Put the selector first: swarm --swarm ${target} ${commandHint} "<message>"`
   );
   process.exit(1);
 }

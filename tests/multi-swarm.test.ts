@@ -243,26 +243,46 @@ describe('a trailing --swarm selector is refused, not delivered elsewhere', () =
     const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
     const def = getOrCreateSwarm(cliDb, 'default');
     getOrCreateSwarm(cliDb, 'docs');
-    joinHeadlessAgent(cliDb, def.id, 'Alice', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
+    const alice = joinHeadlessAgent(cliDb, def.id, 'Alice', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
     joinHeadlessAgent(cliDb, def.id, 'Bob', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
     cliDb.close();
 
     const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
-    let status = 0;
-    try {
-      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'send', 'Bob', '--swarm', 'docs'], {
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'pipe'],
-        env: {
-          PATH: process.env.PATH ?? '',
-          HOME: home,
-          TMPDIR: path.join(home, 'tmp'),
-          SWARM_AGENT_NAME: 'Alice',
-          SWARM_TEST_DISABLE_BACKGROUND: '1',
-        },
-      });
-    } catch (err: any) {
-      status = typeof err.status === 'number' ? err.status : 1;
+    const run = (selector: string[]) => {
+      try {
+        execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'send', 'Bob', ...selector], {
+          encoding: 'utf-8',
+          stdio: ['ignore', 'pipe', 'pipe'],
+          env: {
+            PATH: process.env.PATH ?? '',
+            HOME: home,
+            TMPDIR: path.join(home, 'tmp'),
+            SWARM_AGENT_NAME: 'Alice',
+            // Without the token `send` (requireSelf(true)) fails on authentication BEFORE
+            // reaching the guard — so the test passed even with the guard deleted. Caught
+            // in review: asserting only "nonzero exit + no rows" cannot tell a refusal
+            // from any other early exit.
+            SWARM_SESSION_TOKEN: alice.session_token ?? '',
+            SWARM_TEST_DISABLE_BACKGROUND: '1',
+          },
+        });
+        return { status: 0, stderr: '' };
+      } catch (err: any) {
+        return {
+          status: typeof err.status === 'number' ? err.status : 1,
+          stderr: err.stderr?.toString() ?? '',
+        };
+      }
+    };
+
+    for (const selector of [['--swarm', 'docs'], ['--swarm=docs'], ['-s', 'docs'], ['--swarm', 'nosuchswarm']]) {
+      const result = run(selector);
+      assert.notStrictEqual(result.status, 0, `${selector.join(' ')}: must exit non-zero`);
+      assert.match(
+        result.stderr,
+        /is message text, not a swarm selector/,
+        `${selector.join(' ')}: must fail with the SELECTOR refusal, not some other error`
+      );
     }
 
     const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
@@ -271,8 +291,6 @@ describe('a trailing --swarm selector is refused, not delivered elsewhere', () =
     ).get() as { n: number };
     after.close();
     fs.rmSync(home, { recursive: true, force: true });
-
-    assert.notStrictEqual(status, 0, 'must fail loudly rather than deliver somewhere plausible');
     assert.strictEqual(delivered.n, 0, 'nothing may be inserted into the default swarm');
   });
 });
@@ -295,22 +313,15 @@ describe('pushed-message swarm attribution', () => {
     assert.strictEqual(swarmTagFor(db, dual, alpha.id), ' in alpha');
   });
 
-  test('headless targets are not tagged — a name is not a session identity', () => {
+  test('headless targets are ALWAYS tagged — the value cannot name the wrong swarm', () => {
     const alpha = getOrCreateSwarm(db, 'alpha');
-    const beta = getOrCreateSwarm(db, 'beta');
     const headless = joinHeadlessAgent(db, alpha.id, 'Worker');
-    assert.strictEqual(swarmTagFor(db, headless, alpha.id), '');
 
-    // Counting same-name headless rows was tried as a proxy for "this TTY is in several
-    // swarms" and is wrong both ways: names are unique only within a swarm, so one TTY
-    // under two names goes untagged while two unrelated TTYs sharing a name get tagged
-    // for a membership neither holds. A confidently wrong swarm name is worse than none.
-    joinHeadlessAgent(db, beta.id, 'Worker');
-    assert.strictEqual(
-      swarmTagFor(db, headless, alpha.id),
-      '',
-      'no tag until there is a durable per-session key to key it on'
-    );
+    // There is no reliable way to know whether a headless recipient holds several
+    // memberships, but that uncertainty is about WHETHER a tag is needed, never about
+    // WHAT it says: the value comes from the message's own swarm. A redundant-but-accurate
+    // tag is cheap; an untagged cross-swarm message can be answered into the wrong swarm.
+    assert.strictEqual(swarmTagFor(db, headless, alpha.id), ' in alpha');
   });
 });
 
@@ -329,7 +340,7 @@ describe('multi-swarm membership for headless sessions', () => {
     return Boolean(resolved);
   })
 
-  test('joining a second swarm headless does not drop the first', () => {
+  test('joining a second swarm headless does not drop the first', (t) => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     const beta = getOrCreateSwarm(db, 'beta');
 
@@ -337,10 +348,11 @@ describe('multi-swarm membership for headless sessions', () => {
     // catch cannot fire and the assertions below pass no matter what the source does.
     // FAIL loudly rather than report a green that proves nothing. (Caught in review: a
     // mutation test only demonstrates a guard works in the environment it was run in.)
-    assert.ok(
-      hasTty(),
-      'no controlling TTY: the headless marker cannot resolve, so this test would pass vacuously'
-    );
+    // No controlling TTY => no marker => the deletion this covers cannot fire, and the
+    // assertions below would pass regardless of the source. SKIP loudly: a vacuous green
+    // hides a broken guard, but failing on absent platform plumbing turns normal non-PTY
+    // CI red for a reason that is not about the product.
+    if (!hasTty()) return t.skip('no controlling TTY: headless session markers cannot resolve');
 
     joinHeadlessAgent(db, alpha.id, 'Quarry', undefined, { trackSession: true });
     joinHeadlessAgent(db, beta.id, 'Quarry', undefined, { trackSession: true });
@@ -362,10 +374,10 @@ describe('multi-swarm membership for headless sessions', () => {
    * joined" then stranded every surviving membership unless the operator guessed the
    * right swarm name. Cmux already ignored a pointer with no live membership.
    */
-  test('deleting the active swarm falls back to a surviving headless membership', () => {
+  test('deleting the active swarm falls back to a surviving headless membership', (t) => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     const beta = getOrCreateSwarm(db, 'beta');
-    assert.ok(hasTty(), 'no controlling TTY: headless markers cannot resolve');
+    if (!hasTty()) return t.skip('no controlling TTY: headless session markers cannot resolve');
 
     joinHeadlessAgent(db, beta.id, 'Quarry', undefined, { trackSession: true });
     joinHeadlessAgent(db, alpha.id, 'Quarry', undefined, { trackSession: true });
@@ -379,7 +391,7 @@ describe('multi-swarm membership for headless sessions', () => {
     assert.strictEqual(resolved!.swarm_id, beta.id, 'falls back to the surviving membership');
   });
 
-  test('a same-swarm rename still reaps the old headless row', () => {
+  test('a same-swarm rename still reaps the old headless row', (t) => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     joinHeadlessAgent(db, alpha.id, 'OldName', undefined, { trackSession: true });
     joinHeadlessAgent(db, alpha.id, 'NewName', undefined, { trackSession: true });
@@ -392,7 +404,7 @@ describe('multi-swarm membership for headless sessions', () => {
     ).get(alpha.id);
 
     assert.ok(current, 'renamed agent is registered');
-    assert.ok(hasTty(), 'no controlling TTY: nothing to reap from, so this would pass vacuously');
+    if (!hasTty()) return t.skip('no controlling TTY: nothing to reap from');
     assert.strictEqual(ghost, undefined, 'the pre-rename row in the SAME swarm is reaped');
   });
 });

@@ -18,15 +18,17 @@ export function swarmTagFor(db: SwarmDb, target: Agent, swarmId: string): string
     return listSurfaceMemberships(db, target.surface_id).length < 2 ? '' : ` in ${swarmName}`;
   }
 
-  // Headless targets are NOT tagged, and this is a known gap rather than an oversight.
-  // Their surface_id is synthetic and per-swarm (`headless:<swarm>:<name>`), so it cannot
-  // identify a terminal. Counting same-NAME rows across swarms was tried and is wrong in
-  // both directions: names are only unique within a swarm, so one TTY joined under two
-  // different names goes untagged, while two unrelated TTYs sharing a name get tagged for
-  // a membership neither has. A name is not a session identity. Correctly tagging these
-  // needs a durable per-session key on the row; until then, no tag — ambiguous is
-  // recoverable, a confidently wrong swarm name is not.
-  return '';
+  // Headless targets are ALWAYS tagged.
+  //
+  // There is no reliable way to tell whether a headless recipient holds several
+  // memberships — its surface_id is synthetic and per-swarm, and counting same-NAME rows
+  // is wrong in both directions because names are unique only within a swarm. But that
+  // uncertainty is about WHETHER a tag is needed, never about WHAT it says: the value
+  // comes from the message's own swarm, so it cannot name the wrong one. The worst case
+  // is a redundant but accurate "in alpha" for a single-swarm agent; the cost of omitting
+  // it is a genuinely ambiguous message that the recipient may answer into the wrong
+  // swarm. Tag unconditionally until a durable per-session key exists to narrow it.
+  return ` in ${swarmName}`;
 }
 
 export interface Message {

@@ -546,11 +546,19 @@ export function joinAgent(
     `).run(
       id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid,
       now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion,
-      // INSERT OR REPLACE rewrites the whole row, so without this a re-registration
-      // that says nothing about family would silently erase a previous declaration and
-      // quietly demote the agent to UNKNOWN. A harness-implied family still wins, since
-      // that is a fresh observation of what the agent actually is.
-      (persistedFamily = impliedFamily ?? existing?.model_family ?? null)
+      // For an A2A row the column is a DECLARATION, so preserve it across a
+      // re-registration that says nothing about family — otherwise the agent is silently
+      // demoted to UNKNOWN.
+      //
+      // For a LOCAL row it is a CACHE of an observation, and a cache is not evidence once
+      // the observation is unavailable. Carrying it forward meant a seat that first joined
+      // as claude-code and later rejoined with its harness undetected still resolved
+      // `claude` — so a genuinely Codex process kept a Claude label, and an OpenAI-authored
+      // review would accept it as inverted. Stale certainty is worse than admitted
+      // ignorance: unknown refuses, wrong approves.
+      (persistedFamily = agentType === 'a2a'
+        ? (existing?.model_family ?? null)
+        : impliedFamily)
     );
 
     db.prepare(`
@@ -862,6 +870,42 @@ export function updateHostAgent(
 ): void {
   db.prepare('UPDATE agents SET host_agent = ? WHERE swarm_id = ? AND surface_id = ?')
     .run(hostAgent, swarmId, surfaceId);
+}
+
+/**
+ * The harness is a property of the TERMINAL, not of one swarm — the same fact the
+ * heartbeat already propagates. Refreshing only the selected swarm left sibling
+ * memberships carrying the harness they saw at join, so one surface could resolve
+ * `claude` in alpha and `openai` in beta at the same instant, and a review in the stale
+ * swarm would accept an inverted family that was not inverted.
+ *
+ * A2A rows are never touched: they describe a remote agent, and the local caller's
+ * harness says nothing about it.
+ */
+export function refreshHostAcrossMemberships(
+  db: SwarmDb,
+  self: Agent,
+  hostAgent: HostAgentKind
+): void {
+  if (self.agent_type === 'a2a') return;
+  const family = HOST_MODEL_FAMILY[hostAgent] ?? null;
+
+  if (self.agent_type === 'cmux') {
+    // One real surface id covers every membership this terminal holds.
+    db.prepare(
+      "UPDATE agents SET host_agent = ?, model_family = ? WHERE surface_id = ? AND agent_type = 'cmux'"
+    ).run(hostAgent, family, self.surface_id);
+    return;
+  }
+
+  // Headless surface ids are synthetic and per-swarm, so siblings are unreachable that
+  // way; this TTY's scoped markers are the membership set instead.
+  const update = db.prepare(
+    "UPDATE agents SET host_agent = ?, model_family = ? WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'"
+  );
+  for (const marker of listHeadlessMarkers()) {
+    update.run(hostAgent, family, marker.swarm_id, marker.agent_name);
+  }
 }
 
 export function updateHeartbeat(db: SwarmDb, swarmId: string, surfaceId: string): void {

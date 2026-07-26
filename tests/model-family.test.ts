@@ -18,6 +18,7 @@ import {
   joinA2AAgent,
   joinAgent,
   joinHeadlessAgent,
+  refreshHostAcrossMemberships,
   setModelFamily,
   updateHostAgent,
 } from '../src/registry.js';
@@ -176,6 +177,60 @@ describe('model family is stated, never guessed', () => {
     assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Ghost')!), 'unknown');
     setModelFamily(db, swarm.id, 'Ghost', 'xai');
     assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Ghost')!), 'xai');
+  });
+
+  /**
+   * For a LOCAL agent the column caches an observation, not a declaration. Carrying it
+   * across a rejoin whose harness is undetected kept a `claude` label on what may now be
+   * a Codex process, so an OpenAI-authored review would accept it as inverted. Stale
+   * certainty must decay to unknown: unknown refuses, wrong approves.
+   */
+  test('a local rejoin with no detectable harness drops to UNKNOWN, not the cached family', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    joinAgent(db, swarm.id, 'Seat', 'surface-s', 'ws', process.ppid, undefined, 'cmux', undefined, 'claude-code', () => 'v1');
+    assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Seat')!), 'claude');
+
+    // Same surface and name rejoin, but the harness cannot be detected this time.
+    joinAgent(db, swarm.id, 'Seat', 'surface-s', 'ws', process.ppid, undefined, 'cmux', undefined, null, () => 'v1');
+    assert.strictEqual(
+      agentModelFamily(getAgent(db, swarm.id, 'Seat')!),
+      'unknown',
+      'a cache is not evidence once the observation is gone'
+    );
+  });
+
+  test('an A2A declaration still survives a rejoin (it is a declaration, not a cache)', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'openai');
+    joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/');
+    assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Remote')!), 'openai');
+  });
+
+  test('a harness change refreshes EVERY membership on the surface, not just the selected one', () => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+    joinAgent(db, alpha.id, 'Seat', 'surface-x', 'ws', process.ppid, undefined, 'cmux', undefined, 'claude-code', () => 'v1');
+    const inBeta = joinAgent(db, beta.id, 'Seat', 'surface-x', 'ws', process.ppid, undefined, 'cmux', undefined, 'claude-code', () => 'v1');
+
+    // The terminal's harness changes; a command runs in beta. Refreshing only beta left
+    // alpha resolving `claude` while beta resolved `openai` for the same terminal — and a
+    // review in the stale swarm would accept an inversion that was not one.
+    refreshHostAcrossMemberships(db, inBeta, 'codex');
+
+    assert.strictEqual(agentModelFamily(getAgent(db, beta.id, 'Seat')!), 'openai');
+    assert.strictEqual(
+      agentModelFamily(getAgent(db, alpha.id, 'Seat')!),
+      'openai',
+      'the harness is a fact about the terminal, not about one swarm'
+    );
+  });
+
+  test('a harness refresh never touches an A2A row', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'claude');
+    const remote = getAgent(db, swarm.id, 'Remote')!;
+    refreshHostAcrossMemberships(db, remote, 'codex');
+    assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Remote')!), 'claude');
   });
 
   test('joinAgent returns the family it actually persisted', () => {

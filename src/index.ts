@@ -16,6 +16,7 @@ import {
   getOrCreateSwarm,
   getSelf,
   getSurfaceMarkerConflictWarning,
+  isSelfTokenValid,
   getSwarm,
   getSwarmById,
   joinA2AAgent,
@@ -303,11 +304,15 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
   // writing host_agent here relabelled a declared-claude seat as codex — a WRONG family,
   // which approves, rather than an unknown one, which refuses.
   const host = self.agent_type === 'a2a' ? null : detectHost();
-  if (host) {
-    // Unconditional, NOT gated on `self.host_agent !== host`. The selected row being
-    // current says nothing about its siblings, and "selected fresh, sibling stale" is
-    // precisely the state every pre-fix version leaves behind — i.e. the upgrade state,
-    // where the wrong-family sibling would never heal.
+  // Writing identity requires PROVING it. SWARM_AGENT_NAME is forgeable, so without this
+  // any local process could run a read-only command under another agent's name and
+  // relabel its harness — and therefore its model family — to the caller's. That is the
+  // same forgeable-identity hole as the A2A case, one layer down, and it turns a
+  // read-only command into a way to manufacture a cross-family approval.
+  if (host && isSelfTokenValid(db, self.swarm_id)) {
+    // Unconditional w.r.t. the SELECTED row, NOT gated on `self.host_agent !== host`:
+    // the selected row being current says nothing about its siblings, and "selected
+    // fresh, sibling stale" is precisely the state every pre-fix version leaves behind.
     refreshHostAcrossMemberships(db, self, host);
     self.host_agent = host;
   }

@@ -816,6 +816,24 @@ function tokensMatch(expected: string, presented: string | null): boolean {
   return timingSafeEqual(expectedBytes, presentedBytes);
 }
 
+/**
+ * Did the caller PROVE it owns the identity it resolved to?
+ *
+ * Same check as getAuthenticatedSelf, without throwing, for callers that must not fail a
+ * read-only command but must not act on an unproven identity either. SWARM_AGENT_NAME is
+ * forgeable — anyone local can claim any headless name — so persisting anything derived
+ * from the calling process (its harness, hence its model family) is only safe once the
+ * token matches. Without this, `whoami` run under someone else's name relabelled them.
+ */
+export function isSelfTokenValid(db: SwarmDb, swarmId?: string): boolean {
+  const resolved = resolveSelf(db, swarmId);
+  if (!resolved) return false;
+  const { agent, presentedToken } = resolved;
+  // Legacy rows with no token are grandfathered exactly as getAuthenticatedSelf does.
+  if (agent.session_token === null) return true;
+  return tokensMatch(agent.session_token, presentedToken);
+}
+
 export function getAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | null {
   const resolved = resolveSelf(db, swarmId);
   if (!resolved) return null;

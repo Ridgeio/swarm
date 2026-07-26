@@ -297,6 +297,91 @@ describe('model family is stated, never guessed', () => {
     );
   });
 
+  /**
+   * These two drive the real CLI on purpose. Helper-level coverage could not see either:
+   * the propagation condition lives in requireSelf, so restoring the old
+   * `self.host_agent !== host` gate left every direct-helper test green.
+   */
+  test('CLI: a command in one swarm heals a STALE SIBLING even when the selected row is current', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-sibling-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const alpha = getOrCreateSwarm(cliDb, 'alpha');
+    const beta = getOrCreateSwarm(cliDb, 'beta');
+    // A cmux identity is proven by its per-(surface, swarm) marker FILE, so the markers
+    // must be written into the HOME the CLI will run under — not this test's own.
+    const testHome = process.env.HOME;
+    const testSurface = process.env.CMUX_SURFACE_ID;
+    process.env.HOME = home;
+    process.env.CMUX_SURFACE_ID = 'surface-cli';   // marker is written only for THIS surface
+    const inAlpha = joinAgent(cliDb, alpha.id, 'Seat', 'surface-cli', 'ws', process.ppid, undefined, 'cmux', undefined, 'codex', () => 'v');
+    joinAgent(cliDb, beta.id, 'Seat', 'surface-cli', 'ws', process.ppid, undefined, 'cmux', undefined, 'codex', () => 'v');
+    process.env.HOME = testHome;
+    if (testSurface === undefined) delete process.env.CMUX_SURFACE_ID;
+    else process.env.CMUX_SURFACE_ID = testSurface;
+    // Beta is left in the pre-fix state: stale claude. Alpha (the selected row) is already
+    // current, which is exactly when the old conditional skipped propagation.
+    cliDb.prepare("UPDATE agents SET host_agent = 'claude-code', model_family = 'claude' WHERE swarm_id = ?").run(beta.id);
+    cliDb.close();
+
+    const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+    execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'whoami', '--swarm', 'alpha'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env.PATH ?? '',
+        HOME: home,
+        TMPDIR: path.join(home, 'tmp'),
+        CMUX_SURFACE_ID: 'surface-cli',
+        SWARM_SESSION_TOKEN: inAlpha.session_token ?? '',
+        CODEX_CI: '1',
+        SWARM_TEST_DISABLE_BACKGROUND: '1',
+      },
+    });
+
+    const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const stale = getAgent(after, beta.id, 'Seat')!;
+    after.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    assert.strictEqual(agentModelFamily(stale), 'openai', 'the stale sibling must be healed');
+  });
+
+  test('CLI: an UNAUTHENTICATED caller using another agent name cannot relabel it', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-forge-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const alpha = getOrCreateSwarm(cliDb, 'alpha');
+    joinHeadlessAgent(cliDb, alpha.id, 'Victim', undefined, { hostAgent: 'claude-code', versionRunner: () => 'v' });
+    cliDb.close();
+
+    // SWARM_AGENT_NAME is forgeable: any local process may claim any headless name. A
+    // read-only command run under it must not persist the CALLER's harness onto the
+    // victim's row, which would hand an attacker a manufactured cross-family approval.
+    const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+    try {
+      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'whoami'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          TMPDIR: path.join(home, 'tmp'),
+          SWARM_AGENT_NAME: 'Victim',
+          SWARM_NAME: 'alpha',
+          CODEX_CI: '1',                 // caller is codex; victim is claude
+          SWARM_TEST_DISABLE_BACKGROUND: '1',
+        },
+      });
+    } catch { /* exit status is irrelevant; the row must be unchanged either way */ }
+
+    const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const victim = getAgent(after, alpha.id, 'Victim')!;
+    after.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    assert.strictEqual(victim.host_agent, 'claude-code', 'host must not be rewritten by an unproven identity');
+    assert.strictEqual(agentModelFamily(victim), 'claude');
+  });
+
   test('a harness refresh never touches an A2A row', () => {
     const swarm = getOrCreateSwarm(db, 'alpha');
     joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'claude');

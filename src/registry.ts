@@ -203,6 +203,23 @@ function writeSessionMarker(swarmId: string, agentName: string, sessionToken: st
     2
   );
   fs.mkdirSync(path.dirname(markerPath), { recursive: true });
+
+  // MIGRATE THE OUTGOING ACTIVE MARKER FIRST.
+  //
+  // A session that joined before markers were swarm-scoped has ONLY the unscoped file.
+  // Overwriting it here to make the new swarm active would destroy the old membership's
+  // token — the DB row survives and the roster still lists it, but that swarm can never
+  // authenticate again. The feature would report "still a member of alpha" while alpha
+  // was in fact stranded, which is the failure-looks-like-success shape this whole branch
+  // exists to remove. Give the outgoing membership its scoped home before taking the file.
+  const outgoing = parseTtySessionMarker(markerPath);
+  if (outgoing && outgoing.swarm_id !== swarmId && outgoing.session_token) {
+    const outgoingScoped = scopedSessionMarkerPath(markerPath, outgoing.swarm_id);
+    if (!fs.existsSync(outgoingScoped)) {
+      fs.writeFileSync(outgoingScoped, JSON.stringify(outgoing, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    }
+  }
+
   // Per-swarm marker authenticates this membership; the unscoped one makes it active.
   fs.writeFileSync(scopedSessionMarkerPath(markerPath, swarmId), payload, { encoding: 'utf-8', mode: 0o600 });
   fs.writeFileSync(markerPath, payload, { encoding: 'utf-8', mode: 0o600 });

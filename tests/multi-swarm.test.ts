@@ -505,6 +505,40 @@ describe('multi-swarm membership for headless sessions', () => {
     );
   });
 
+  /**
+   * The real upgrade path. A session that joined BEFORE markers were swarm-scoped has
+   * only the unscoped file, so joining a second swarm overwrote it and destroyed the
+   * first membership's token: the row survived and the roster still listed it, but that
+   * swarm could never authenticate again — "still a member of alpha" while alpha was
+   * stranded. Tests that create both memberships with the new code cannot see this,
+   * because both already have scoped files; the pre-upgrade layout must be reconstructed.
+   */
+  test('joining a second swarm preserves a PRE-UPGRADE membership that has only the active marker', (t) => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+    if (!hasTty()) return t.skip('no controlling TTY: headless session markers cannot be written');
+
+    joinHeadlessAgent(db, alpha.id, 'Old', undefined, { trackSession: true });
+
+    // Reconstruct the pre-upgrade layout: unscoped marker only.
+    const dir = path.join(home, '.swarm');
+    const scoped = fs.readdirSync(dir).filter(f => /^headless-.*\.[0-9a-f]{16}$/.test(f));
+    assert.ok(scoped.length > 0, 'precondition: a scoped marker was written');
+    for (const file of scoped) fs.rmSync(path.join(dir, file), { force: true });
+
+    joinHeadlessAgent(db, beta.id, 'New', undefined, { trackSession: true });
+
+    // Both rows exist — that part never broke. The question is whether alpha can still
+    // prove who it is.
+    assert.ok(getSelf(db, alpha.id), 'alpha row survives');
+    assert.strictEqual(
+      getAuthenticatedSelf(db, alpha.id)?.name,
+      'Old',
+      'the pre-upgrade membership must still AUTHENTICATE, not merely appear on the roster'
+    );
+    assert.strictEqual(getAuthenticatedSelf(db, beta.id)?.name, 'New');
+  });
+
   test('a same-swarm rename still reaps the old headless row', (t) => {
     const alpha = getOrCreateSwarm(db, 'alpha');
     joinHeadlessAgent(db, alpha.id, 'OldName', undefined, { trackSession: true });

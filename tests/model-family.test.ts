@@ -382,6 +382,46 @@ describe('model family is stated, never guessed', () => {
     assert.strictEqual(agentModelFamily(victim), 'claude');
   });
 
+  /**
+   * getAuthenticatedSelf grandfathers a NULL session_token so pre-token rows keep working
+   * after an upgrade. Copying that allowance into the identity-WRITE gate meant a forged
+   * SWARM_AGENT_NAME could relabel precisely those legacy rows — the upgrade state again.
+   * Running commands and rewriting identity are different questions.
+   */
+  test('CLI: a legacy NULL-token row cannot be relabelled by an unproven caller either', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-legacy-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const alpha = getOrCreateSwarm(cliDb, 'alpha');
+    joinHeadlessAgent(cliDb, alpha.id, 'LegacyVictim', undefined, { hostAgent: 'claude-code', versionRunner: () => 'v' });
+    cliDb.prepare('UPDATE agents SET session_token = NULL WHERE name = ?').run('LegacyVictim');
+    cliDb.close();
+
+    const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+    try {
+      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'whoami'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          TMPDIR: path.join(home, 'tmp'),
+          SWARM_AGENT_NAME: 'LegacyVictim',
+          SWARM_NAME: 'alpha',
+          CODEX_CI: '1',
+          SWARM_TEST_DISABLE_BACKGROUND: '1',
+        },
+      });
+    } catch { /* exit status irrelevant; the row must be unchanged */ }
+
+    const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const victim = getAgent(after, alpha.id, 'LegacyVictim')!;
+    after.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    assert.strictEqual(victim.host_agent, 'claude-code', 'a missing token is not proof of ownership');
+    assert.strictEqual(agentModelFamily(victim), 'claude');
+  });
+
   test('a harness refresh never touches an A2A row', () => {
     const swarm = getOrCreateSwarm(db, 'alpha');
     joinA2AAgent(db, swarm.id, 'Remote', 'http://127.0.0.1:1/', undefined, 'claude');

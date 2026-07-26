@@ -829,8 +829,15 @@ export function isSelfTokenValid(db: SwarmDb, swarmId?: string): boolean {
   const resolved = resolveSelf(db, swarmId);
   if (!resolved) return false;
   const { agent, presentedToken } = resolved;
-  // Legacy rows with no token are grandfathered exactly as getAuthenticatedSelf does.
-  if (agent.session_token === null) return true;
+  // Deliberately does NOT grandfather a NULL token, unlike getAuthenticatedSelf.
+  //
+  // There, treating NULL as acceptable keeps pre-token rows able to run commands after an
+  // upgrade — a compatibility allowance. Here the question is different: may this caller
+  // WRITE an identity? A row with no token offers no proof of ownership, and accepting
+  // its absence let a forged SWARM_AGENT_NAME relabel exactly the legacy rows an upgrade
+  // leaves behind. Absence of evidence is not evidence. Such a row keeps working; it
+  // simply cannot be relabelled until a rejoin mints it a token.
+  if (agent.session_token === null) return false;
   return tokensMatch(agent.session_token, presentedToken);
 }
 

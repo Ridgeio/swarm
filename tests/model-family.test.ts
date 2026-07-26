@@ -18,6 +18,7 @@ import {
   joinA2AAgent,
   joinAgent,
   joinHeadlessAgent,
+  listHeadlessMarkers,
   refreshHostAcrossMemberships,
   setModelFamily,
   updateHostAgent,
@@ -31,7 +32,14 @@ const NOW = Date.parse('2026-07-21T18:42:00.000Z');
 let db: SwarmDb;
 let dbPath: string;
 
+const ORIGINAL_HOME = process.env.HOME;
+let homeDir: string;
+
 beforeEach(() => {
+  // Session markers follow HOME; without this, tests using trackSession would write
+  // into the real ~/.swarm and could disturb the live fleet.
+  homeDir = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-family-home-'));
+  process.env.HOME = homeDir;
   dbPath = path.join(os.tmpdir(), `swarm-family-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
   db = getDbAt(dbPath);
 });
@@ -41,6 +49,8 @@ afterEach(() => {
   for (const suffix of ['', '-wal', '-shm']) {
     try { fs.unlinkSync(dbPath + suffix); } catch {}
   }
+  try { fs.rmSync(homeDir, { recursive: true, force: true }); } catch {}
+  process.env.HOME = ORIGINAL_HOME;
 });
 
 describe('model family is stated, never guessed', () => {
@@ -171,12 +181,31 @@ describe('model family is stated, never guessed', () => {
     }
   });
 
-  test('the stored family is used only when no harness is detectable', () => {
+  test('a LOCAL row never falls back to its stored family — unknown host means UNKNOWN', () => {
     const swarm = getOrCreateSwarm(db, 'alpha');
     joinAgent(db, swarm.id, 'Ghost', 'surface-3', 'ws', process.ppid, undefined, 'cmux', undefined, null, () => 'v1');
     assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Ghost')!), 'unknown');
+
+    // Even with a value in the column, a local row resolves from the live harness only.
+    // Rows left as {host_agent: null, model_family: 'claude'} by an older version are the
+    // upgrade state, and they never rejoin — so a read-side fallback kept approving them.
     setModelFamily(db, swarm.id, 'Ghost', 'xai');
-    assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Ghost')!), 'xai');
+    assert.strictEqual(
+      agentModelFamily(getAgent(db, swarm.id, 'Ghost')!),
+      'unknown',
+      'a cached observation is not review evidence'
+    );
+
+    // Direct shape check, matching the reviewer's proof case.
+    assert.strictEqual(
+      agentModelFamily({ agent_type: 'cmux', host_agent: null, model_family: 'openai' }),
+      'unknown'
+    );
+    // ...while an A2A declaration still governs.
+    assert.strictEqual(
+      agentModelFamily({ agent_type: 'a2a', host_agent: null, model_family: 'openai' }),
+      'openai'
+    );
   });
 
   /**
@@ -222,6 +251,49 @@ describe('model family is stated, never guessed', () => {
       agentModelFamily(getAgent(db, alpha.id, 'Seat')!),
       'openai',
       'the harness is a fact about the terminal, not about one swarm'
+    );
+  });
+
+  test('a headless refresh records on the authenticated row even with no TTY markers', () => {
+    const swarm = getOrCreateSwarm(db, 'alpha');
+    // Spawned/batch path: resolved by SWARM_AGENT_NAME, no controlling-TTY marker. A
+    // marker-only loop updated ZERO rows, so the detected harness died with the process.
+    const worker = joinHeadlessAgent(db, swarm.id, 'Worker', undefined, {
+      hostAgent: 'claude-code', versionRunner: () => 'v1',
+    });
+    refreshHostAcrossMemberships(db, worker, 'codex');
+    assert.strictEqual(agentModelFamily(getAgent(db, swarm.id, 'Worker')!), 'openai');
+  });
+
+  test('a stale marker cannot relabel a row that was reclaimed with a new token', (t) => {
+    const alpha = getOrCreateSwarm(db, 'alpha');
+    const beta = getOrCreateSwarm(db, 'beta');
+
+    // trackSession is what writes the per-(TTY, swarm) markers this guard reads. Without
+    // markers the sibling loop never runs and the test cannot fail — the first version of
+    // this test had exactly that defect, and only a mutation run exposed it.
+    joinHeadlessAgent(db, alpha.id, 'Worker', undefined, {
+      trackSession: true, hostAgent: 'claude-code', versionRunner: () => 'v1',
+    });
+    const live = joinHeadlessAgent(db, beta.id, 'Worker', undefined, {
+      trackSession: true, hostAgent: 'codex', versionRunner: () => 'v1',
+    });
+    if (listHeadlessMarkers().length < 2) {
+      return t.skip('no controlling TTY: headless session markers cannot be written');
+    }
+
+    // Another terminal force-reclaims alpha/Worker as Claude, minting a NEW token. This
+    // session's alpha marker still carries the OLD one.
+    db.prepare(
+      "UPDATE agents SET session_token = 'fresh-token', host_agent = 'claude-code', model_family = 'claude' WHERE swarm_id = ? AND name = 'Worker'"
+    ).run(alpha.id);
+
+    refreshHostAcrossMemberships(db, live, 'codex');
+
+    assert.strictEqual(
+      agentModelFamily(getAgent(db, alpha.id, 'Worker')!),
+      'claude',
+      'a marker whose token no longer matches the row may not rewrite it'
     );
   });
 

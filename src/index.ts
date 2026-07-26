@@ -303,9 +303,11 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
   // writing host_agent here relabelled a declared-claude seat as codex — a WRONG family,
   // which approves, rather than an unknown one, which refuses.
   const host = self.agent_type === 'a2a' ? null : detectHost();
-  if (host && self.host_agent !== host) {
-    // Propagate to every membership this terminal holds, not just the selected swarm:
-    // a stale sibling would keep an old family and could be accepted as inverted.
+  if (host) {
+    // Unconditional, NOT gated on `self.host_agent !== host`. The selected row being
+    // current says nothing about its siblings, and "selected fresh, sibling stale" is
+    // precisely the state every pre-fix version leaves behind — i.e. the upgrade state,
+    // where the wrong-family sibling would never heal.
     refreshHostAcrossMemberships(db, self, host);
     self.host_agent = host;
   }
@@ -556,11 +558,12 @@ function refuseTrailingSelector(
   message: string,
   commandHint: string
 ): void {
-  // Start-or-whitespace: requiring leading whitespace missed the minimal case, a body
-  // that IS the selector (`swarm send Bob --swarm docs`) — exactly what this refuses.
+  // Matched ANYWHERE in the body, not just at the end. End-anchoring caught
+  // `send Bob --swarm docs` but missed the more natural `send Bob --swarm docs hello`,
+  // which sailed through to the default swarm — the same silent misroute, one word later.
   // `-s` is the advertised alias and parseGlobalFlags honours it before the free-text
-  // boundary, so a trailing `-s docs` is the same trap.
-  const match = /(?:^|\s)(?:--swarm[=\s]+|-s\s+)([^\s]+)$/.exec(message);
+  // boundary, so it is the same trap.
+  const match = /(?:^|\s)(?:--swarm[=\s]+|-s\s+)([^\s]+)/.exec(message);
   if (!match) return;
   const target = match[1];
 
@@ -576,8 +579,11 @@ function refuseTrailingSelector(
       ? `"${target}" is already the current swarm`
       : `this would have gone to "${current}" instead of "${target}"`;
   console.error(
-    `Refusing: the trailing "${match[0].trim()}" is message text, not a swarm selector — ${detail}. ` +
-    `Put the selector first: swarm --swarm ${target} ${commandHint} "<message>"`
+    `Refusing: "${match[0].trim()}" appears inside the message, where it is literal text ` +
+    `rather than a swarm selector — ${detail}. ` +
+    `Put the selector before the subcommand: swarm --swarm ${target} ${commandHint} "<message>". ` +
+    `If you really meant to send those words, reword them — a selector-shaped token in the ` +
+    `body is refused rather than delivered somewhere you did not choose.`
   );
   process.exit(1);
 }

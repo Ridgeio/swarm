@@ -898,12 +898,29 @@ export function refreshHostAcrossMemberships(
     return;
   }
 
-  // Headless surface ids are synthetic and per-swarm, so siblings are unreachable that
-  // way; this TTY's scoped markers are the membership set instead.
+  // ALWAYS record it on the authenticated row itself. A headless agent resolved via
+  // SWARM_AGENT_NAME (spawned/batch paths) may hold no controlling-TTY markers at all, and
+  // a marker-only loop then updated zero rows — the detected harness was written to the
+  // in-memory object and lost at process exit.
+  db.prepare(
+    "UPDATE agents SET host_agent = ?, model_family = ? WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'"
+  ).run(hostAgent, family, self.swarm_id, self.name);
+
+  // Siblings come from this TTY's markers, but a marker can be STALE: another terminal
+  // may have force-reclaimed that name, minting a new token. Writing on name alone let a
+  // dead session relabel a live agent's family — a wrong-family approval. Require the
+  // row's token to match the marker that claims it.
+  const sibling = db.prepare(`
+    SELECT session_token FROM agents
+    WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'
+  `);
   const update = db.prepare(
     "UPDATE agents SET host_agent = ?, model_family = ? WHERE swarm_id = ? AND name = ? COLLATE NOCASE AND agent_type = 'headless'"
   );
   for (const marker of listHeadlessMarkers()) {
+    if (marker.swarm_id === self.swarm_id) continue;
+    const row = sibling.get(marker.swarm_id, marker.agent_name) as { session_token: string | null } | undefined;
+    if (!row || !marker.session_token || row.session_token !== marker.session_token) continue;
     update.run(hostAgent, family, marker.swarm_id, marker.agent_name);
   }
 }

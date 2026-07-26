@@ -56,8 +56,15 @@ export function parseModelFamily(value: string | null | undefined): ModelFamily 
 export function agentModelFamily(
   agent: { host_agent?: string | null; model_family?: string | null; agent_type?: string | null }
 ): ModelFamily {
+  // A2A: the declaration is the ONLY evidence. Its host_agent is not an observation of
+  // the remote agent — it is whatever local process last acted under that identity.
   if (agent.agent_type === 'a2a') return parseModelFamily(agent.model_family) ?? 'unknown';
-  const fromHarness = deriveModelFamily(agent.host_agent);
-  if (fromHarness !== 'unknown') return fromHarness;
-  return parseModelFamily(agent.model_family) ?? 'unknown';
+
+  // LOCAL: the live harness, or nothing. The stored column here is a cache of a past
+  // observation, and falling back to it resurrected exactly the wrong-family case this
+  // is meant to remove — a row left as {host_agent: null, model_family: 'claude'} by an
+  // older version kept approving as Claude even though nothing currently observes that.
+  // Clearing the cache on rejoin was not enough: rows already on disk never rejoin.
+  // The cache may still be DISPLAYED; it may not be review evidence.
+  return deriveModelFamily(agent.host_agent);
 }

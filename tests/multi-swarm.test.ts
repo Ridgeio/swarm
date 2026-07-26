@@ -275,12 +275,21 @@ describe('a trailing --swarm selector is refused, not delivered elsewhere', () =
       }
     };
 
-    for (const selector of [['--swarm', 'docs'], ['--swarm=docs'], ['-s', 'docs'], ['--swarm', 'nosuchswarm']]) {
+    // Mid-message forms too: end-anchoring caught `send Bob --swarm docs` but missed
+    // `send Bob --swarm docs hello`, which is the more natural way to make the mistake.
+    for (const selector of [
+      ['--swarm', 'docs'],
+      ['--swarm=docs'],
+      ['-s', 'docs'],
+      ['--swarm', 'nosuchswarm'],
+      ['--swarm', 'docs', 'hello'],
+      ['-s', 'docs', 'hello', 'there'],
+    ]) {
       const result = run(selector);
       assert.notStrictEqual(result.status, 0, `${selector.join(' ')}: must exit non-zero`);
       assert.match(
         result.stderr,
-        /is message text, not a swarm selector/,
+        /^Refusing:[\s\S]*swarm selector/m,
         `${selector.join(' ')}: must fail with the SELECTOR refusal, not some other error`
       );
     }
@@ -292,6 +301,52 @@ describe('a trailing --swarm selector is refused, not delivered elsewhere', () =
     after.close();
     fs.rmSync(home, { recursive: true, force: true });
     assert.strictEqual(delivered.n, 0, 'nothing may be inserted into the default swarm');
+  });
+
+  /**
+   * The broadcast defect was the ABSENCE of the validator call, so sharing a helper with
+   * `send` proves the parsing logic but not that both call sites stay wired: deleting the
+   * broadcast call left every send-only test green.
+   */
+  test('broadcast refuses a misplaced selector too, and delivers nothing', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-bcast-'));
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const cliDb = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const def = getOrCreateSwarm(cliDb, 'default');
+    getOrCreateSwarm(cliDb, 'docs');
+    const alice = joinHeadlessAgent(cliDb, def.id, 'Alice', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
+    joinHeadlessAgent(cliDb, def.id, 'Bob', undefined, { hostAgent: 'codex', versionRunner: () => 'v' });
+    cliDb.close();
+
+    const index = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
+    let status = 0;
+    let stderr = '';
+    try {
+      execFileSync('node', ['--import', import.meta.resolve('tsx'), index, 'broadcast', 'hello', '--swarm', 'docs'], {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: {
+          PATH: process.env.PATH ?? '',
+          HOME: home,
+          TMPDIR: path.join(home, 'tmp'),
+          SWARM_AGENT_NAME: 'Alice',
+          SWARM_SESSION_TOKEN: alice.session_token ?? '',
+          SWARM_TEST_DISABLE_BACKGROUND: '1',
+        },
+      });
+    } catch (err: any) {
+      status = typeof err.status === 'number' ? err.status : 1;
+      stderr = err.stderr?.toString() ?? '';
+    }
+
+    const after = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const rows = after.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number };
+    after.close();
+    fs.rmSync(home, { recursive: true, force: true });
+
+    assert.notStrictEqual(status, 0, 'broadcast must exit non-zero');
+    assert.match(stderr, /^Refusing:[\s\S]*swarm selector/m);
+    assert.strictEqual(rows.n, 0, 'no broadcast row may be written');
   });
 });
 

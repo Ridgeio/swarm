@@ -133,6 +133,13 @@ export interface JanitorInstallOptions extends JanitorPathsOptions {
   entrypointPath?: string;
   /** Set false in tests; production uninstall best-effort unloads first. */
   launchctlCommand?: string | false;
+  /**
+   * Test seams for interpreter resolution. Without these the default path can only be
+   * exercised on a host whose own execPath happens to be Homebrew-pinned, so the same
+   * test passes vacuously everywhere else — which is how the original defect survived.
+   */
+  execPath?: string;
+  pathProbe?: { existsSync?: (p: string) => boolean; realpathSync?: (p: string) => string };
 }
 
 const BUILD_OUTPUT_NAMES = new Set(['node_modules', '.astro', 'dist', 'build', '.next', '.cache']);
@@ -946,16 +953,22 @@ export function stableNodePath(
 export function installJanitorLaunchAgent(options: JanitorInstallOptions = {}): string {
   const plistPath = janitorLaunchAgentPath(options);
   const programArguments = [
-    options.nodePath ?? stableNodePath(),
+    options.nodePath ?? stableNodePath(options.execPath ?? process.execPath, options.pathProbe ?? {}),
     options.entrypointPath ?? builtEntrypoint(),
     'janitor',
     'tick',
     '--observe',
   ];
-  // Without this the job can only fail silently: launchd discards stderr by default, so a
-  // broken interpreter path leaves no trace anywhere. A job that cannot report its own
-  // failure is not monitored, it is merely installed.
+  // Captures stderr from a job that STARTS. Measured limit, do not overstate it: a missing
+  // interpreter fails BEFORE exec, and launchd then creates this file with ZERO BYTES —
+  // an empty log that reads exactly like "ran fine, nothing to report". For that class the
+  // only signal is the exit-status column of `launchctl list` (78). The stable alias above
+  // is what fixes the observed incident; this key preserves diagnostics for the different
+  // class where the process runs and complains.
   const stderrPath = path.join(options.homeDir ?? os.homedir(), '.swarm', 'janitor-stderr.log');
+  // launchd creates the FILE but not missing parent directories, so on a fresh install
+  // (~/.swarm absent) the diagnostic path would be unusable exactly when it is needed.
+  fs.mkdirSync(path.dirname(stderrPath), { recursive: true });
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

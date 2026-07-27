@@ -399,22 +399,28 @@ describe('WI-5 observe-only janitor census', () => {
     assert.strictEqual(resolved, cellar);
   });
 
-  test('installing WITHOUT an explicit nodePath bakes in a non-Cellar interpreter', () => {
-    // The pre-existing installer test passes nodePath explicitly, so it never exercised
-    // the default — which is exactly where the version-pinned path came from. Mutating
-    // the installer back to process.execPath left every other test green.
+  test('installing WITHOUT an explicit nodePath resolves a Cellar default on EVERY platform', () => {
+    // Platform-independent by construction. The earlier version only caught the bug on a
+    // host whose own execPath was Homebrew-pinned; anywhere else stableNodePath() equals
+    // process.execPath, the assertion was skipped, and reverting the installer stayed
+    // green. The seam drives a SIMULATED Cellar default through the real installer.
     const launchAgentsDir = path.join(suiteRoot, 'default Library', 'LaunchAgents');
+    const cellar = '/opt/homebrew/Cellar/node/26.5.0/bin/node';
+    const stable = '/opt/homebrew/bin/node';
     const plistPath = installJanitorLaunchAgent({
-      launchAgentsDir, homeDir: path.join(suiteRoot, 'default home'),
-      entrypointPath: '/test/index.js', launchctlCommand: false,
+      launchAgentsDir,
+      homeDir: path.join(suiteRoot, 'default home'),
+      entrypointPath: '/test/index.js',
+      launchctlCommand: false,
+      execPath: cellar,
+      pathProbe: {
+        existsSync: (c) => c === stable,
+        realpathSync: (c) => (c === stable || c === cellar ? cellar : c),
+      },
     });
     const plist = fs.readFileSync(plistPath, 'utf-8');
-    assert.match(plist, new RegExp(`<string>${stableNodePath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`),
-      'the plist must use the resolved stable path');
-    if (process.execPath.includes('/Cellar/')) {
-      assert.ok(!plist.includes('/Cellar/'),
-        'a version-pinned Cellar path must never reach the plist — it dies on brew upgrade');
-    }
+    assert.ok(plist.includes(`<string>${stable}</string>`), 'plist must use the stable alias');
+    assert.ok(!plist.includes('/Cellar/'), 'a version-pinned path must never reach the plist');
   });
 
   test('the installed plist can report its own failure', () => {
@@ -425,8 +431,11 @@ describe('WI-5 observe-only janitor census', () => {
       entrypointPath: '/test/index.js', launchctlCommand: false,
     });
     const plist = fs.readFileSync(plistPath, 'utf-8');
-    // launchd discards stderr by default, so a broken interpreter leaves no trace at all.
     assert.match(plist, /<key>StandardErrorPath<\/key>/);
     assert.match(plist, /janitor-stderr\.log/);
+    // launchd creates the FILE but never missing parent directories, so on a fresh
+    // install the diagnostic path would be unusable exactly when it is needed.
+    assert.ok(fs.existsSync(path.join(homeDir, '.swarm')),
+      'installer must create the stderr log directory; launchd will not');
   });
 });

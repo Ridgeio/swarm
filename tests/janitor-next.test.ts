@@ -12,6 +12,7 @@ import {
   formatJanitorHookLine,
   getJanitorStatus,
   installJanitorLaunchAgent,
+  stableNodePath,
   JANITOR_HEARTBEAT_STALE_MS,
   JANITOR_TICK_STALENESS_MS,
   readJanitorRoots,
@@ -355,5 +356,77 @@ describe('WI-5 observe-only janitor census', () => {
     assert.strictEqual(uninstallJanitorLaunchAgent({ launchAgentsDir, launchctlCommand: false }), true);
     assert.strictEqual(fs.existsSync(plistPath), false);
     assert.strictEqual(uninstallJanitorLaunchAgent({ launchAgentsDir, launchctlCommand: false }), false);
+  });
+
+  /**
+   * Measured failure this fixes: the plist held /opt/homebrew/Cellar/node/25.9.0_1/bin/node,
+   * `brew upgrade node` moved to 26.5.0, and the job failed with exit 78 from then on —
+   * while launchctl still listed it, so registered-and-dead looked exactly like
+   * registered-and-working.
+   */
+  test('stableNodePath rewrites a version-pinned Cellar path to an alias that survives upgrade', () => {
+    const cellar = '/opt/homebrew/Cellar/node/26.5.0/bin/node';
+    const stable = '/opt/homebrew/bin/node';
+    const resolved = stableNodePath(cellar, {
+      existsSync: (p) => p === stable,
+      // Both aliases resolve to the SAME binary today, which is the precondition for
+      // swapping one for the other.
+      realpathSync: (p) => (p === stable || p === cellar ? cellar : p),
+    });
+    assert.strictEqual(resolved, stable);
+  });
+
+  test('stableNodePath keeps a path that is not version-pinned', () => {
+    // The mock is built so the guard is LOAD-BEARING: this path's realpath matches a
+    // candidate alias, so without the not-pinned guard it would be rewritten. A mock that
+    // cannot distinguish the two cases would pass either way.
+    const plain = '/usr/bin/node';
+    const resolved = stableNodePath(plain, {
+      existsSync: (c) => c === '/opt/homebrew/bin/node',
+      realpathSync: () => '/shared/real/node',
+    });
+    assert.strictEqual(resolved, plain, 'a non-pinned path must be left alone');
+  });
+
+  test('stableNodePath keeps the Cellar path when no alias resolves to the same binary', () => {
+    // Never point the job at a DIFFERENT node than the one that installed it: a wrong
+    // interpreter is worse than a pinned one, because it may half-work.
+    const cellar = '/opt/homebrew/Cellar/node/26.5.0/bin/node';
+    const resolved = stableNodePath(cellar, {
+      existsSync: () => true,
+      realpathSync: (p) => (p === cellar ? cellar : '/some/other/node'),
+    });
+    assert.strictEqual(resolved, cellar);
+  });
+
+  test('installing WITHOUT an explicit nodePath bakes in a non-Cellar interpreter', () => {
+    // The pre-existing installer test passes nodePath explicitly, so it never exercised
+    // the default — which is exactly where the version-pinned path came from. Mutating
+    // the installer back to process.execPath left every other test green.
+    const launchAgentsDir = path.join(suiteRoot, 'default Library', 'LaunchAgents');
+    const plistPath = installJanitorLaunchAgent({
+      launchAgentsDir, homeDir: path.join(suiteRoot, 'default home'),
+      entrypointPath: '/test/index.js', launchctlCommand: false,
+    });
+    const plist = fs.readFileSync(plistPath, 'utf-8');
+    assert.match(plist, new RegExp(`<string>${stableNodePath().replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}</string>`),
+      'the plist must use the resolved stable path');
+    if (process.execPath.includes('/Cellar/')) {
+      assert.ok(!plist.includes('/Cellar/'),
+        'a version-pinned Cellar path must never reach the plist — it dies on brew upgrade');
+    }
+  });
+
+  test('the installed plist can report its own failure', () => {
+    const launchAgentsDir = path.join(suiteRoot, 'stderr Library', 'LaunchAgents');
+    const homeDir = path.join(suiteRoot, 'stderr home');
+    const plistPath = installJanitorLaunchAgent({
+      launchAgentsDir, homeDir, nodePath: '/test/node',
+      entrypointPath: '/test/index.js', launchctlCommand: false,
+    });
+    const plist = fs.readFileSync(plistPath, 'utf-8');
+    // launchd discards stderr by default, so a broken interpreter leaves no trace at all.
+    assert.match(plist, /<key>StandardErrorPath<\/key>/);
+    assert.match(plist, /janitor-stderr\.log/);
   });
 });

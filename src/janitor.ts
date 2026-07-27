@@ -907,15 +907,55 @@ export function janitorLaunchAgentPath(options: JanitorInstallOptions = {}): str
   return path.join(directory, 'io.swarm.janitor.plist');
 }
 
+/**
+ * A node path that survives `brew upgrade node`.
+ *
+ * `process.execPath` under Homebrew resolves to the VERSION-PINNED Cellar binary
+ * (/opt/homebrew/Cellar/node/25.9.0_1/bin/node). Baking that into a LaunchAgent means the
+ * job dies the next time node is upgraded — and dies SILENTLY: launchctl still lists it,
+ * so registered-and-failing is indistinguishable from registered-and-working unless you
+ * read the exit status column. Measured on this machine: the janitor sat at exit 78 for
+ * an unknown period while its heartbeat-stale banner was printed to every agent and read
+ * past by all of them.
+ *
+ * Prefer a stable alias that resolves to the SAME binary today and follows the upgrade.
+ */
+export function stableNodePath(
+  execPath: string = process.execPath,
+  deps: { existsSync?: (p: string) => boolean; realpathSync?: (p: string) => string } = {}
+): string {
+  const exists = deps.existsSync ?? fs.existsSync;
+  const realpath = deps.realpathSync ?? fs.realpathSync;
+  // Only rewrite version-pinned paths; anything else is already stable or deliberate.
+  if (!execPath.includes('/Cellar/')) return execPath;
+
+  let target: string;
+  try { target = realpath(execPath); } catch { return execPath; }
+
+  for (const candidate of ['/opt/homebrew/bin/node', '/usr/local/bin/node', '/opt/homebrew/opt/node/bin/node']) {
+    try {
+      // Must resolve to the same binary NOW, or we would be pointing the job at a
+      // different node than the one that installed it.
+      if (exists(candidate) && realpath(candidate) === target) return candidate;
+    } catch { /* try the next candidate */ }
+  }
+  // No stable alias found — keep the working path rather than inventing one.
+  return execPath;
+}
+
 export function installJanitorLaunchAgent(options: JanitorInstallOptions = {}): string {
   const plistPath = janitorLaunchAgentPath(options);
   const programArguments = [
-    options.nodePath ?? process.execPath,
+    options.nodePath ?? stableNodePath(),
     options.entrypointPath ?? builtEntrypoint(),
     'janitor',
     'tick',
     '--observe',
   ];
+  // Without this the job can only fail silently: launchd discards stderr by default, so a
+  // broken interpreter path leaves no trace anywhere. A job that cannot report its own
+  // failure is not monitored, it is merely installed.
+  const stderrPath = path.join(options.homeDir ?? os.homedir(), '.swarm', 'janitor-stderr.log');
   const plist = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -930,6 +970,8 @@ ${programArguments.map(argument => `    <string>${xmlEscape(argument)}</string>`
   <integer>900</integer>
   <key>RunAtLoad</key>
   <true/>
+  <key>StandardErrorPath</key>
+  <string>${xmlEscape(stderrPath)}</string>
 </dict>
 </plist>
 `;

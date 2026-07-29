@@ -147,4 +147,86 @@ describe('merged gate: squash merges recordable, no-ops refused', () => {
     assert.equal(r.mergedVerification, undefined);
     fs.rmSync(dir, { recursive: true, force: true });
   });
+
+  /**
+   * Regression for the defect Tundra (openai) found reviewing 1dc56347 — the FIRST
+   * version of this gate. `git diff --name-only` is newline-delimited and C-quotes
+   * paths it considers unusual, and `core.quotePath` defaults to TRUE. So a changed
+   * path holding an accent, umlaut or CJK character became the pathspec
+   * `"caf\303\251- m\303\274nchen.txt"`, which matches NO file; `diff --quiet` then
+   * had nothing to compare, exited 0, and the gate recorded a genuinely UNMERGED
+   * branch as merged. The fix reads -z / NUL-delimited output.
+   *
+   * Each case asserts its own PRECONDITION — that the unfixed instrument really
+   * would have quoted this path. Without that assertion a future git default, or a
+   * repo-local core.quotePath=false, would make these tests pass while measuring
+   * nothing, which is the failure mode this whole file exists to avoid.
+   */
+  for (const [label, filename] of [
+    ['non-ASCII', 'café- münchen.txt'],
+    ['leading/trailing space', ' spaced .txt'],
+  ] as const) {
+    test(`RED — unmerged branch with a ${label} path is NOT recorded as merged`, () => {
+      const dir = makeRepo();
+      const target = git(dir, ['rev-parse', 'HEAD']).trim();
+      git(dir, ['checkout', '-qb', 'quoted']);
+      fs.writeFileSync(path.join(dir, filename), 'work\n');
+      git(dir, ['add', '-A']);
+      git(dir, ['commit', '-qm', 'quoted path']);
+      const head = git(dir, ['rev-parse', 'HEAD']).trim();
+      git(dir, ['checkout', '-q', 'main']);
+      pinOrigin(dir, target);
+
+      // PRECONDITION: the old newline-split instrument must actually mangle this
+      // path, otherwise the case is vacuous. Quoting shows up as a wrapping " for
+      // non-ASCII; whitespace survives --name-only intact but dies on .trim().
+      const nameOnly = git(dir, ['diff', '--name-only', `${target}...${head}`]).replace(/\n$/, '');
+      const mangled = nameOnly !== filename || nameOnly.trim() !== filename;
+      assert.ok(mangled, `fixture is vacuous: --name-only returned ${JSON.stringify(nameOnly)} unmangled`);
+
+      // And the branch must be genuinely unmerged, or "not merged" proves nothing.
+      let isAncestor = true;
+      try {
+        git(dir, ['merge-base', '--is-ancestor', head, target]);
+      } catch {
+        isAncestor = false;
+      }
+      assert.equal(isAncestor, false, 'fixture must be a genuinely unmerged branch');
+
+      const r = review(dir, 'quoted', head);
+      assert.equal(r.mergedVerification, undefined, 'an unmerged branch must never record mergedVerification');
+      assert.ok(r.failures.length > 0, 'the gate must fail, not pass silently');
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+  }
+
+  test('RED — unmerged branch with a NEWLINE in the path is NOT recorded as merged', () => {
+    const dir = makeRepo();
+    const target = git(dir, ['rev-parse', 'HEAD']).trim();
+    git(dir, ['checkout', '-qb', 'newline']);
+    const filename = 'bad\nname.txt';
+    try {
+      fs.writeFileSync(path.join(dir, filename), 'work\n');
+    } catch {
+      // Some filesystems refuse a newline in a name. Skipping is honest; asserting
+      // on a file that was never created would be a green that measured nothing.
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+    git(dir, ['add', '-A']);
+    git(dir, ['commit', '-qm', 'newline path']);
+    const head = git(dir, ['rev-parse', 'HEAD']).trim();
+    git(dir, ['checkout', '-q', 'main']);
+    pinOrigin(dir, target);
+
+    // A newline in the path is the sharpest form: --name-only cannot even represent
+    // it as one line, so the old split produced a pathspec that matched nothing.
+    const nameOnly = git(dir, ['diff', '--name-only', `${target}...${head}`]).replace(/\n$/, '');
+    assert.notEqual(nameOnly, filename, 'fixture is vacuous: --name-only returned the path unmangled');
+
+    const r = review(dir, 'newline', head);
+    assert.equal(r.mergedVerification, undefined, 'an unmerged branch must never record mergedVerification');
+    assert.ok(r.failures.length > 0, 'the gate must fail, not pass silently');
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
 });

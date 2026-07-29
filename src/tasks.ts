@@ -1056,12 +1056,26 @@ export function reviewGitGates(
         const ancestor = git(task.repo_path, [
           'merge-base', '--is-ancestor', facts.head, target.sha,
         ]) !== null;
+        // -z is load-bearing, not a style choice. `--name-only` is NEWLINE-delimited and
+        // git C-QUOTES any path it considers unusual, and `core.quotePath` defaults to
+        // TRUE — so this is not an exotic-filename edge case. Measured on a real repo
+        // 2026-07-29, both against this exact gate:
+        //     bad\nname.txt        -> pathspec "bad\nname.txt"
+        //     café- münchen.txt    -> pathspec "caf\303\251- m\303\274nchen.txt"
+        // Either pathspec matches NO file, so `diff --quiet` finds nothing to differ,
+        // exits 0, and a GENUINELY UNMERGED branch is recorded as merged in a durable
+        // ledger. Any accent, umlaut or CJK character in a changed path is enough. That
+        // is the exact false-positive this gate was rewritten to remove, arriving by a
+        // different door. Caught by Tundra (openai) in cross-family review of 1dc56347.
+        //
+        // Do NOT reintroduce .trim(): with -z the bytes between NULs are the path
+        // exactly, and a path with leading or trailing whitespace is legal. Trimming it
+        // yields a pathspec matching nothing — the same false `merged`, same mechanism.
         const changedRaw = ancestor
           ? ''
-          : git(task.repo_path, ['diff', '--name-only', `${target.sha}...${facts.head}`]);
+          : git(task.repo_path, ['diff', '-z', '--name-only', `${target.sha}...${facts.head}`]);
         const changedPaths = (changedRaw ?? '')
-          .split('\n')
-          .map(line => line.trim())
+          .split('\0')
           .filter(Boolean);
         if (ancestor) {
           mergedVerification = {

@@ -83,6 +83,15 @@ export interface MergedVerification {
   sourceSha: string;
   targetRef: string;
   targetSha: string;
+  /**
+   * WHICH instrument established that the source landed on the target. A later
+   * audit reading disposition=merged must not have to guess whether that rests
+   * on a local content comparison or a GitHub API read, and if corroboration
+   * was unavailable the record says so rather than being silently weaker.
+   */
+  method: 'content' | 'content+gh';
+  /** Paths the branch changed, used as the content comparison's subject. */
+  comparedPaths: number;
 }
 
 export interface CloseTaskResult extends Task {
@@ -975,13 +984,20 @@ async function reviewCloseEvidence(
   return { evidence, failures };
 }
 
-function reviewGitGates(
+/**
+ * Exported for test only. The merged gate must be provable against REAL git
+ * semantics — a mocked runner would only prove the test author's model of what
+ * git returns, and the defect this replaced was precisely a wrong model of what
+ * `--is-ancestor` reports after a squash merge.
+ */
+export function reviewGitGates(
   task: Task,
   facts: GitFacts,
   claimKind: ClaimKind,
   disposition: TaskDisposition,
   preservedArchive: boolean,
-  forcedDiscard: boolean
+  forcedDiscard: boolean,
+  git: GitQueryRunner = tryGit
 ): GitGateReview {
   if (!task.repo_path) return { failures: [] };
   const failures: GateFailure[] = [];
@@ -1009,18 +1025,80 @@ function reviewGitGates(
           message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; default target ref and target SHA could not be resolved. ` +
             'Set origin/HEAD or fetch origin/main or origin/master, then retry.',
         });
-      } else if (tryGit(task.repo_path, ['merge-base', '--is-ancestor', facts.head, target.sha]) === null) {
-        failures.push({
-          gate: 'git-default-branch-reachability',
-          message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; target ref ${target.ref}; target SHA ${target.sha}. ` +
-            `The commit is not on the target branch. Merge and push it to ${target.ref}, then retry.`,
-        });
       } else {
-        mergedVerification = {
-          sourceSha: facts.head,
-          targetRef: target.ref,
-          targetSha: target.sha,
-        };
+        // "Did it land?" is a CONTENT question, not an ancestry one.
+        //
+        // This gate used to ask `merge-base --is-ancestor <head> <target>`. That is
+        // WRONG for a squash-merging repo and PromptEden's own operating manual says
+        // so: a squash creates a NEW commit, so the branch head never becomes an
+        // ancestor of the default branch and `--is-ancestor` reports EVERY
+        // squash-merged PR as stranded. Measured 2026-07-29 on PR #1258: reviewed
+        // head 746da24d is not an ancestor of origin/main, while its squash merge
+        // 985ee13d is and has exactly one parent. The old gate was therefore
+        // unsatisfiable — no override, no grant, and no correctly-attached worktree
+        // could reach it — and four agents spent six grants obeying it.
+        //
+        // The principle is unchanged: `merged` must be a MEASURED statement about
+        // the default branch, never an assertion. Only the instrument changes.
+        //
+        // Content equality is PRIMARY and deliberately local. A `gh pr view` gate
+        // would need network and auth, and gh is absent from the minimal PATH used
+        // by cron/launchd and from non-interactive ssh sessions — exactly the
+        // contexts agents close tasks from. A gate that cannot run offline gets
+        // worked around, and the workaround is recording a false disposition.
+        const changedRaw = git(task.repo_path, [
+          'diff', '--name-only', `${target.sha}...${facts.head}`,
+        ]);
+        const changedPaths = (changedRaw ?? '')
+          .split('\n')
+          .map(line => line.trim())
+          .filter(Boolean);
+        if (changedRaw === null) {
+          failures.push({
+            gate: 'git-default-branch-reachability',
+            message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; target ref ${target.ref}. ` +
+              'Could not compute the paths this branch changed, so landing cannot be measured. Fetch the target ref and retry.',
+          });
+        } else if (changedPaths.length === 0) {
+          // The zero-change guard. An empty content diff is indistinguishable from
+          // a fully-landed one, and the same manual paragraph records that both
+          // `--is-ancestor` and `branch --contains` report LANDED for a branch with
+          // zero commits. Without this, replacing an unfireable gate would produce
+          // an always-firing one — the same defect inverted, and worse, because it
+          // would admit a false `merged` into a durable ledger.
+          failures.push({
+            gate: 'git-default-branch-reachability',
+            message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head} changes no paths relative to ${target.ref}. ` +
+              'A branch that changed nothing cannot be verified as landed — an empty diff looks identical to a merged one. Use --disposition archive.',
+          });
+        } else if (
+          git(task.repo_path, ['diff', '--quiet', facts.head, target.sha, '--', ...changedPaths]) === null
+        ) {
+          failures.push({
+            gate: 'git-default-branch-reachability',
+            message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; target ref ${target.ref}; target SHA ${target.sha}. ` +
+              `${changedPaths.length} path(s) this branch changed still differ on ${target.ref}. Merge and push it, then retry.`,
+          });
+        } else {
+          // No gh corroboration here, deliberately. The injected runner is a
+          // GitQueryRunner — it runs git. An earlier draft of this block called
+          // git(repo, ['!gh', 'pr', 'view', ...]), which would have executed
+          // `git !gh` and returned null, i.e. it would have silently recorded
+          // method 'content' forever while LOOKING like it consulted GitHub. A
+          // corroborator that cannot speak is worse than none, because the method
+          // field would then assert an instrument that never ran.
+          //
+          // If gh corroboration is wanted it belongs at the caller, where a gh
+          // runner can be injected and its ABSENCE recorded honestly. Until then
+          // this gate is content-only and says so.
+          mergedVerification = {
+            sourceSha: facts.head,
+            targetRef: target.ref,
+            targetSha: target.sha,
+            method: 'content',
+            comparedPaths: changedPaths.length,
+          };
+        }
       }
     }
   } else if (disposition === 'pr' || disposition === 'merged') {

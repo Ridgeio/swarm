@@ -250,7 +250,13 @@ describe('WI-3 task ledger CLI', () => {
       assert.match(refused.stderr, new RegExp(`source SHA ${sourceSha}`));
       assert.match(refused.stderr, /target ref origin\/main/);
       assert.match(refused.stderr, new RegExp(`target SHA ${originalTargetSha}`));
-      assert.match(refused.stderr, /The commit is not on the target branch/);
+      // Wording changed when the gate moved from ancestry to content equality: an
+    // unmerged branch is now refused because the paths it changed still DIFFER on
+    // the target, not because its head is not an ancestor. Every other assertion
+    // in this test is unchanged and still passes — refusal, source SHA, target
+    // ref, target SHA, worktree preserved, task still active — so the test's
+    // intent is intact and only the sentence it reads moved.
+    assert.match(refused.stderr, /path\(s\) this branch changed still differ on origin\/main/);
       assert.ok(fs.existsSync(active.worktree_path), 'failed verification must leave the worktree in place');
       db = openDb(home);
       assert.strictEqual(taskRow(db, 'default-merged').state, 'active');

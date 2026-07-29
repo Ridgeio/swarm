@@ -107,16 +107,40 @@ describe('merged gate: squash merges recordable, no-ops refused', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  test('RED — a branch that changed NOTHING is refused, not read as landed', () => {
-    // PromptEden's manual records this false positive: an empty content diff is
-    // indistinguishable from a fully-merged one, and both --is-ancestor and
+  test('RED — a branch whose commits change no paths is refused, not read as landed', () => {
+    // PromptEden's manual records the false positive this guards: an empty content
+    // diff is indistinguishable from a fully-merged one, and both --is-ancestor and
     // branch --contains report LANDED for a zero-commit branch. Replacing an
     // unfireable gate with an always-firing one is the same defect inverted.
+    //
+    // A DOCUMENTED LIMIT, established by measurement rather than assumed: a branch
+    // with NO commits at all cannot be distinguished from a FAST-FORWARD merged one.
+    // Both give head == target, is-ancestor yes, `rev-list target..head` 0, and zero
+    // changed paths — after an ff-merge the branch's commits ARE the default
+    // branch's history, so "did this branch do work" is not recoverable from
+    // post-merge state. Refusing that shape would break every ff-merged close, so
+    // the ancestry fast path accepts it. The guard therefore protects the CONTENT
+    // path, which is where the squash case lives and where the risk actually is.
+    //
+    // The constructible risk is a branch with a commit that changes nothing: NOT an
+    // ancestor, so it reaches the content path, and it touches zero paths.
     const dir = makeRepo();
     git(dir, ['checkout', '-qb', 'noop']);
+    git(dir, ['commit', '-q', '--allow-empty', '-m', 'empty: no changes']);
     const head = git(dir, ['rev-parse', 'HEAD']).trim();
     git(dir, ['checkout', '-q', 'main']);
-    pinOrigin(dir, git(dir, ['rev-parse', 'HEAD']).trim());
+    const target = git(dir, ['rev-parse', 'HEAD']).trim();
+    pinOrigin(dir, target);
+
+    // Assert the preconditions, so this test fails loudly if the fixture stops
+    // exercising the content path.
+    let isAncestor = true;
+    try {
+      git(dir, ['merge-base', '--is-ancestor', head, target]);
+    } catch {
+      isAncestor = false;
+    }
+    assert.equal(isAncestor, false, 'fixture must reach the content path, not the ancestry fast path');
 
     const r = review(dir, 'noop', head);
     assert.match(r.failures.map(f => f.message).join(' '), /changes no paths/);

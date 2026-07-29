@@ -89,7 +89,7 @@ export interface MergedVerification {
    * on a local content comparison or a GitHub API read, and if corroboration
    * was unavailable the record says so rather than being silently weaker.
    */
-  method: 'content' | 'content+gh';
+  method: 'ancestry' | 'content' | 'content+gh';
   /** Paths the branch changed, used as the content comparison's subject. */
   comparedPaths: number;
 }
@@ -1046,14 +1046,32 @@ export function reviewGitGates(
         // by cron/launchd and from non-interactive ssh sessions — exactly the
         // contexts agents close tasks from. A gate that cannot run offline gets
         // worked around, and the workaround is recording a false disposition.
-        const changedRaw = git(task.repo_path, [
-          'diff', '--name-only', `${target.sha}...${facts.head}`,
-        ]);
+        // ANCESTRY FIRST, as a POSITIVE test only. This is the correction an
+        // existing test caught: after a FAST-FORWARD merge the branch head IS the
+        // target, so it changes no paths relative to it, and a content-only gate
+        // refused a legitimately merged branch. Ancestry is unsound as a NEGATIVE
+        // test — a squash makes it wrongly say "no" — but when it says YES the
+        // commits are literally on the default branch and nothing more is needed.
+        // Keep it for what it proves; do not trust its denial.
+        const ancestor = git(task.repo_path, [
+          'merge-base', '--is-ancestor', facts.head, target.sha,
+        ]) !== null;
+        const changedRaw = ancestor
+          ? ''
+          : git(task.repo_path, ['diff', '--name-only', `${target.sha}...${facts.head}`]);
         const changedPaths = (changedRaw ?? '')
           .split('\n')
           .map(line => line.trim())
           .filter(Boolean);
-        if (changedRaw === null) {
+        if (ancestor) {
+          mergedVerification = {
+            sourceSha: facts.head,
+            targetRef: target.ref,
+            targetSha: target.sha,
+            method: 'ancestry',
+            comparedPaths: 0,
+          };
+        } else if (changedRaw === null) {
           failures.push({
             gate: 'git-default-branch-reachability',
             message: `Cannot close task "${task.id}" as merged: source SHA ${facts.head}; target ref ${target.ref}. ` +

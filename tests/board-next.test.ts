@@ -747,6 +747,7 @@ describe('WI-7c board Mermaid graph', () => {
             encoding: 'utf-8',
             env: {
               ...process.env,
+              NODE_OPTIONS: [process.env.NODE_OPTIONS, '--no-deprecation'].filter(Boolean).join(' '),
               HOME: home,
               SWARM_ID: 'default',
               SWARM_NAME: '',

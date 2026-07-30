@@ -53,9 +53,19 @@ swarm status --set "<what you are doing>"
 
 1. Check `swarm inbox` before starting new work and after finishing a task.
 2. When a terminal message starts with `[SWARM from <name>]:`, treat it as a direct request or notification.
-3. Reply with `swarm send <name> "<reply>"` when a response is useful.
+3. Reply with `swarm send <name> "<reply>"` only for a result, decision-bearing question, or true blocker; informational messages need no receipt reply.
 4. Prefer targeted messages over broadcasts.
 5. Do not send secrets through swarm messages or leave secrets visible in terminals other agents can read.
+
+## Quiet goals and inactive recipients
+
+- One goal emits one condition-complete final evidence packet or one true blocker. Put progress in status, checkpoints, run logs, and files—not acknowledgement or per-step messages.
+- After handling a message, use `swarm ack <exact-id...>` as transport metadata. Never send an acknowledgement message and never use `ack --all`.
+- For an ordinary question that truly needs an answer, send it once with `swarm send <agent> "<question>" --require-reply <ttl>`. The exact recipient resolves it with `swarm send <requester> "<answer>" --reply-to <message-id>`; reading or acking alone never resolves it. Inspect pending/terminal state with `swarm replies [--history]`.
+- Required ownership pickup uses `swarm handoff offer` and exact-recipient `handoff accept`; a successful push is not acceptance.
+- When a recipient is quiet, use `swarm inbox --wait 60`, inspect handoff status, then `swarm read` once. Supersede changed orders; do not resend identical prompts.
+- If the exact registration is inactive or pickup expires, preserve work with `swarm rescue --task <slug> --to <successor>` before Owner/Lead takeover or rebind. Same-name replacements inherit no lease, grant, message, or role.
+- Re-review every changed exact head with a fresh different-family adversarial reviewer under the active provider/quota policy.
 
 ## Durable work: tasks, evidence, approvals (SWARM-NEXT)
 

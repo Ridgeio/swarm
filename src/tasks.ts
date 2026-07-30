@@ -2332,7 +2332,7 @@ export async function acceptTaskHandoff(
       `charter sha256=${offer.charter_sha256}.`,
       {
         createdAt: acceptedAt,
-        kind: 'ack',
+        kind: 'handoff',
         fromAgentId: recipient.id,
         recipientAgentId: offer.from_agent_id,
       }
@@ -2420,7 +2420,7 @@ export async function declineTaskHandoff(
       `Declined handoff offer #${offer.id} for ${slug}; source lease remains unchanged; reason=${reason}.`,
       {
         createdAt: resolvedAt,
-        kind: 'ack',
+        kind: 'handoff',
         fromAgentId: recipient.id,
         recipientAgentId: offer.from_agent_id,
       }

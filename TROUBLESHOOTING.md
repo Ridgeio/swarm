@@ -115,11 +115,29 @@ Use the message ID shown by the hook:
 
 ```bash
 swarm ack 41
-# or, after reviewing everything pending:
-swarm ack --all
+# or acknowledge several exact reviewed rows:
+swarm ack 41 44 47
 ```
 
-A plain `swarm inbox` read also acknowledges every row it prints. `--peek`, `--recent`, and kind-filtered reads do not.
+A plain `swarm inbox` read also acknowledges every row it prints. `--peek`,
+`--recent`, and kind-filtered reads do not. `ack --all` is deliberately refused:
+bulk acknowledgement could erase an unseen STOP, gate, question, or handoff.
+
+## I acknowledged a question but it still says REPLY REQUIRED
+
+Delivery acknowledgement means only “this exact inbox row was reviewed.” It
+does not claim the requested work or answer the question. Respond to the exact
+requester and bind the answer to the request ID printed by the hook/inbox:
+
+```bash
+swarm send Alice "Schema B; it preserves rollback." --reply-to 41
+```
+
+Only the original exact recipient registration can resolve the row, and only
+before its deadline. If either exact party leaves or the deadline passes, the
+janitor dead-letters the request and queues an escalation for the active
+requester and active Owner/Lead registrations. A same-name rejoin cannot answer
+for the departed registration.
 
 ---
 
@@ -173,11 +191,11 @@ Every close, including an override, must type `--not-established "<text>"`; use 
 
 The normal fix is to push the branch and clean or commit the worktree. The explicit escape hatches are:
 
-- Preserve the worktree with `swarm rescue --task <slug>`, verify the artifact, then close with `--disposition archive`.
+- Preserve the worktree with `swarm rescue --task <slug>`, verify the artifact, then close with `--disposition archive`. For succession, add `--to <successor>` so the exact replacement receives a manifest-digest pointer before any authorized takeover/rebind.
 - Intentionally throw it away with both `--disposition discard --force-discard`. This is event-logged and cannot be requested with only one of the two flags.
 
 ```bash
-swarm rescue --task auth-refresh
+swarm rescue --task auth-refresh --to Bob
 swarm task close auth-refresh --disposition archive --not-established "none"
 
 # destructive intent, double-confirmed:

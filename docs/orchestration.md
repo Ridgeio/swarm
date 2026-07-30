@@ -77,8 +77,14 @@ scope arbitrations without lead involvement in one afternoon.
    sha>, mergeable clean.` If any clause isn't true yet, there is nothing to
    send. This also fixes crossed-message races (two agents both telling the
    lead CI went green; the lead merging before the "please merge" arrives).
-2. **No acks upward.** Ack the agent who tasked you, one line, only them.
-   The assigner assumes receipt unless a problem is flagged within ~10 min.
+2. **No acknowledgement messages.** Delivery acknowledgement is `swarm ack
+   <exact-id...>` metadata after the message is handled. Assignment pickup is
+   an exact `swarm handoff accept`, not “got it.” The assigner receives one
+   condition-complete final evidence packet or one true blocker; progress
+   belongs in status, checkpoints, and run logs. If an ordinary question needs
+   an answer, send it once with `--require-reply <ttl>` and require the exact
+   recipient's directed `--reply-to <message-id>`; a read or ack does not
+   resolve it.
 3. **No receipt checks.** Check `swarm inbox --recent N` before asking
    whether a message was lost (the unread cursor advances when *any* session
    reads; `--recent` replays regardless — two agents were confused by this
@@ -92,6 +98,13 @@ scope arbitrations without lead involvement in one afternoon.
    when its owner *sends* it. Observed failure: an agent screen-read the
    lead's option analysis mid-deliberation and adopted one option as "the
    direction" — it wasn't.
+
+For an inactive recipient, do not resend the same prompt. Wait on the inbox,
+inspect required-reply/handoff status, and read the local surface once. If its
+exact registration is gone or the pickup deadline expires, the source retains
+the lease: run `swarm rescue --task <slug> --to <successor>` and verify its
+digest-bound artifact before any authorized reap/takeover/rebind, then send
+the exact successor a new charter.
 
 ## Context management across the fleet
 
@@ -123,16 +136,15 @@ scope arbitrations without lead involvement in one afternoon.
 | Screen-read "decisions" | Near-miss: agent almost built against an unmade infra choice |
 | Premature "closed" verdicts | An agent closed an investigation whose own positive control had failed; reopened only on lead pushback — verify the control *before* declaring victory |
 
-## CLI improvement backlog (evidence-linked)
+## CLI controls graduated from field evidence
 
-Concrete `swarm` features that would encode the above in the tool rather
-than in discipline. Each links to a failure observed live:
+These controls now encode the field failures in the tool rather than leaving
+them to discipline:
 
-1. **Multi-recipient targeted send** — `swarm send a,b,c "<msg>"` (or
-   `--group builders` with named groups in the DB). Removes the main reason
+1. **Multi-recipient targeted send** — `swarm send a,b,c "<msg>"`. Removes the main reason
    agents reach for `broadcast`. *Evidence: reviewer pings and contract
    notices routinely need exactly 2–3 recipients.*
-2. **Message kinds** — `--kind status|digest|merge-req|escalation|ack`,
+2. **Message kinds** — `--kind status|digest|merge-req|escalation|gate|handoff`,
    filterable on read (`swarm inbox --kind merge-req`). Lets the lead read
    gates first and skim status later; lets a PM absorb `status` mechanically.
    *Evidence: gate-critical messages buried between acks all afternoon.*
@@ -147,9 +159,10 @@ than in discipline. Each links to a failure observed live:
    corrected SHA/status replaces the stale message in unread inboxes rather
    than coexisting with it. *Evidence: a mistyped SHA correction raced its
    original; the auditor had to disambiguate manually.*
-6. **Digest support** — `swarm digest --to lead --window <since>` for PM
-   use: batch accumulated status sends into one message, marking sources
-   read. *Evidence: the PM digest pattern works but is assembled by hand.*
+6. **Still open: digest support** — a future deterministic
+   `swarm digest --to lead --window <since>` could batch accumulated status
+   rows into one packet without spending model turns. *Evidence: the PM digest
+   pattern works but is assembled by hand.*
 
 When implementing any of these: keep the CLI thin (this repo's design
 constraint), prefer DB fields + read-side filters over a delivery framework,

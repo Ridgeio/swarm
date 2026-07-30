@@ -99,6 +99,45 @@ describe('redeliverPending', () => {
     assert.strictEqual(deliveredFlag(id), 1);
   });
 
+  test('never legacy-redelivers a resolved required request after its durable outbox is gone', async () => {
+    const requestId = addMessage({ from: 'Alice', to: 'Bob', body: 'Need answer' });
+    const replyId = addMessage({ from: 'Bob', to: 'Alice', body: 'Answer' });
+    const now = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO required_message_responses (
+        swarm_id, request_message_id, sender_agent_id, sender_name,
+        recipient_agent_id, recipient_name, required_by, status, created_at,
+        resolved_at, reply_message_id
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'resolved', ?, ?, ?)
+    `).run(
+      SWARM,
+      requestId,
+      'agent-Alice',
+      'Alice',
+      'agent-Bob',
+      'Bob',
+      new Date(Date.now() + 60_000).toISOString(),
+      now,
+      now,
+      replyId
+    );
+
+    const pushed: string[] = [];
+    assert.strictEqual(hasPendingRedeliveries(db), true, 'the ordinary reply remains eligible');
+    const result = await redeliverPending(db, {
+      deliver: async (_agent, text) => {
+        pushed.push(text);
+        return { delivered: true };
+      },
+    });
+
+    assert.deepStrictEqual(result, { eligible: 1, redelivered: 1, attempted: 1 });
+    assert.deepStrictEqual(pushed, ['[SWARM from Bob]: Answer']);
+    assert.strictEqual(deliveredFlag(requestId), 0, 'required request stays outside the legacy path');
+    assert.strictEqual(deliveredFlag(replyId), 1);
+    assert.strictEqual(hasPendingRedeliveries(db), false);
+  });
+
   test('cursor guard matches case-insensitively', async () => {
     const id = addMessage({ from: 'Alice', to: 'Bob' });
     setCursor('bob', id); // cursor stored with different casing must still count as seen

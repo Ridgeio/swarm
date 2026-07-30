@@ -4,6 +4,14 @@ Supersedes the 2026-07-17 table. Grounding order unchanged: (1) field bench — 
 
 ## Standing rules
 
+**Active review-capacity override — 2026-07-30.** Claude review capacity is
+red/exhausted for the current program. New adversarial/model-inversion gates
+use two fresh exact-head packets: xAI/Grok plus AGY/Gemini High. Do not launch
+Claude for these reviews and do not reuse a verdict from an earlier SHA. If
+the author is xAI, the Grok packet is same-family advisory and the independent
+Gemini packet is the binding inversion gate. This override remains until a
+phase-boundary quota note explicitly lifts it.
+
 1. **Route by default; ensemble by exception.** Panels (alloy) are for decision gates only: architecture approval, security review, release review, contested root-cause. For throughput work, one well-routed model. (Evidence: routing retains ~95% of frontier quality at a fraction of frontier calls — RouteLLM; ensembles add ~two effective votes regardless of panel size — "Nine Judges" 2026; tests out-verify judges — CodeT.)
 2. **Planning/execution split.** Frontier plans and reviews; cheaper executes against the frozen plan. (Aider architect/editor: SOTA at 14× lower cost; Claude Code opusplan.)
 3. **Model inversion (enforced).** The reviewer of gate-critical work must be a different model family than the author — routed mechanically by `swarm review <slug>` (refuses same-family; audited override only). Evidence beyond the ICML correlated-errors result: Greptile's model-inversion study (500 PRs/model, 2026) found cross-model review beat same-model in BOTH directions — Claude-authored: GPT 62.0% recall vs Opus 53.7%; Codex-authored: Opus 60.0% vs GPT 50.5% — because "the types of bugs a model introduces most often are the same types it's more likely to miss during review." Review briefs carry the author-family priors: **Claude-authored → hunt missing behavior first** (GPT 69.0% vs Opus 63.3%); **Codex-authored → hunt build breakage first** (Opus 82.4% vs GPT 58.8%). Both families are weak on semantic-intent/error-handling in Codex code (27.4%/22.6%, tied) — TESTS must catch those, not reviewers. Caveat (theirs and ours): experimental; the effect may fade as models converge — the priors table is a controls.md row with a retest date, not eternal truth. Tests remain the gold verifier; inverted review the second layer; Fable judgment the third. (Source: greptile.com/blog/model-inversion.)
@@ -22,7 +30,7 @@ Supersedes the 2026-07-17 table. Grounding order unchanged: (1) field bench — 
 | Builder: spine / migrations / security surfaces | Codex (gpt-5.6-sol, xhigh) | Gemini → Fable (gate-critical only) | Field-proven primary executor; outcome evidence over Arena rank |
 | Builder: frontend / marketing surfaces | Gemini (`gemini` CLI — NOT Antigravity; its wrapper is broken as of 2026-07) | Kimi → Codex | Fills roster gap; de-risks Codex cap-outs |
 | Design / brand / copy drafting | Kimi K3 (opencode) | Gemini | Field: identity gate 3 days early; keep k2.7 fallback for 429 storms; Fable final pass stands |
-| Adversarial reviewer (per PR) | Different family than author — pick from {Codex, Claude, Gemini} | Fable on gate-critical | Rule 3; fresh context per review (Devin Review evidence: fresh-context reviewers catch what authors can't) |
+| Adversarial reviewer (per PR) | Active override: fresh Grok + AGY/Gemini exact-head packets | Different non-author family when override lifts | Rule 3; fresh context per review, causal attacks, no prior-verdict reuse |
 | QA / dogfood / smoke probes | Grok — **ON PROBATION**: 4/4 silent stub-failures in the 2026-07-19 research panels; require a completion-quality check (output length/substance gate) before trusting a Grok lane result | Kimi → Gemini | Prior field record good (BL-5 discipline); harness reliability now in question — field bench beats reputation in BOTH directions |
 | Research / context mapping | Gemini | Codex synthesis → Fable reads the distillate | Long-context + search-native |
 | Janitor-adjacent ops / sweeps / inventories | Deterministic code; else cheapest with quota headroom | any | Rule 6 |

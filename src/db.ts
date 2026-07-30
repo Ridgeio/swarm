@@ -247,6 +247,37 @@ function createCurrentTables(db: SwarmDb): void {
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
     );
 
+    CREATE TABLE IF NOT EXISTS required_message_responses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      request_message_id INTEGER UNIQUE,
+      sender_agent_id TEXT NOT NULL,
+      sender_name TEXT NOT NULL COLLATE NOCASE,
+      recipient_agent_id TEXT NOT NULL,
+      recipient_name TEXT NOT NULL COLLATE NOCASE,
+      required_by TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'resolved', 'expired')),
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      reply_message_id INTEGER,
+      expiry_reason TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+      FOREIGN KEY (request_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+      FOREIGN KEY (reply_message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS required_response_expiry_notifications (
+      request_id INTEGER NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      audience TEXT NOT NULL CHECK (audience IN ('sender', 'authority')),
+      message_id INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (request_id, recipient_agent_id, audience),
+      FOREIGN KEY (request_id) REFERENCES required_message_responses(id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
     CREATE TABLE IF NOT EXISTS handoff_expiry_notifications (
       offer_id INTEGER NOT NULL,
       recipient_agent_id TEXT NOT NULL,
@@ -598,6 +629,10 @@ function migrate(db: SwarmDb): void {
       ON swarm_authorities(swarm_id, agent_id, revoked_at);
     CREATE INDEX IF NOT EXISTS idx_message_outbox_pending
       ON message_outbox(state, message_id);
+    CREATE INDEX IF NOT EXISTS idx_required_responses_deadline
+      ON required_message_responses(swarm_id, status, required_by);
+    CREATE INDEX IF NOT EXISTS idx_required_responses_recipient
+      ON required_message_responses(swarm_id, recipient_agent_id, status);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);
     CREATE INDEX IF NOT EXISTS idx_janitor_findings_state ON janitor_findings(state, kind);
     CREATE INDEX IF NOT EXISTS idx_janitor_snapshots_tick ON janitor_snapshots(tick_at);

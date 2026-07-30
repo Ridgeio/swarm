@@ -8,7 +8,7 @@ Scope: the hardening successor to `0dadc34`, evaluated against the operator's as
 | --- | --- |
 | Immutable authority | Tasks, task events, direct deliveries, roles, grants, decisions, and handoff parties bind immutable registration IDs. A same-name rejoin receives a new ID and inherits none of them. |
 | Legacy ownership | A task with a NULL owner ID refuses privileged mutation. `task rebind --to --reason` is an explicit Owner/Lead-only recovery that bumps the epoch and records authorization plus rebound events. |
-| Current checkpoint | A handoff charter may use only a checkpoint event from the current owner registration at the current lease epoch. A prior-epoch or same-name-replacement checkpoint is rejected. |
+| Current checkpoint | Every draft carries a random generation marker durably bound to its creating owner registration and lease epoch. Reuse requires that exact marker; a successor preserves but never adopts a prior-owner or overwritten draft. A completed event binds the final content digest, and handoff revalidates marker+digest before copying bytes into a charter. |
 | Owner/Lead ACL | The first privileged local registration bootstraps Owner and Lead for its exact ID. Only an active Owner/Lead may assign those roles, create/revoke grants, take over/recover another registration's task, or make program-scope decisions. |
 | Grant provenance | Grant issuer and recipient IDs are durable. Expiry checks use a persisted monotonic scope clock. Same-name replacements cannot consume old grants. |
 | Decision provenance | Task decisions require the exact current task owner+epoch; program decisions require Owner/Lead. Only the exact original active author may supersede an active decision at the same scope, and an immediate transaction plus unique fence permits one successor. |
@@ -24,7 +24,7 @@ Scope: the hardening successor to `0dadc34`, evaluated against the operator's as
 | Required ordinary replies | `send --require-reply <ttl>` atomically binds requester ID, recipient ID, message ID, and deadline. Reading/acking does not resolve it; only the exact directed `--reply-to <message-id>` does. Late replies and rollback fail closed. |
 | Inactive-party escalation | The fleet janitor expires required replies when either exact party is inactive or the deadline passes, suppresses the stale live request, and queues exactly-once requester/Owner/Lead audience rows. |
 | Rescue delivery | `rescue ... --to` re-verifies the artifact, records its manifest digest and exact successor ID in the task event, and queues a digest-bound pointer to only that registration. Same-name replacements cannot inherit it. |
-| Parser no-op | `decision --help`, unknown options, and missing option values exit before authentication/database mutation. A regression test asserts decision-row count is unchanged. |
+| Parser no-op | `decision --help`, unknown options, missing values, and misspelled coordination-shaped send/broadcast options exit before durable mutation. Regression tests assert row counts stay unchanged. |
 
 ## Handoff state machine
 
@@ -42,13 +42,13 @@ The hardening suite exercises:
 
 - same-name rejoin cannot inherit task, Owner/Lead role, grant, direct-recipient message, or decision-author authority;
 - a member cannot create/revoke grants, make a program decision, or recover another owner's task;
-- a prior-epoch checkpoint cannot authorize handoff after takeover;
+- a prior-owner incomplete draft and a delayed prior-owner overwrite are preserved but cannot be adopted or authorize handoff after takeover; post-record byte changes also fail digest verification;
 - a second decision successor and supersession by a reassigned same-name registration both fail;
 - crashes after offer/accept commit but before push leave atomic durable state and retryable outbox rows;
 - one janitor tick expires offers in multiple swarms and repeated ticks create no duplicate audience rows;
 - handoff, grant, and required-response clocks reject rollback;
 - legacy NULL-token and A2A identities can read but cannot perform privileged mutations;
-- help, unknown options, and missing values create no decision rows;
+- help, unknown options, missing values, and a misspelled `--require-reply` create no durable rows;
 - exact acknowledgement leaves every unlisted STOP/gate/handoff delivery live;
 - inbox acknowledgement cancels its exact queued push but leaves a required-response obligation pending;
 - late replies and same-name replacements cannot resolve another registration's request;

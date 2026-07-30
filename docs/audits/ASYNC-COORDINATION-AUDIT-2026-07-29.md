@@ -18,8 +18,12 @@ Scope: the hardening successor to `0dadc34`, evaluated against the operator's as
 | Fleet deadline sweep | Every janitor tick sweeps every registered swarm. Expiry transitions once and creates exactly one durable notification row per source/authority audience, deduplicating an agent that holds both roles. |
 | Clock rollback | Handoff and grant deadline scopes persist their last observed wall time. A rollback fails closed instead of extending or reviving authority. |
 | Privileged identity | Privileged mutations require an active local registration with a non-NULL token matching the session marker. Legacy NULL-token and A2A identities retain read/messaging compatibility but cannot mutate privileged coordination state. |
-| Reset generation | Reset revokes every live in-scope grant and clears role bindings before removing agents. The next token-bound local join can bootstrap fresh Owner/Lead IDs; surviving task leases remain fenced until authorized takeover/rebind. |
+| Reset generation | Reset revokes every live in-scope grant, terminally expires pending required replies, and clears role bindings before removing agents. The next token-bound local join can bootstrap fresh Owner/Lead IDs; surviving task leases remain fenced until authorized takeover/rebind. |
 | Exact acknowledgement | `ack --all` is refused and the former library bulk-ack helper is removed. Only explicit message IDs can be acknowledged. |
+| Quiet message doctrine | User-authored `--kind ack` is refused. Skills, hooks, and operator doctrine require one final packet or blocker, with delivery acknowledgement kept as exact-ID metadata. |
+| Required ordinary replies | `send --require-reply <ttl>` atomically binds requester ID, recipient ID, message ID, and deadline. Reading/acking does not resolve it; only the exact directed `--reply-to <message-id>` does. Late replies and rollback fail closed. |
+| Inactive-party escalation | The fleet janitor expires required replies when either exact party is inactive or the deadline passes, suppresses the stale live request, and queues exactly-once requester/Owner/Lead audience rows. |
+| Rescue delivery | `rescue ... --to` re-verifies the artifact, records its manifest digest and exact successor ID in the task event, and queues a digest-bound pointer to only that registration. Same-name replacements cannot inherit it. |
 | Parser no-op | `decision --help`, unknown options, and missing option values exit before authentication/database mutation. A regression test asserts decision-row count is unchanged. |
 
 ## Handoff state machine
@@ -29,7 +33,7 @@ Scope: the hardening successor to `0dadc34`, evaluated against the operator's as
 3. One immediate transaction inserts the pending offer, its audit event, pointer message, exact-recipient delivery, and outbox row. The source lease remains unchanged.
 4. Push is attempted after commit. Failure changes delivery state only; it cannot erase the offer.
 5. Only the offer's exact recipient registration may accept. Acceptance re-hashes the charter and verifies source ID, source epoch, recipient ID, deadline, and monotonic clock.
-6. One immediate transaction transfers owner name+ID, increments the epoch, resolves the offer, records the acceptance event, and queues the acknowledgement.
+6. One immediate transaction transfers owner name+ID, increments the epoch, resolves the offer, records the acceptance event, and queues the source notification.
 7. Expiry or invalidation never transfers authority. The janitor records expiry and durable escalation; late acceptance independently fails closed even if the janitor has not run.
 
 ## Adversarial negative controls
@@ -42,17 +46,21 @@ The hardening suite exercises:
 - a second decision successor and supersession by a reassigned same-name registration both fail;
 - crashes after offer/accept commit but before push leave atomic durable state and retryable outbox rows;
 - one janitor tick expires offers in multiple swarms and repeated ticks create no duplicate audience rows;
-- handoff and grant clocks reject rollback;
+- handoff, grant, and required-response clocks reject rollback;
 - legacy NULL-token and A2A identities can read but cannot perform privileged mutations;
 - help, unknown options, and missing values create no decision rows;
-- exact acknowledgement leaves every unlisted STOP/gate/handoff delivery live.
+- exact acknowledgement leaves every unlisted STOP/gate/handoff delivery live;
+- inbox acknowledgement cancels its exact queued push but leaves a required-response obligation pending;
+- late replies and same-name replacements cannot resolve another registration's request;
+- repeated required-response sweeps create no duplicate requester/Owner/Lead audience rows;
+- a rescue pointer carries a verified manifest digest and remains invisible to a same-name successor replacement.
 
 The release gate is the full TypeScript build and test suite on the exact candidate SHA, followed by a fresh cross-family adversarial review. Verdicts from `0dadc34` or earlier are not reusable.
 
 ## Honest residual boundaries
 
 1. **Push transport is at-least-once, durable state is exactly-once.** The SQLite transition/outbox and expiry-audience rows are uniqueness-fenced. A process can still crash after an external push succeeds but before marking the outbox row pushed, so a retry may duplicate the terminal nudge. Consumers must continue treating the inbox row/ID as canonical.
-2. **General required-response deadlines are not implemented.** Handoff deadlines are deterministic. Ordinary STOP, gate, question, and required-reply messages have durable exact-recipient delivery but no generic `required_by` state machine.
+2. **Required-response deadlines are deliberately direct-message only.** A broadcast cannot create an ambiguous N-party response contract. Use one direct `--require-reply` per accountable registration or a task handoff for ownership pickup.
 3. **The local-machine trust boundary remains.** These controls stop stale, unauthenticated, A2A, and ordinary member actions through supported APIs. They do not defend against a malicious same-user process that edits SQLite or steals a live session token.
 4. **Wall-clock rollback fails closed; forward jumps expire early.** This is the conservative authority-safety choice until a trusted time source exists.
 5. **Filesystem cleanup remains observe-only.** The janitor mutates only coordination-ledger deadline/audit/outbox state; it still never deletes repositories, worktrees, or artifacts.

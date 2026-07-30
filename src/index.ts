@@ -38,10 +38,14 @@ import {
   broadcastMessage,
   countRecentMessages,
   getInbox,
+  getRequiredResponse,
   getRecentMessages,
+  listPendingRequiredResponsesForRecipient,
+  listRequiredResponsesForAgent,
   MESSAGE_KINDS,
   recordHookInjections,
   sendMessage,
+  sweepRequiredResponses,
   waitForInbox,
 } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
@@ -91,7 +95,12 @@ import {
   type ClaimKind,
   type TaskDisposition,
 } from './tasks.js';
-import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './rescue.js';
+import {
+  deliverRescueArtifacts,
+  listRescueArtifacts,
+  rescueTargets,
+  verifyRescueArtifact,
+} from './rescue.js';
 import {
   addJanitorRoot,
   formatJanitorHookLine,
@@ -127,7 +136,7 @@ import {
   startBoardServer,
   waitForBoardServerStop,
 } from './board-server.js';
-import { createGrant, listGrants, revokeGrant } from './grants.js';
+import { createGrant, listGrants, parseGrantTtl, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
 import { requestTaskReview } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
@@ -176,6 +185,19 @@ function requireValidKind(usage: string): string | undefined {
   return kind;
 }
 
+function requireSendKind(usage: string): string | undefined {
+  const kind = requireValidKind(usage);
+  if (kind === 'ack') {
+    console.error(
+      'Refused conversational acknowledgement: delivery acknowledgement is transport metadata, not a swarm message. ' +
+      'Handle the message, then run "swarm ack <msg-id...>" for the exact IDs; send only a result or a true blocker.'
+    );
+    console.error(usage);
+    process.exit(1);
+  }
+  return kind;
+}
+
 function requireSupersedes(usage: string): number | undefined {
   if (!hasFlag('--supersedes')) return undefined;
   const raw = getFlag('--supersedes');
@@ -185,6 +207,33 @@ function requireSupersedes(usage: string): number | undefined {
     process.exit(1);
   }
   return Number(raw);
+}
+
+function requireReplyDeadline(usage: string): string | undefined {
+  if (!hasFlag('--require-reply')) return undefined;
+  const values = getRepeatedFlags('--require-reply');
+  const raw = getFlag('--require-reply');
+  const occurrences = args.filter(token => token === '--require-reply').length;
+  if (occurrences !== 1 || values.length !== 1 || !raw || raw.startsWith('-')) {
+    console.error('--require-reply needs exactly one positive duration such as 15m, 2h, or 1d.');
+    console.error(usage);
+    process.exit(1);
+  }
+  let durationMs: number;
+  try {
+    durationMs = parseGrantTtl(raw);
+  } catch {
+    console.error(`Invalid --require-reply "${raw}". Use a positive duration such as 15m, 2h, or 1d.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  const expiryMs = Date.now() + durationMs;
+  if (!Number.isSafeInteger(expiryMs) || Math.abs(expiryMs) > 8.64e15) {
+    console.error(`Invalid --require-reply "${raw}": deadline is outside the supported date range.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return new Date(expiryMs).toISOString();
 }
 
 function requirePositiveIdFlag(flag: string, label: string, usage: string): number | undefined {
@@ -211,6 +260,26 @@ function shellToken(value: string): string {
 function oneLineForCli(value: string, limit: number = 160): string {
   const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   return flattened.length <= limit ? flattened : `${flattened.slice(0, limit - 1)}\u2026`;
+}
+
+function requiredResponseHint(
+  db: ReturnType<typeof getDb>,
+  swarmId: string,
+  messageId: number,
+  fromAgent: string,
+  includeTerminal: boolean = false
+): string {
+  const request = getRequiredResponse(db, swarmId, messageId);
+  if (!request) return '';
+  if (request.status === 'pending') {
+    return ` [REPLY REQUIRED by ${request.required_by}; answer with: ` +
+      `swarm send ${shellToken(fromAgent)} "<answer>" --reply-to ${messageId}]`;
+  }
+  if (!includeTerminal) return '';
+  if (request.status === 'resolved') {
+    return ` [required reply resolved by message #${request.reply_message_id ?? 'deleted'}]`;
+  }
+  return ` [required reply expired: ${request.expiry_reason ?? 'unresolved'}]`;
 }
 
 function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = false): Swarm {
@@ -347,17 +416,22 @@ Agent Management:
 Communication:
   swarm send <agent>[,<agent>...] <message>        Send message within the current swarm
     [--interject|--now]                              (comma-separated list sends to each);
-    [--kind <kind>] [--supersedes <msg-id>]           Grok: force send-now (double Enter);
-                                                     default single Enter queues mid-turn
+    [--kind <kind>] [--supersedes <msg-id>]           --require-reply creates a durable deadline;
+    [--require-reply <ttl>] [--reply-to <msg-id>]      --reply-to resolves that exact request;
+                                                       Grok: force send-now (double Enter);
+                                                     default single Enter queues mid-turn;
+                                                     --kind ack is read-only/system-reserved
   swarm broadcast <message>                        Send to all agents in the current swarm
     [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
-    [--supersedes <msg-id>]                           escalation, ack, gate, handoff)
+    [--supersedes <msg-id>]                           escalation, gate, handoff;
+                                                     ack is read-only/system-reserved)
   swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
     [--wait <seconds>]
     [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
                                                       --recent N replays last N regardless of cursor;
                                                       --kind filters and never advances the cursor)
   swarm ack <msg-id...>                            Acknowledge exact messages explicitly
+  swarm replies [--history]                        Inspect required-answer state for this exact ID
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Task Ledger:
@@ -398,7 +472,7 @@ Task Ledger:
     [--supersedes <decision-id>]
   swarm harness-review <slug>                      Review the full task handoff timeline
   swarm rescue --worktree <path> | --task <slug>   Create and verify preservation artifacts
-    | --agent <name>
+    | --agent <name> [--to <successor>]               and optionally deliver exact-ID pointers
   swarm rescue --list                              List rescue manifests and verification state
                                                      (plain files under ~/.swarm/archive/rescue/;
                                                      existing rsync may copy them off-host)
@@ -526,6 +600,7 @@ function reclaimHeadlessNameOrExit(
 
 function printHookContext(): void {
   const { db, self, swarm } = requireSelf();
+  sweepRequiredResponses(db, self.swarm_id);
 
   // Re-emit the Warp OSC tab title so that agents like Claude Code,
   // which set their own title on startup/activity, can't permanently
@@ -545,14 +620,21 @@ function printHookContext(): void {
   const injected = recordHookInjections(db, self.swarm_id, self.name, inbox);
   const inboxSection = injected.length === 0
     ? ''
-    : `\nNEW MESSAGES (respond to these):\n${injected.map(entry => {
+    : `\nNEW MESSAGES (review and act as needed; do not send receipt-only acknowledgements):\n${injected.map(entry => {
       const { message: msg } = entry;
       if (entry.collapsed) {
-        return `(#${msg.id} from ${msg.from_agent}, unacked for ${entry.unackedMinutes}m — swarm inbox --recent to review, swarm ack ${msg.id} to clear)`;
+        return `(#${msg.id} from ${msg.from_agent}, unacked for ${entry.unackedMinutes}m — swarm inbox --recent to review, swarm ack ${msg.id} to clear)${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)}`;
       }
       const time = new Date(msg.created_at).toLocaleTimeString();
-      return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
+      return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)}`;
     }).join('\n')}`;
+  const requiredLines = listPendingRequiredResponsesForRecipient(db, self.swarm_id, self.name)
+    .filter(request => !injected.some(entry => entry.message.id === request.request_message_id))
+    .map(request =>
+      `REPLY REQUIRED #${request.request_message_id ?? 'deleted'} from ${request.sender_name} by ${request.required_by} — ` +
+      `swarm send ${shellToken(request.sender_name)} "<answer>" --reply-to ${request.request_message_id ?? '<message-id>'}`
+    );
+  const requiredSection = requiredLines.length === 0 ? '' : `\n${requiredLines.join('\n')}`;
   const taskLines = getActiveTaskHookLines(db, self.swarm_id, self.name);
   const handoffLines = getHandoffOfferHookLines(db, self.swarm_id, self.name);
   const taskSection = taskLines.length || handoffLines.length
@@ -566,7 +648,7 @@ function printHookContext(): void {
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | inbox [--wait N] | members | status --set "<desc>" | task start/checkpoint/close | board --tab${readCommand} | help --agent (full map)
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${updateSection}${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond only when work, a required reply, or a blocker calls for it.${taskSection}${requiredSection}${janitorSection}${updateSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
@@ -866,16 +948,38 @@ async function main() {
 
       case 'send': {
         const { db, self } = requireSelf(true);
-        const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
+        const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>] [--require-reply <ttl>|--reply-to <msg-id>]';
         // Flags may appear anywhere before/among free-text; strip them from the body.
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const kind = requireValidKind(usage);
+        const kind = requireSendKind(usage);
         const supersedes = requireSupersedes(usage);
+        const requiredBy = requireReplyDeadline(usage);
+        const replyTo = requirePositiveIdFlag('--reply-to', 'Required message ID', usage);
+        if (args.filter(token => token === '--reply-to').length > 1) {
+          console.error('--reply-to may be specified only once.');
+          console.error(usage);
+          process.exit(1);
+        }
+        if (requiredBy !== undefined && replyTo !== undefined) {
+          console.error('--require-reply and --reply-to are mutually exclusive.');
+          console.error(usage);
+          process.exit(1);
+        }
+        if (supersedes !== undefined && (requiredBy !== undefined || replyTo !== undefined)) {
+          console.error('--supersedes cannot be combined with required-reply coordination.');
+          console.error(usage);
+          process.exit(1);
+        }
         const rest = args.slice(1);
         const tokens: string[] = [];
         for (let i = 0; i < rest.length; i++) {
           if (rest[i] === '--interject' || rest[i] === '--now') continue;
-          if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          if (
+            rest[i] === '--kind' ||
+            rest[i] === '--supersedes' ||
+            rest[i] === '--require-reply' ||
+            rest[i] === '--reply-to'
+          ) { i++; continue; }
           tokens.push(rest[i]);
         }
         const targetName = tokens[0];
@@ -903,6 +1007,11 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
+        if (replyTo !== undefined && recipients.length !== 1) {
+          console.error('--reply-to requires exactly one recipient: the exact original requester.');
+          console.error(usage);
+          process.exit(1);
+        }
         // Attempt every recipient even after a failure; exit nonzero if ANY failed.
         let anyFailed = false;
         let anyQueued = false;
@@ -912,7 +1021,17 @@ async function main() {
             anyFailed = true;
             continue;
           }
-          const result = await sendMessage(db, self.swarm_id, self.name, recipient, message, { interject }, kind, supersedes);
+          const result = await sendMessage(
+            db,
+            self.swarm_id,
+            self.name,
+            recipient,
+            message,
+            { interject },
+            kind,
+            supersedes,
+            { requiredBy, replyTo }
+          );
           console.log(result.message);
           if (!result.delivered && !result.queued) anyFailed = true;
           if (result.queued) anyQueued = true;
@@ -927,8 +1046,16 @@ async function main() {
       case 'broadcast': {
         const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm broadcast <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
+        if (hasFlag('--require-reply') || hasFlag('--reply-to')) {
+          console.error(
+            'Required replies are exact-registration obligations and cannot be broadcast. ' +
+            'Use "swarm send <agent> <message> --require-reply <ttl>" or reply directly with --reply-to.'
+          );
+          console.error(usage);
+          process.exit(1);
+        }
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const kind = requireValidKind(usage);
+        const kind = requireSendKind(usage);
         const supersedes = requireSupersedes(usage);
         const rest = args.slice(1);
         const tokens: string[] = [];
@@ -1630,6 +1757,10 @@ async function main() {
           console.log(`Rescue verified: ${artifactDir} (${manifest.head_sha})`);
           break;
         }
+        if (hasFlag('--to') && !getFlag('--to')) {
+          console.error('Usage: swarm rescue --worktree <path> | --task <slug> | --agent <name> [--to <successor>]');
+          process.exit(1);
+        }
         const { db, self } = requireSelf();
         const results = rescueTargets(db, self.swarm_id, {
           worktree: getFlag('--worktree'),
@@ -1639,6 +1770,23 @@ async function main() {
         for (const result of results) {
           console.log(`Rescue verified: ${result.artifactDir}`);
           console.log(`Manifest: ${path.join(result.artifactDir, 'manifest.json')}`);
+        }
+        const recipient = getFlag('--to');
+        if (recipient) {
+          const delivered = await deliverRescueArtifacts(
+            db,
+            self.swarm_id,
+            self.name,
+            recipient,
+            results
+          );
+          console.log(
+            `Rescue pointer delivery committed for ${recipient}: ` +
+            `${delivered.pushed} pushed, ${delivered.queued} queued; ` +
+            `message${delivered.messageIds.length === 1 ? '' : 's'} ` +
+            delivered.messageIds.map(id => `#${id}`).join(', ')
+          );
+          if (delivered.queued > 0) spawnRedeliverWorker();
         }
         break;
       }
@@ -1869,6 +2017,7 @@ async function main() {
           console.error(`${usage}\n--wait cannot be combined with --recent because recent is a historical replay.`);
           process.exit(1);
         }
+        sweepRequiredResponses(db, self.swarm_id);
         if (hasFlag('--recent')) {
           const limitRaw = getFlag('--recent');
           const limit = limitRaw && /^\d+$/.test(limitRaw) ? parseInt(limitRaw, 10) : 10;
@@ -1879,7 +2028,10 @@ async function main() {
             for (const msg of recent) {
               const time = new Date(msg.created_at).toLocaleTimeString();
               const superseded = msg.superseded_by === null ? '' : ` [superseded by #${msg.superseded_by}]`;
-              console.log(`[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}${superseded}`);
+              console.log(
+                `[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}` +
+                `${superseded}${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent, true)}`
+              );
             }
             console.log(`\n${recent.length} recent message(s) (replay — cursor unchanged)`);
           }
@@ -1914,14 +2066,78 @@ async function main() {
         } else {
           for (const msg of messages) {
             const time = new Date(msg.created_at).toLocaleTimeString();
-            console.log(`[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}`);
+            console.log(
+              `[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}` +
+              requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)
+            );
           }
           const suffix = kind
             ? ` (kind filter — cursor not advanced)`
             : peek ? ' (peek mode, not marked as read)' : '';
           console.log(`\n${messages.length} message(s)${suffix}`);
         }
+        const shownIds = new Set(messages.map(message => message.id));
+        const pendingRequired = listPendingRequiredResponsesForRecipient(db, self.swarm_id, self.name)
+          .filter(request => request.request_message_id === null || !shownIds.has(request.request_message_id));
+        if (pendingRequired.length > 0) {
+          console.log('\nPending required replies (reading or acking does not resolve them):');
+          for (const request of pendingRequired) {
+            console.log(
+              `  #${request.request_message_id ?? 'deleted'} from ${request.sender_name}, due ${request.required_by} — ` +
+              `swarm send ${shellToken(request.sender_name)} "<answer>" --reply-to ${request.request_message_id ?? '<message-id>'}`
+            );
+          }
+        }
         if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
+        break;
+      }
+
+      case 'replies': {
+        const usage = 'Usage: swarm replies [--history]';
+        const unknown = args.slice(1).find(token => token !== '--history');
+        if (unknown) {
+          console.error(`Unknown replies option "${unknown}".`);
+          console.error(usage);
+          process.exit(1);
+        }
+        const { db, self } = requireSelf();
+        sweepRequiredResponses(db, self.swarm_id);
+        if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
+        const rows = listRequiredResponsesForAgent(
+          db,
+          self.swarm_id,
+          self.name,
+          hasFlag('--history')
+        );
+        if (rows.length === 0) {
+          console.log(
+            hasFlag('--history')
+              ? 'No required replies on record for this registration.'
+              : 'No pending required replies for this registration.'
+          );
+          break;
+        }
+        for (const row of rows) {
+          const id = row.request_message_id ?? 'deleted';
+          if (row.status === 'pending' && row.recipient_agent_id === self.id) {
+            console.log(
+              `#${id} pending — from ${row.sender_name}; due ${row.required_by}; ` +
+              `swarm send ${shellToken(row.sender_name)} "<answer>" --reply-to ${id}`
+            );
+          } else if (row.status === 'pending') {
+            console.log(`#${id} pending — awaiting ${row.recipient_name}; due ${row.required_by}`);
+          } else if (row.status === 'resolved') {
+            console.log(
+              `#${id} resolved — ${row.sender_name} -> ${row.recipient_name}; ` +
+              `reply #${row.reply_message_id ?? 'deleted'} at ${row.resolved_at ?? 'unknown'}`
+            );
+          } else {
+            console.log(
+              `#${id} expired — ${row.sender_name} -> ${row.recipient_name}; ` +
+              `${row.expiry_reason ?? 'unresolved'}`
+            );
+          }
+        }
         break;
       }
 
@@ -2456,6 +2672,11 @@ async function main() {
               UPDATE grants SET revoked_at = ?
               WHERE revoked_at IS NULL
             `).run(resetAt);
+            db.prepare(`
+              UPDATE required_message_responses
+              SET status = 'expired', resolved_at = ?, expiry_reason = 'swarm reset ended registration generation'
+              WHERE status = 'pending'
+            `).run(resetAt);
             db.exec('DELETE FROM swarm_authorities');
             db.exec('DELETE FROM agents');
             db.exec('DELETE FROM message_deliveries');
@@ -2470,6 +2691,11 @@ async function main() {
             db.prepare(`
               UPDATE grants SET revoked_at = ?
               WHERE swarm_id = ? AND revoked_at IS NULL
+            `).run(resetAt, swarm.id);
+            db.prepare(`
+              UPDATE required_message_responses
+              SET status = 'expired', resolved_at = ?, expiry_reason = 'swarm reset ended registration generation'
+              WHERE swarm_id = ? AND status = 'pending'
             `).run(resetAt, swarm.id);
             // Clearing the role rows is the explicit recovery ceremony: the
             // next token-bound local join can bootstrap a fresh Owner/Lead ID,

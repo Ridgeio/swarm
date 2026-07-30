@@ -5,6 +5,7 @@ import os from 'os';
 import path from 'path';
 import { REPO_DIR } from './version.js';
 import { sweepHandoffOffers } from './tasks.js';
+import { sweepRequiredResponses } from './mailbox.js';
 
 const MODULE_ROOT = REPO_DIR;
 const DEFAULT_CONTROLS_PATH = path.join(MODULE_ROOT, 'docs', 'controls.md');
@@ -816,6 +817,7 @@ export function runJanitorTick(
       .all() as Array<{ id: string }>;
     for (const swarm of swarms) {
       sweepHandoffOffers(db, swarm.id, tickNow);
+      sweepRequiredResponses(db, swarm.id, tickNow);
     }
 
     scanWorkerEpochs(db, findings, kvUpdates);

@@ -543,6 +543,36 @@ describe('cli supersession and pull/ack delivery', () => {
     }
   });
 
+  test('conversational --kind ack is refused without writing a message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-no-ack-noise-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      const before = openDb(home);
+      const countBefore = (before.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      before.close();
+
+      for (const args of [
+        ['send', 'Bob', 'received', '--kind', 'ack'],
+        ['broadcast', 'acknowledged', '--kind', 'ack'],
+      ]) {
+        const refused = runCli(home, args, { SWARM_AGENT_NAME: 'Alice' });
+        assert.notStrictEqual(refused.status, 0);
+        assert.match(
+          refused.stderr,
+          /Refused conversational acknowledgement: delivery acknowledgement is transport metadata.*send only a result or a true blocker/s
+        );
+      }
+
+      const after = openDb(home);
+      const countAfter = (after.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      after.close();
+      assert.strictEqual(countAfter, countBefore);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('hook turn loss keeps a message pending, third injection collapses, and ack clears it', () => {
     const home = mkdtempSync(join(tmpdir(), 'swarm-cli-hook-'));
     try {

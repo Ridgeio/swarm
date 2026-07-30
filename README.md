@@ -104,7 +104,7 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 ## Task-based operation
 
-Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff offer` creates a digest-bound transfer that moves the lease only after the named recipient runs `handoff accept`; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, handoff offers, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`. Reset explicitly ends the old registration generation: it revokes live grants and clears Owner/Lead bindings, so the first subsequent token-bound local join bootstraps fresh roles while every surviving task remains fenced pending authorized takeover or legacy rebind.
+Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff offer` creates a digest-bound transfer that moves the lease only after the named recipient runs `handoff accept`; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, handoff offers, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`. Reset explicitly ends the old registration generation: it revokes live grants, terminally expires pending required replies, and clears Owner/Lead bindings, so the first subsequent token-bound local join bootstraps fresh roles while every surviving task remains fenced pending authorized takeover or legacy rebind.
 
 For asynchronous work, use the two-phase path:
 
@@ -116,6 +116,30 @@ swarm handoff accept auth-refresh --offer 7
 ```
 
 The source owner retains the current lease and epoch until acceptance. The offer stores both parties' immutable registration IDs, the source epoch, charter SHA-256, pickup deadline, pointer message ID, and delivery/ack state. Offer creation, acceptance, and their notification rows commit atomically before any terminal push. An expired offer becomes a durable dead letter, notifies the sender and active Owner/Lead registrations exactly once, and never transfers authority. Immediate handoff has been removed; `offer` → named-recipient `accept` is the only ownership-transfer path.
+
+The quiet asynchronous contract is: one goal emits one final evidence packet
+or one true blocker. Progress belongs in status, checkpoints, run logs, and
+files—not receipt, start, waiting, or per-test messages. A push is only a
+nudge; exact handoff acceptance proves ownership pickup. For an ordinary
+question whose answer is required, create a durable deadline and resolve it
+with an explicit directed reply:
+
+```bash
+swarm send Bob "Which schema should we ship?" --require-reply 15m
+# Bob uses the request ID printed in his inbox:
+swarm send Alice "Use schema B; it preserves rollback." --reply-to 42
+```
+
+Reading or acknowledging request `#42` does not resolve it. The exact recipient
+registration must send the directed reply before the deadline; the janitor
+dead-letters an overdue or inactive-party request and notifies its active
+requester plus active Owner/Lead registrations exactly once. If a recipient
+stays quiet, wait on the inbox, inspect required-reply or handoff state, and
+read its local surface once; do not duplicate the order. If the exact
+registration is inactive or a handoff offer expires, verify a rescue artifact
+before an authorized reap/takeover/rebind, then deliver its digest-bound
+pointer and a fresh charter to the exact successor. Same-name replacements
+inherit nothing.
 
 Every task lease is bound to both an immutable agent-registration ID and an epoch. Rejoining with the same display name does not inherit a lease, role, grant, message, or decision-author identity. Legacy name-only task rows deliberately fail privileged mutation until an Owner/Lead performs an explicit audited upgrade:
 
@@ -183,6 +207,7 @@ Swarm management:
 Messaging:
   swarm send <agent>[,<agent>...] <message>   Send to one or more agents
         [--kind <kind>] [--supersedes <id>]
+        [--require-reply <ttl> | --reply-to <id>]
         [--interject|--now]
   swarm broadcast <message>                   Send to every agent in this swarm
         [--kind <kind>] [--supersedes <id>]
@@ -191,6 +216,7 @@ Messaging:
         [--wait <seconds>]
         [--kind <kind>]
   swarm ack <msg-id...>                       Acknowledge exact pending deliveries
+  swarm replies [--history]                   Inspect required-answer state for this exact ID
   swarm redeliver [--dry-run]                 Retry eligible push notifications
 
 Task ledger:
@@ -231,7 +257,7 @@ Task ledger:
 
 Recovery and hygiene:
   swarm rescue --worktree <path>               Create and verify a rescue artifact
-        | --task <slug> | --agent <name>
+        | --task <slug> | --agent <name> [--to <successor>]
   swarm rescue --list                          List rescue manifests and verification state
   swarm rescue --verify <artifact-dir>         Re-verify an existing rescue artifact
   swarm janitor tick --observe                 Census debris and enforce handoff deadlines
@@ -292,6 +318,9 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Command | One-line example |
 |---|---|
 | Acknowledge delivery | `swarm ack 41 42` after handling those exact messages |
+| Require an ordinary answer | `swarm send Bob "Which schema?" --require-reply 15m` |
+| Resolve a required answer | `swarm send Alice "Schema B, because rollback" --reply-to 42` |
+| Inspect required answers | `swarm replies` (pending) or `swarm replies --history` |
 | Supersede an instruction | `swarm send Bob "use the revised migration plan" --kind gate --supersedes 41` |
 | Start or take over a task | `swarm task start auth-refresh --title "Refresh auth" --repo . --claim code-merged --takeover` |
 | Checkpoint a task | `swarm task checkpoint auth-refresh --notes "Token rotation works; next run integration tests"` |
@@ -304,7 +333,7 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Offer a safe handoff | `swarm handoff offer auth-refresh --to Bob --ttl 15m` |
 | Accept a handoff | `swarm handoff accept auth-refresh --offer 7` |
 | Record a decision | `swarm decision "DECISION: keep JWT BECAUSE clients depend on it" --task auth-refresh` |
-| Create a rescue | `swarm rescue --task auth-refresh` |
+| Create and deliver a rescue | `swarm rescue --task auth-refresh --to Bob` |
 | List rescues | `swarm rescue --list` |
 | Verify a rescue | `swarm rescue --verify ~/.swarm/archive/rescue/20260718-auth-refresh` |
 | Run the janitor | `swarm janitor tick --observe` |
@@ -365,11 +394,11 @@ Two agents working on separate features that share a dependency:
 # Agent A notices a shared concern
 swarm send AgentB "heads up, I'm refactoring the database client in src/db.ts. Don't touch that file for the next few minutes."
 
-# Agent B acknowledges
-swarm send AgentA "got it, I'll work on the API routes instead"
+# Agent B changes course without a receipt message
+swarm status --set "API routes; avoiding src/db.ts until AgentA's final packet"
 
-# Agent A finishes
-swarm send AgentB "db refactor done and pushed. You can use the new query() method now."
+# Agent A emits the one condition-complete packet
+swarm send AgentB "db refactor complete: feat/db @ <sha>; build/tests green; query() contract in src/db.ts"
 ```
 
 ### Monitoring a team
@@ -377,9 +406,9 @@ swarm send AgentB "db refactor done and pushed. You can use the new query() meth
 A lead agent checks on everyone:
 ```bash
 swarm members                    # who's active?
+swarm board                      # task/progress/dead-letter state
 swarm read Alice --lines 20      # what's Alice doing?
 swarm read Bob --lines 20        # what's Bob doing?
-swarm broadcast "status check — what's everyone working on?"
 ```
 
 ### Spawning new agents
@@ -421,9 +450,9 @@ swarm discover http://localhost:3100/.well-known/agent.json
 
 Once registered, A2A agents participate in the swarm just like Cmux agents:
 ```bash
-swarm send Cooper "review the auth PR on branch feat/auth"
-swarm broadcast "status check — what's everyone working on?"
+swarm send Cooper "review the auth PR on branch feat/auth" --require-reply 30m
 swarm members   # shows both [cmux] and [a2a] agents
+swarm board     # inspect progress without a status-request fan-out
 ```
 
 Messages to A2A agents are delivered via HTTP POST. Messages to Cmux agents are pushed into their terminal. The routing is transparent — `swarm send` figures out the right transport.
@@ -449,15 +478,14 @@ swarm send Hermes "draft the user-facing docs for the new auth flow"
 
 ### End of session
 
-```bash
-swarm broadcast "wrapping up for now, great work team"
-```
-
-Then either each agent runs `/leave-swarm`, or you run `/reset-swarm` to clear the current swarm. Use `swarm reset --all` only to clear every swarm.
+Checkpoint owned work and emit its one final packet or blocker, then each agent
+runs `/leave-swarm`, or the operator runs `/reset-swarm` to clear the current
+swarm. Do not send a ceremonial wrap-up/receipt broadcast. Use
+`swarm reset --all` only to clear every swarm.
 
 ## How agents coordinate
 
-**Cmux/headless agents**: SQLite is the source of truth. The awareness hook peeks without consuming, records injection attempts, and keeps a delivery pending until `swarm ack <id>` (or a plain `swarm inbox` read) acknowledges it. Cmux/AppleScript push remains a best-effort nudge, not proof that work was seen or completed.
+**Cmux/headless agents**: SQLite is the source of truth. The awareness hook peeks without consuming, records injection attempts, and keeps a delivery pending until `swarm ack <id>` (or a plain `swarm inbox` read) acknowledges it. Acknowledgement also cancels any queued push for that exact delivery, but it does not resolve a required reply. Cmux/AppleScript push remains a best-effort nudge, not proof that work was seen or completed.
 
 **A2A agents**: Messages are delivered via HTTP POST to the agent's registered endpoint using the [A2A protocol](https://google.github.io/A2A/). The agent processes the message and can respond through the same channel.
 
@@ -472,16 +500,16 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`src/transport.ts`** — Low-level Cmux utilities (`send`, `read-screen`, `spawn`, tab/workspace management, `\n` sanitization, message chunking)
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
 - **`src/registry.ts`** — Swarm + agent CRUD, A2A registration, async stale cleanup
-- **`src/mailbox.ts`** — Swarm-scoped message send/broadcast/inbox with cursor tracking
+- **`src/mailbox.ts`** — Exact-recipient delivery/outbox, required-reply deadlines, inbox, and cursor tracking
 - **`src/tasks.ts`** — Fenced task leases, checkpoints, evidence-gated close, handoff, and decisions
-- **`src/rescue.ts`** — Verified preservation artifacts and manifest verification
-- **`src/janitor.ts`** — Observe-only debris census, heartbeat, hook trigger, and launchd schedule
+- **`src/rescue.ts`** — Verified preservation artifacts plus digest-bound exact-successor delivery
+- **`src/janitor.ts`** — Observe-only debris census, coordination-deadline sweeps, heartbeat, hook trigger, and launchd schedule
 - **`src/board.ts`** — Read-only fleet/task/debris/quota rendering, watch loops, and Mermaid graph/HTML output
 - **`src/index.ts`** — CLI entry point
 - **`hooks/swarm-awareness.sh`** — Claude Code UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 - **`hooks/swarm-awareness-headless.sh`** — Headless awareness hook used where a host can poll inbox messages
 
-State is stored in `~/.swarm/swarm.db`. Swarm-scoped tables include agents, messages, per-recipient deliveries, inbox cursors, tasks, task events, and decisions; janitor status, findings, and snapshots provide machine-level debris history. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
+State is stored in `~/.swarm/swarm.db`. Swarm-scoped tables include agents, messages, per-recipient deliveries/outbox, required-response/audience rows, inbox cursors, tasks, task events, and decisions; janitor status, findings, and snapshots provide machine-level debris history. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 

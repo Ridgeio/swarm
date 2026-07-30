@@ -2,6 +2,8 @@ import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { deliverToAgent } from './transport-router.js';
 import { getAgent, listAgents } from './registry.js';
 import type { DeliveryOptions } from './transport-interface.js';
+import { listSwarmAuthorities } from './authority.js';
+import { observeMonotonicClock } from './clock.js';
 
 export interface Message {
   id: number;
@@ -49,6 +51,26 @@ export interface InboxWaitResult {
   timedOut: boolean;
 }
 
+export interface RequiredMessageResponse {
+  id: number;
+  swarm_id: string;
+  request_message_id: number | null;
+  sender_agent_id: string;
+  sender_name: string;
+  recipient_agent_id: string;
+  recipient_name: string;
+  required_by: string;
+  status: 'pending' | 'resolved' | 'expired';
+  created_at: string;
+  resolved_at: string | null;
+  reply_message_id: number | null;
+  expiry_reason: string | null;
+}
+
+export interface RequiredResponseSweepResult {
+  expired: RequiredMessageResponse[];
+}
+
 // Allowed values for the optional message classification tag. Validated at the CLI
 // boundary (a typo'd kind would otherwise store an unfilterable message); storage
 // itself is a plain nullable TEXT column so builds with a different set stay readable.
@@ -63,6 +85,8 @@ export interface EnqueueDirectMessageOptions {
   supersedes?: number;
   fromAgentId?: string | null;
   recipientAgentId?: string;
+  requiredBy?: string;
+  replyTo?: number;
 }
 
 export interface FlushOutboxResult {
@@ -98,6 +122,51 @@ export function enqueueDirectMessage(
     );
   }
   const createdAt = options.createdAt ?? new Date().toISOString();
+  if (options.requiredBy !== undefined && options.replyTo !== undefined) {
+    throw new Error('A message cannot both require a reply and resolve another required reply.');
+  }
+  if (
+    options.supersedes !== undefined &&
+    (options.requiredBy !== undefined || options.replyTo !== undefined)
+  ) {
+    throw new Error('Required-reply messages cannot also supersede another message.');
+  }
+  if ((options.requiredBy !== undefined || options.replyTo !== undefined) && fromAgentId === null) {
+    throw new Error('Required replies need an immutable sender registration ID.');
+  }
+  if (options.requiredBy !== undefined) {
+    const requiredByMs = new Date(options.requiredBy).getTime();
+    const createdAtMs = new Date(createdAt).getTime();
+    if (!Number.isFinite(requiredByMs) || !Number.isFinite(createdAtMs) || requiredByMs <= createdAtMs) {
+      throw new Error('Required-reply deadline must be a valid time after message creation.');
+    }
+    observeMonotonicClock(db, swarmId, 'required-response', createdAtMs);
+  }
+  const replyRequest = options.replyTo === undefined
+    ? undefined
+    : db.prepare(`
+        SELECT * FROM required_message_responses
+        WHERE swarm_id = ? AND request_message_id = ? AND status = 'pending'
+      `).get(swarmId, options.replyTo) as RequiredMessageResponse | undefined;
+  if (options.replyTo !== undefined) {
+    if (
+      !replyRequest ||
+      replyRequest.recipient_agent_id !== fromAgentId ||
+      replyRequest.sender_agent_id !== recipientAgentId
+    ) {
+      throw new Error(
+        `Cannot resolve required reply #${options.replyTo}: it is not pending from this exact sender registration ` +
+        'to the exact original requester.'
+      );
+    }
+    const replyAtMs = new Date(createdAt).getTime();
+    observeMonotonicClock(db, swarmId, 'required-response', replyAtMs);
+    if (replyRequest.required_by <= createdAt) {
+      throw new Error(
+        `Cannot resolve required reply #${options.replyTo}: its deadline ${replyRequest.required_by} has passed.`
+      );
+    }
+  }
 
   if (options.supersedes !== undefined) {
     const previous = db.prepare(`
@@ -142,6 +211,45 @@ export function enqueueDirectMessage(
     ) VALUES (?, ?, ?, 'pending', 0, NULL, ?, NULL)
   `).run(messageId, swarmId, recipientAgentId, createdAt);
 
+  if (options.requiredBy !== undefined) {
+    db.prepare(`
+      INSERT INTO required_message_responses (
+        swarm_id, request_message_id, sender_agent_id, sender_name,
+        recipient_agent_id, recipient_name, required_by, status, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+    `).run(
+      swarmId,
+      messageId,
+      fromAgentId,
+      fromName,
+      recipientAgentId,
+      canonicalRecipient,
+      options.requiredBy,
+      createdAt
+    );
+  }
+  if (replyRequest) {
+    const changed = db.prepare(`
+      UPDATE required_message_responses
+      SET status = 'resolved', resolved_at = ?, reply_message_id = ?, expiry_reason = NULL
+      WHERE id = ? AND status = 'pending'
+    `).run(createdAt, messageId, replyRequest.id);
+    if (Number(changed.changes) !== 1) {
+      throw new Error(`Required reply #${options.replyTo} changed before the response committed.`);
+    }
+    if (replyRequest.request_message_id !== null) {
+      db.prepare(`
+        UPDATE message_deliveries
+        SET status = 'acked', acked_at = COALESCE(acked_at, ?)
+        WHERE message_id = ? AND swarm_id = ? AND recipient_agent_id = ?
+      `).run(createdAt, replyRequest.request_message_id, swarmId, fromAgentId);
+      db.prepare(`
+        DELETE FROM message_outbox
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run(replyRequest.request_message_id, fromAgentId);
+    }
+  }
+
   if (options.supersedes !== undefined) {
     db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ? AND swarm_id = ?')
       .run(messageId, options.supersedes, swarmId);
@@ -169,9 +277,14 @@ export async function flushMessageOutbox(
       m.swarm_id,
       m.from_agent,
       m.body,
+      required.required_by,
       a.id AS active_agent_id
     FROM message_outbox o
     JOIN messages m ON m.id = o.message_id AND m.swarm_id = o.swarm_id
+    LEFT JOIN required_message_responses required
+      ON required.swarm_id = m.swarm_id
+      AND required.request_message_id = m.id
+      AND required.status = 'pending'
     LEFT JOIN agents a
       ON a.id = o.recipient_agent_id AND a.swarm_id = o.swarm_id
     WHERE o.state = 'pending'
@@ -183,6 +296,7 @@ export async function flushMessageOutbox(
     swarm_id: string;
     from_agent: string;
     body: string;
+    required_by: string | null;
     active_agent_id: string | null;
   }>;
 
@@ -203,7 +317,14 @@ export async function flushMessageOutbox(
       continue;
     }
     try {
-      const result = await deliver(target, `[SWARM from ${row.from_agent}]: ${row.body}`);
+      const requiredReply = row.required_by === null
+        ? ''
+        : `\n[REPLY REQUIRED: request #${row.message_id}; due ${row.required_by}; ` +
+          `resolve with: swarm send ${row.from_agent} "<answer>" --reply-to ${row.message_id}]`;
+      const result = await deliver(
+        target,
+        `[SWARM from ${row.from_agent}]: ${row.body}${requiredReply}`
+      );
       if (!result.delivered) {
         db.prepare(`
           UPDATE message_outbox
@@ -247,7 +368,8 @@ export async function sendMessage(
   body: string,
   options?: DeliveryOptions,
   kind?: string | null,
-  supersedes?: number
+  supersedes?: number,
+  coordination?: { requiredBy?: string; replyTo?: number }
 ): Promise<{ delivered: boolean; queued: boolean; message: string; messageId?: number }> {
   const target = getAgent(db, swarmId, toName);
   if (!target) {
@@ -264,6 +386,8 @@ export async function sendMessage(
       kind: kind ?? null,
       supersedes,
       recipientAgentId: target.id,
+      requiredBy: coordination?.requiredBy,
+      replyTo: coordination?.replyTo,
     }
   ));
   const deliveryResult = await flushMessageOutbox(
@@ -272,7 +396,11 @@ export async function sendMessage(
     (agent, formatted) => deliverToAgent(agent, formatted, options)
   );
   if (deliveryResult.pushed > 0) {
-    return { delivered: true, queued: false, message: `Message sent to ${toName}`, messageId: msgId };
+    const required = coordination?.requiredBy
+      ? `; reply required by ${coordination.requiredBy} (request #${msgId})`
+      : '';
+    const reply = coordination?.replyTo ? `; resolves required message #${coordination.replyTo}` : '';
+    return { delivered: true, queued: false, message: `Message sent to ${toName}${required}${reply}`, messageId: msgId };
   } else {
     // Push failed but the message is in the DB. Cmux/headless recipients pick it
     // up via `swarm inbox`; a2a recipients get retried by the redeliver worker
@@ -280,8 +408,184 @@ export async function sendMessage(
     // read their inbox remotely (getSelf resolves SWARM_AGENT_NAME for a2a).
     // The caller should spawn a redeliver worker so an idle recipient isn't
     // stuck waiting for a turn that never comes (see redeliver.ts).
-    return { delivered: true, queued: true, message: `Message sent to ${toName} (queued for retry/inbox)`, messageId: msgId };
+    const required = coordination?.requiredBy
+      ? `; reply required by ${coordination.requiredBy} (request #${msgId})`
+      : '';
+    const reply = coordination?.replyTo ? `; resolves required message #${coordination.replyTo}` : '';
+    return {
+      delivered: true,
+      queued: true,
+      message: `Message sent to ${toName} (queued for retry/inbox)${required}${reply}`,
+      messageId: msgId,
+    };
   }
+}
+
+export function getRequiredResponse(
+  db: SwarmDb,
+  swarmId: string,
+  messageId: number
+): RequiredMessageResponse | null {
+  const row = db.prepare(`
+    SELECT * FROM required_message_responses
+    WHERE swarm_id = ? AND request_message_id = ?
+  `).get(swarmId, messageId) as RequiredMessageResponse | undefined;
+  return row ?? null;
+}
+
+export function listPendingRequiredResponsesForRecipient(
+  db: SwarmDb,
+  swarmId: string,
+  recipientName: string
+): RequiredMessageResponse[] {
+  const recipient = getAgent(db, swarmId, recipientName);
+  if (!recipient) return [];
+  return db.prepare(`
+    SELECT * FROM required_message_responses
+    WHERE swarm_id = ?
+      AND recipient_agent_id = ?
+      AND status = 'pending'
+    ORDER BY required_by ASC, id ASC
+  `).all(swarmId, recipient.id) as unknown as RequiredMessageResponse[];
+}
+
+export function listRequiredResponsesForAgent(
+  db: SwarmDb,
+  swarmId: string,
+  agentName: string,
+  includeTerminal: boolean = false
+): RequiredMessageResponse[] {
+  const agent = getAgent(db, swarmId, agentName);
+  if (!agent) return [];
+  return db.prepare(`
+    SELECT * FROM required_message_responses
+    WHERE swarm_id = ?
+      AND (sender_agent_id = ? OR recipient_agent_id = ?)
+      ${includeTerminal ? '' : "AND status = 'pending'"}
+    ORDER BY
+      CASE status WHEN 'pending' THEN 0 WHEN 'expired' THEN 1 ELSE 2 END,
+      required_by ASC,
+      id ASC
+  `).all(swarmId, agent.id, agent.id) as unknown as RequiredMessageResponse[];
+}
+
+function enqueueRequiredResponseExpiryNotifications(
+  db: SwarmDb,
+  request: RequiredMessageResponse,
+  createdAt: string
+): void {
+  const recipients: Array<{
+    id: string;
+    name: string;
+    audience: 'sender' | 'authority';
+  }> = [];
+  const sender = db.prepare(
+    'SELECT id, name FROM agents WHERE swarm_id = ? AND id = ?'
+  ).get(request.swarm_id, request.sender_agent_id) as { id: string; name: string } | undefined;
+  if (sender) recipients.push({ ...sender, audience: 'sender' });
+  for (const authority of listSwarmAuthorities(db, request.swarm_id)) {
+    const active = db.prepare(
+      'SELECT id, name FROM agents WHERE swarm_id = ? AND id = ?'
+    ).get(request.swarm_id, authority.agent_id) as { id: string; name: string } | undefined;
+    if (!active) continue;
+    if (recipients.some(row => row.id === active.id && row.audience === 'authority')) continue;
+    recipients.push({ ...active, audience: 'authority' });
+  }
+
+  for (const recipient of recipients) {
+    const prior = db.prepare(`
+      SELECT message_id FROM required_response_expiry_notifications
+      WHERE request_id = ? AND recipient_agent_id = ? AND audience = ?
+    `).get(request.id, recipient.id, recipient.audience);
+    if (prior) continue;
+    const body = recipient.audience === 'sender'
+      ? `Required reply to message #${request.request_message_id ?? 'deleted'} from ${request.recipient_name} ` +
+        `expired unresolved (${request.expiry_reason}). Delivery acknowledgement did not count as a reply.`
+      : `ESCALATION: required reply #${request.request_message_id ?? 'deleted'} from ${request.recipient_name} ` +
+        `to ${request.sender_name} expired unresolved (${request.expiry_reason}). Inspect the exact registration; ` +
+        'use rescue plus authorized reassignment for owned work.';
+    const messageId = enqueueDirectMessage(
+      db,
+      request.swarm_id,
+      'swarm-janitor',
+      recipient.name,
+      body,
+      {
+        createdAt,
+        kind: 'escalation',
+        fromAgentId: null,
+        recipientAgentId: recipient.id,
+      }
+    );
+    db.prepare(`
+      INSERT INTO required_response_expiry_notifications (
+        request_id, recipient_agent_id, audience, message_id, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(request.id, recipient.id, recipient.audience, messageId, createdAt);
+  }
+}
+
+export function sweepRequiredResponses(
+  db: SwarmDb,
+  swarmId: string,
+  now: number = Date.now()
+): RequiredResponseSweepResult {
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Required-response sweep time must be a finite integer millisecond timestamp.');
+  }
+  const pending = db.prepare(`
+    SELECT * FROM required_message_responses
+    WHERE swarm_id = ? AND status = 'pending'
+    ORDER BY id ASC
+  `).all(swarmId) as unknown as RequiredMessageResponse[];
+  if (pending.length === 0) return { expired: [] };
+  withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'required-response', now);
+  });
+
+  const at = new Date(now).toISOString();
+  const expired: RequiredMessageResponse[] = [];
+  for (const row of pending) {
+    const transitioned = withImmediateTransaction(db, () => {
+      const current = db.prepare(`
+        SELECT * FROM required_message_responses
+        WHERE swarm_id = ? AND id = ? AND status = 'pending'
+      `).get(swarmId, row.id) as RequiredMessageResponse | undefined;
+      if (!current) return null;
+      const activeRecipient = db.prepare(
+        'SELECT id FROM agents WHERE swarm_id = ? AND id = ?'
+      ).get(swarmId, current.recipient_agent_id);
+      const activeSender = db.prepare(
+        'SELECT id FROM agents WHERE swarm_id = ? AND id = ?'
+      ).get(swarmId, current.sender_agent_id);
+      const reason = !activeSender
+        ? 'exact requester registration is inactive'
+        : !activeRecipient
+          ? 'exact recipient registration is inactive'
+          : current.required_by <= at
+            ? `reply deadline ${current.required_by} passed`
+            : null;
+      if (!reason) return null;
+      const changed = db.prepare(`
+        UPDATE required_message_responses
+        SET status = 'expired', resolved_at = ?, expiry_reason = ?
+        WHERE id = ? AND status = 'pending'
+      `).run(at, reason, current.id);
+      if (Number(changed.changes) !== 1) return null;
+      if (current.request_message_id !== null) {
+        db.prepare(`
+          DELETE FROM message_outbox
+          WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+        `).run(current.request_message_id, current.recipient_agent_id);
+      }
+      const next = db.prepare('SELECT * FROM required_message_responses WHERE id = ?')
+        .get(current.id) as unknown as RequiredMessageResponse;
+      enqueueRequiredResponseExpiryNotifications(db, next, at);
+      return next;
+    }) as RequiredMessageResponse | null;
+    if (transitioned) expired.push(transitioned);
+  }
+  return { expired };
 }
 
 export async function broadcastMessage(
@@ -476,7 +780,15 @@ export function acknowledgeMessages(
         throw new Error(`Message #${id} was not found in this swarm or is not addressed to you.`);
       }
     }
-    for (const id of ids) upsert.run(id, swarmId, agentName, agentId, ackedAt);
+    for (const id of ids) {
+      upsert.run(id, swarmId, agentName, agentId, ackedAt);
+      if (agentId) {
+        db.prepare(`
+          DELETE FROM message_outbox
+          WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+        `).run(id, agentId);
+      }
+    }
     advanceCursor(db, swarmId, agentName, ids);
   });
   return ids;
@@ -512,11 +824,15 @@ export function getInbox(
       AND d.swarm_id = m.swarm_id
       AND d.recipient = ? COLLATE NOCASE
       AND (d.recipient_agent_id IS NULL OR d.recipient_agent_id = ?)
+    LEFT JOIN required_message_responses required
+      ON required.request_message_id = m.id
+      AND required.swarm_id = m.swarm_id
     WHERE m.swarm_id = ?
       AND (m.to_agent = ? COLLATE NOCASE OR m.to_agent IS NULL)
       AND (m.to_agent_id IS NULL OR m.to_agent_id = ?)
       AND m.from_agent != ? COLLATE NOCASE
       AND m.superseded_by IS NULL
+      AND (required.id IS NULL OR required.status != 'expired')
       AND (
         (
           d.message_id IS NULL

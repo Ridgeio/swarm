@@ -51,9 +51,10 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'hook-context', group: 'identity', line: 'hook-context — emit prompt-time context' },
   { command: 'help', group: 'identity', line: 'help — show command help' },
 
-  { command: 'send', group: 'messaging', line: 'send — message named agents' },
+  { command: 'send', group: 'messaging', line: 'send — message agents; bind answers with reply flags' },
   { command: 'broadcast', group: 'messaging', line: 'broadcast — message the swarm' },
   { command: 'ack', group: 'messaging', line: 'ack — acknowledge exact delivery IDs (no --all)' },
+  { command: 'replies', group: 'messaging', line: 'replies [--history] — inspect required-answer state' },
   { command: 'inbox', group: 'messaging', line: 'inbox — read queued messages' },
   { command: 'redeliver', group: 'messaging', line: 'redeliver — retry pending pushes' },
 
@@ -71,9 +72,9 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'board', group: 'board', line: 'board — render fleet state or graph (splits beside you; --own-workspace for program setup)' },
   { command: 'stats', group: 'board', line: 'stats — show fleet metrics' },
 
-  { command: 'janitor', group: 'janitor', line: 'janitor — census debris and enforce handoff deadlines' },
+  { command: 'janitor', group: 'janitor', line: 'janitor — census debris and enforce coordination deadlines' },
 
-  { command: 'rescue', group: 'rescue', line: 'rescue — preserve stranded work' },
+  { command: 'rescue', group: 'rescue', line: 'rescue — preserve work; --to sends exact-ID pointer' },
   { command: 'reap', group: 'rescue', line: 'reap — prune dead agents' },
   { command: 'reset', group: 'rescue', line: 'reset — clear ephemeral swarm state' },
 ] as const;

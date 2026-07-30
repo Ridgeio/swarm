@@ -26,4 +26,4 @@ swarm inbox
 swarm members
 ```
 
-After joining, use `swarm send`, `swarm broadcast`, `swarm read`, and `swarm status --set` for coordination.
+After joining, use `swarm send`, `swarm broadcast`, `swarm read`, and `swarm status --set` for coordination. Do not send receipt-only acknowledgements: one goal should produce one condition-complete final evidence packet or one true blocker, with progress kept in status/checkpoints.

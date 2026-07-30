@@ -1,10 +1,12 @@
-import type { SwarmDb } from './db.js';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { getTask, type Task } from './tasks.js';
+import { enqueueDirectMessage, flushMessageOutbox } from './mailbox.js';
+import { getAgent } from './registry.js';
 
 export interface RescueAttribution {
   swarm_id: string | null;
@@ -57,6 +59,12 @@ export interface RescueTargetOptions {
 export interface RescueResult {
   artifactDir: string;
   manifest: RescueManifest;
+}
+
+export interface RescueDeliveryResult {
+  messageIds: number[];
+  pushed: number;
+  queued: number;
 }
 
 interface RescueTarget {
@@ -314,7 +322,10 @@ export function verifyRescueArtifact(artifactDir: string): RescueManifest {
     }
 
     manifest.verified = true;
-    manifest.verified_at = new Date().toISOString();
+    // Verification is an idempotent attestation. Preserve the first successful
+    // timestamp so re-running `rescue --verify` cannot invalidate a manifest
+    // digest already recorded in a task event or successor pointer.
+    manifest.verified_at = manifest.verified_at ?? new Date().toISOString();
     manifest.verification_error = null;
     writeManifest(artifactDir, manifest);
     return manifest;
@@ -424,6 +435,111 @@ export function rescueTargets(
   options: RescueTargetOptions
 ): RescueResult[] {
   return resolveTargets(db, swarmId, options).map(rescueOne);
+}
+
+/**
+ * After filesystem verification, atomically journal task-attributed rescues and
+ * enqueue exact-registration manifest pointers for a named successor. Push is
+ * intentionally after commit; the durable delivery/outbox remains canonical.
+ */
+export async function deliverRescueArtifacts(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  recipientName: string,
+  results: readonly RescueResult[]
+): Promise<RescueDeliveryResult> {
+  if (results.length === 0) throw new Error('No verified rescue artifacts were produced.');
+  const source = getAgent(db, swarmId, actor);
+  const recipient = getAgent(db, swarmId, recipientName);
+  if (!source) throw new Error(`Agent "${actor}" is not active in this swarm.`);
+  if (!recipient) {
+    throw new Error(`Rescue recipient "${recipientName}" is not active. Run "swarm members" and choose the exact successor registration.`);
+  }
+  if (source.id === recipient.id) throw new Error('Rescue delivery recipient must be a different active registration.');
+  const verifiedResults = results.map(result => {
+    const manifest = verifyRescueArtifact(result.artifactDir);
+    if (!manifest.verified) {
+      throw new Error(`Refused to deliver unverified rescue manifest: ${path.join(result.artifactDir, 'manifest.json')}`);
+    }
+    if (
+      manifest.attribution.swarm_id !== null &&
+      manifest.attribution.swarm_id !== swarmId
+    ) {
+      throw new Error(`Rescue manifest belongs to a different swarm: ${result.artifactDir}`);
+    }
+    const manifestFile = path.join(result.artifactDir, 'manifest.json');
+    return {
+      artifactDir: result.artifactDir,
+      manifest,
+      manifestFile,
+      manifestSha256: sha256Buffer(fs.readFileSync(manifestFile)),
+    };
+  });
+
+  const createdAt = new Date().toISOString();
+  const messageIds = withImmediateTransaction(db, () => {
+    const currentSource = getAgent(db, swarmId, actor);
+    const currentRecipient = getAgent(db, swarmId, recipientName);
+    if (!currentSource || currentSource.id !== source.id) {
+      throw new Error(`Sender registration changed for "${actor}" before rescue delivery committed.`);
+    }
+    if (!currentRecipient || currentRecipient.id !== recipient.id) {
+      throw new Error(`Rescue recipient registration changed before delivery committed. Re-run "swarm rescue" for the intended successor.`);
+    }
+
+    const ids: number[] = [];
+    for (const result of verifiedResults) {
+      const { manifestFile, manifestSha256 } = result;
+      const taskId = result.manifest.attribution.task_id;
+      const task = taskId ? getTask(db, swarmId, taskId) : null;
+      if (taskId && !task) {
+        throw new Error(`Rescue-attributed task "${taskId}" no longer exists in this swarm.`);
+      }
+      if (task) {
+        db.prepare(`
+          INSERT INTO task_events (
+            swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+          ) VALUES (?, ?, ?, 'rescue_created', ?, ?, ?, ?)
+        `).run(
+          swarmId,
+          task.id,
+          task.lease_epoch,
+          currentSource.name,
+          currentSource.id,
+          JSON.stringify({
+            artifact_dir: result.artifactDir,
+            manifest_path: manifestFile,
+            head_sha: result.manifest.head_sha,
+            manifest_sha256: manifestSha256,
+            verified_at: result.manifest.verified_at,
+            delivered_to: currentRecipient.name,
+            delivered_to_agent_id: currentRecipient.id,
+          }),
+          createdAt
+        );
+      }
+      ids.push(enqueueDirectMessage(
+        db,
+        swarmId,
+        currentSource.name,
+        currentRecipient.name,
+        `VERIFIED RESCUE${taskId ? ` for task ${taskId}` : ''}: ${manifestFile}; ` +
+          `manifest sha256=${manifestSha256}; head ${result.manifest.head_sha}. ` +
+          `Verify the manifest digest and artifact before any takeover or rebind.`,
+        {
+          createdAt,
+          kind: 'handoff',
+          fromAgentId: currentSource.id,
+          recipientAgentId: currentRecipient.id,
+        }
+      ));
+    }
+    return ids;
+  });
+
+  const delivery = await flushMessageOutbox(db, messageIds);
+  return { messageIds, pushed: delivery.pushed, queued: delivery.queued };
 }
 
 export function listRescueArtifacts(): Array<{ artifactDir: string; manifest: RescueManifest | null; error?: string }> {

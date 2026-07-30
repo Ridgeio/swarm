@@ -65,11 +65,15 @@ export async function redeliverPending(
       AND (m.to_agent_id IS NULL OR m.to_agent_id = a.id)
     LEFT JOIN message_outbox o
       ON o.message_id = m.id AND o.recipient_agent_id = a.id
+    LEFT JOIN required_message_responses required
+      ON required.swarm_id = m.swarm_id
+      AND required.request_message_id = m.id
     LEFT JOIN inbox_cursors c
       ON c.swarm_id = m.swarm_id AND c.agent_name = m.to_agent COLLATE NOCASE
     WHERE m.delivered = 0
       AND m.to_agent IS NOT NULL
       AND o.message_id IS NULL
+      AND required.id IS NULL
       AND m.id > COALESCE(c.last_read_id, 0)
       AND m.created_at > ?
     ORDER BY m.id ASC
@@ -196,8 +200,12 @@ export function hasPendingRedeliveries(db: SwarmDb): boolean {
       AND (m.to_agent_id IS NULL OR m.to_agent_id = a.id)
     LEFT JOIN inbox_cursors c
       ON c.swarm_id = m.swarm_id AND c.agent_name = m.to_agent COLLATE NOCASE
+    LEFT JOIN required_message_responses required
+      ON required.swarm_id = m.swarm_id
+      AND required.request_message_id = m.id
     WHERE m.delivered = 0
       AND m.to_agent IS NOT NULL
+      AND required.id IS NULL
       AND m.id > COALESCE(c.last_read_id, 0)
       AND m.created_at > ?
     LIMIT 1

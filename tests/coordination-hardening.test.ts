@@ -496,20 +496,20 @@ describe('transactional handoff outbox and deadline janitor', () => {
           .get(offer.id) as { status: string }).status,
         'accepted'
       );
-      const ack = value.db.prepare(`
+      const acceptanceNotice = value.db.prepare(`
         SELECT m.id, o.state, o.attempts
         FROM messages m
         JOIN message_outbox o ON o.message_id = m.id
-        WHERE m.kind = 'ack' AND m.to_agent_id = ?
+        WHERE m.kind = 'handoff' AND m.to_agent_id = ?
       `).get(alice.id) as { id: number; state: string; attempts: number };
       assert.deepStrictEqual(
-        { state: ack.state, attempts: ack.attempts },
+        { state: acceptanceNotice.state, attempts: acceptanceNotice.attempts },
         { state: 'pending', attempts: 0 }
       );
 
       const flushed = await flushMessageOutbox(
         value.db,
-        [offer.message_id, ack.id],
+        [offer.message_id, acceptanceNotice.id],
         async () => ({ delivered: true })
       );
       assert.deepStrictEqual(flushed, { pushed: 2, queued: 0 });

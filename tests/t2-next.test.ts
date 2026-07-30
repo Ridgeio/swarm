@@ -162,7 +162,7 @@ describe('T2.1 typed grants', () => {
       const listed = runCli(home, ['grant', 'list', '--live']);
       assert.strictEqual(listed.status, 0, listed.stderr || listed.stdout);
       assert.match(listed.stdout, /#1 merge cli-grant -> Alice; by Alice; expires .*; note CLI fixture/);
-      const revoked = runCli(home, ['grant', 'revoke', '1']);
+      const revoked = runCli(home, ['grant', 'revoke', '1'], auth);
       assert.strictEqual(revoked.status, 0, revoked.stderr || revoked.stdout);
       assert.match(revoked.stdout, /Grant #1 revoked at/);
       const empty = runCli(home, ['grant', 'list', '--live']);

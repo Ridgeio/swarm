@@ -1,15 +1,27 @@
 import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { execFileSync } from 'child_process';
+import { createHash, randomUUID } from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { detectHost } from './hooks.js';
-import { sendMessage } from './mailbox.js';
+import {
+  enqueueDirectMessage,
+  flushMessageOutbox,
+} from './mailbox.js';
 import { getAgent } from './registry.js';
-import { findLiveGrant, recordGrantUsed, type Grant } from './grants.js';
+import { findLiveGrant, parseGrantTtl, recordGrantUsed, type Grant } from './grants.js';
+import {
+  listSwarmAuthorities,
+  requireActiveAgent,
+  requireSwarmAuthority,
+} from './authority.js';
+import { observeMonotonicClock } from './clock.js';
 
 export const TASK_LEASE_HOURS = 24;
 export const HANDOFF_FRESH_MINUTES = 60;
+export const HANDOFF_OFFER_DEFAULT_TTL = '15m';
+export const HANDOFF_OFFER_MAX_TTL_MS = 24 * 60 * 60 * 1000;
 export const CHECKPOINT_STALE_MINUTES = 90;
 export const RUN_SUMMARY_HEAD_LINES = 15;
 export const RUN_SUMMARY_TAIL_LINES = 25;
@@ -42,6 +54,7 @@ export interface Task {
   title: string;
   state: TaskState;
   owner_agent: string | null;
+  owner_agent_id: string | null;
   lease_epoch: number;
   lease_expires_at: string | null;
   repo_path: string | null;
@@ -61,6 +74,7 @@ interface TaskEvent {
   epoch: number;
   kind: string;
   actor: string | null;
+  actor_agent_id: string | null;
   data: string | null;
   created_at: string;
 }
@@ -101,6 +115,7 @@ export interface StartTaskOptions {
   noWorktree?: boolean;
   takeover?: boolean;
   claimKind?: string;
+  now?: number;
 }
 
 export interface StartTaskResult {
@@ -112,12 +127,19 @@ export interface StartTaskResult {
 export interface ReopenTaskOptions {
   reason: string;
   takeover?: boolean;
+  now?: number;
 }
 
 export interface ReopenTaskResult {
   task: Task;
   previousOwner: string | null;
   priorDisposition: TaskDisposition | null;
+}
+
+export interface RebindLegacyTaskOptions {
+  target: string;
+  reason: string;
+  now?: number;
 }
 
 export interface CheckpointResult {
@@ -154,11 +176,79 @@ export interface RunTaskCommandResult {
   summary: string;
 }
 
-export interface HandoffResult {
+export type HandoffOfferStatus =
+  | 'pending'
+  | 'accepted'
+  | 'declined'
+  | 'cancelled'
+  | 'expired'
+  | 'invalidated';
+
+export type HandoffPickupStatus =
+  | 'queued'
+  | 'pushed-unconfirmed'
+  | 'pending'
+  | 'injected'
+  | 'acked'
+  | 'not-recorded';
+
+export interface HandoffOffer {
+  id: number;
+  swarm_id: string;
+  task_id: string;
+  from_agent: string;
+  to_agent: string;
+  from_agent_id: string | null;
+  to_agent_id: string | null;
+  source_epoch: number;
+  brief_path: string;
+  charter_sha256: string;
+  status: HandoffOfferStatus;
+  created_at: string;
+  expires_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  message_id: number | null;
+  accepted_epoch: number | null;
+}
+
+export interface HandoffOfferView extends HandoffOffer {
+  pickup_status: HandoffPickupStatus;
+  first_injected_at: string | null;
+  acked_at: string | null;
+}
+
+export interface OfferTaskHandoffOptions {
+  staleOk?: boolean;
+  ttl?: string;
+  now?: number;
+  failpoint?: 'after-commit-before-push';
+}
+
+export interface HandoffOfferResult {
+  offer: HandoffOffer;
   task: Task;
   briefPath: string;
   stale: boolean;
   message: string;
+}
+
+export interface HandoffOfferResolutionResult {
+  offer: HandoffOffer;
+  task: Task;
+  message: string;
+}
+
+export interface ResolveHandoffOfferOptions {
+  offerId?: number;
+  reason?: string;
+  now?: number;
+  failpoint?: 'after-commit-before-push';
+}
+
+export interface HandoffSweepResult {
+  expired: HandoffOffer[];
+  invalidated: HandoffOffer[];
 }
 
 export interface DecisionResult {
@@ -169,8 +259,8 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function leaseExpiry(): string {
-  return new Date(Date.now() + TASK_LEASE_HOURS * 60 * 60 * 1000).toISOString();
+function leaseExpiry(now: number = Date.now()): string {
+  return new Date(now + TASK_LEASE_HOURS * 60 * 60 * 1000).toISOString();
 }
 
 function swarmHome(): string {
@@ -367,20 +457,33 @@ function insertEvent(
   data: unknown,
   createdAt: string = nowIso()
 ): number {
+  const actorAgentId = actor === null
+    ? null
+    : requireActiveAgent(db, task.swarm_id, actor, `record ${kind} task event`).id;
   const result = db.prepare(`
-    INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(task.swarm_id, task.id, task.lease_epoch, kind, actor, data === null ? null : JSON.stringify(data), createdAt);
+    INSERT INTO task_events (
+      swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    task.swarm_id,
+    task.id,
+    task.lease_epoch,
+    kind,
+    actor,
+    actorAgentId,
+    data === null ? null : JSON.stringify(data),
+    createdAt
+  );
   return Number(result.lastInsertRowid);
 }
 
-function latestActorEpoch(db: SwarmDb, task: Task, actor: string): number | null {
+function latestActorEpoch(db: SwarmDb, task: Task, actorAgentId: string): number | null {
   const row = db.prepare(`
     SELECT epoch FROM task_events
-    WHERE swarm_id = ? AND task_id = ? AND actor = ? COLLATE NOCASE
-      AND kind IN ('started', 'claimed', 'reopened')
+    WHERE swarm_id = ? AND task_id = ? AND actor_agent_id = ?
+      AND kind IN ('started', 'claimed', 'reopened', 'handoff_accepted', 'legacy_rebound')
     ORDER BY id DESC LIMIT 1
-  `).get(task.swarm_id, task.id, actor) as { epoch: number } | undefined;
+  `).get(task.swarm_id, task.id, actorAgentId) as { epoch: number } | undefined;
   return row?.epoch ?? null;
 }
 
@@ -391,7 +494,11 @@ function staleAuthorityMessage(task: Task, actor: string, verb: string, presente
     : sameName(task.owner_agent, actor)
       ? `Run "swarm task start ${task.id}" to refresh your lease before retrying.`
       : `Run "swarm task start ${task.id} --takeover" to claim it before retrying.`;
-  return `Refused stale task authority for "${task.id}" (${verb}): owner is "${owner}" at lease epoch ${task.lease_epoch}, but ${actor} holds ${presentedEpoch === null ? 'no task epoch' : `epoch ${presentedEpoch}`}. ${action}`;
+  const legacy = task.owner_agent !== null && task.owner_agent_id === null
+    ? ` Legacy ownership has no immutable registration ID; an active Owner/Lead must run ` +
+      `"swarm task rebind ${task.id} --to <agent> --reason \\"<text>\\"".`
+    : '';
+  return `Refused stale task authority for "${task.id}" (${verb}): owner is "${owner}" at lease epoch ${task.lease_epoch}, but ${actor} holds ${presentedEpoch === null ? 'no task epoch' : `epoch ${presentedEpoch}`}.${legacy} ${action}`;
 }
 
 function checkAuthority(
@@ -400,16 +507,25 @@ function checkAuthority(
   slug: string,
   actor: string,
   verb: string,
-  expectedEpoch?: number
+  expectedEpoch?: number,
+  clockNow: number = Date.now()
 ): AuthorityCheck {
   return withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'task', clockNow);
+    const actorAgent = requireActiveAgent(db, swarmId, actor, verb);
     const task = getTask(db, swarmId, slug);
     if (!task) return { error: `Task "${slug}" not found in this swarm.` };
-    const presentedEpoch = expectedEpoch ?? latestActorEpoch(db, task, actor);
-    if (!sameName(task.owner_agent, actor) || presentedEpoch !== task.lease_epoch) {
+    const presentedEpoch = expectedEpoch ?? latestActorEpoch(db, task, actorAgent.id);
+    if (
+      task.owner_agent_id === null ||
+      task.owner_agent_id !== actorAgent.id ||
+      presentedEpoch !== task.lease_epoch
+    ) {
       insertEvent(db, task, 'refused_stale_epoch', actor, {
         verb,
         owner_agent: task.owner_agent,
+        owner_agent_id: task.owner_agent_id,
+        actor_agent_id: actorAgent.id,
         current_epoch: task.lease_epoch,
         presented_epoch: presentedEpoch,
       });
@@ -425,9 +541,10 @@ export function requireTaskAuthority(
   slug: string,
   actor: string,
   verb: string,
-  expectedEpoch?: number
+  expectedEpoch?: number,
+  clockNow?: number
 ): { task: Task; epoch: number } {
-  const checked = checkAuthority(db, swarmId, slug, actor, verb, expectedEpoch);
+  const checked = checkAuthority(db, swarmId, slug, actor, verb, expectedEpoch, clockNow);
   if (checked.error || !checked.task || checked.epoch === undefined) {
     throw new Error(checked.error ?? `Task "${slug}" authority check failed.`);
   }
@@ -442,6 +559,11 @@ export async function startTask(
   options: StartTaskOptions
 ): Promise<StartTaskResult> {
   validateTaskSlug(slug);
+  const actorAgent = requireActiveAgent(db, swarmId, actor, 'start task');
+  const mutationNow = options.now ?? Date.now();
+  if (!Number.isFinite(mutationNow) || !Number.isSafeInteger(mutationNow)) {
+    throw new Error('Task mutation time must be a finite integer millisecond timestamp.');
+  }
   const explicitClaimKind = options.claimKind === undefined
     ? undefined
     : validateClaimKind(options.claimKind);
@@ -452,8 +574,20 @@ export async function startTask(
   if (prior && ['done', 'abandoned'].includes(prior.state)) {
     throw new Error(`Task "${slug}" is ${prior.state} and cannot be started again.`);
   }
-  if (prior?.owner_agent && !sameName(prior.owner_agent, actor) && prior.state === 'active' && !options.takeover) {
+  if (prior?.owner_agent && prior.owner_agent_id === null) {
+    throw new Error(
+      `Task "${slug}" has legacy name-only ownership. ` +
+      `An active Owner/Lead must run "swarm task rebind ${slug} --to <agent> --reason \\"<text>\\"" before mutation.`
+    );
+  }
+  const changingOwner = prior?.owner_agent_id !== null &&
+    prior?.owner_agent_id !== undefined &&
+    prior.owner_agent_id !== actorAgent.id;
+  if (changingOwner && !options.takeover) {
     throw new Error(`Task "${slug}" is active and owned by "${prior.owner_agent}" at lease epoch ${prior.lease_epoch}. Re-run with --takeover to claim it.`);
+  }
+  if (changingOwner) {
+    requireSwarmAuthority(db, swarmId, actor, `take over task "${slug}"`);
   }
 
   const requestedRepo = options.repoPath ?? prior?.repo_path ?? undefined;
@@ -463,19 +597,37 @@ export async function startTask(
   }
 
   const result = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'task', mutationNow);
+    const currentStartActor = requireActiveAgent(db, swarmId, actor, 'start task');
+    if (currentStartActor.id !== actorAgent.id) {
+      return { error: `Refused start: ${actor}'s registration changed before the mutation committed.` };
+    }
     const current = getTask(db, swarmId, slug);
     if (current && ['done', 'abandoned'].includes(current.state)) {
       throw new Error(`Task "${slug}" is ${current.state} and cannot be started again.`);
     }
-    if (current?.owner_agent && !sameName(current.owner_agent, actor) && current.state === 'active' && !options.takeover) {
+    if (current?.owner_agent && current.owner_agent_id === null) {
+      throw new Error(
+        `Task "${slug}" has legacy name-only ownership. ` +
+        `An active Owner/Lead must explicitly rebind it before mutation.`
+      );
+    }
+    const currentOwnerChanged = current?.owner_agent_id !== null &&
+      current?.owner_agent_id !== undefined &&
+      current.owner_agent_id !== actorAgent.id;
+    if (currentOwnerChanged && !options.takeover) {
       throw new Error(`Task "${slug}" is active and owned by "${current.owner_agent}" at lease epoch ${current.lease_epoch}. Re-run with --takeover to claim it.`);
+    }
+    if (currentOwnerChanged) {
+      requireSwarmAuthority(db, swarmId, actor, `take over task "${slug}"`);
     }
 
     const previousOwner = current?.owner_agent ?? null;
-    const claimed = !!current && !!previousOwner && !sameName(previousOwner, actor);
+    const previousOwnerId = current?.owner_agent_id ?? null;
+    const claimed = !!current && previousOwnerId !== null && previousOwnerId !== actorAgent.id;
     const eventKind: 'started' | 'claimed' = claimed ? 'claimed' : 'started';
     const epoch = (current?.lease_epoch ?? 0) + 1;
-    const timestamp = nowIso();
+    const timestamp = new Date(mutationNow).toISOString();
     const title = options.title?.trim() || current?.title;
     if (!title) throw new Error(`Task "${slug}" requires --title <text>.`);
     const claimKind: ClaimKind | null = explicitClaimKind !== undefined
@@ -489,15 +641,17 @@ export async function startTask(
     if (current) {
       db.prepare(`
         UPDATE tasks
-        SET title = ?, state = 'active', owner_agent = ?, lease_epoch = ?, lease_expires_at = ?,
+        SET title = ?, state = 'active', owner_agent = ?, owner_agent_id = ?,
+            lease_epoch = ?, lease_expires_at = ?,
             repo_path = ?, branch = ?, worktree_path = ?, transcript_hint = ?, disposition = NULL,
             claim_kind = ?, updated_at = ?
         WHERE swarm_id = ? AND id = ?
       `).run(
         title,
-        actor,
+        actorAgent.name,
+        actorAgent.id,
         epoch,
-        leaseExpiry(),
+        leaseExpiry(mutationNow),
         worktree?.repoPath ?? (options.repoPath ? path.resolve(options.repoPath) : current.repo_path),
         worktree?.branch ?? current.branch,
         worktree?.worktreePath ?? current.worktree_path,
@@ -510,16 +664,18 @@ export async function startTask(
     } else {
       db.prepare(`
         INSERT INTO tasks (
-          id, swarm_id, title, state, owner_agent, lease_epoch, lease_expires_at,
+          id, swarm_id, title, state, owner_agent, owner_agent_id,
+          lease_epoch, lease_expires_at,
           repo_path, branch, worktree_path, transcript_hint, disposition, claim_kind, created_at, updated_at
-        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
       `).run(
         slug,
         swarmId,
         title,
-        actor,
+        actorAgent.name,
+        actorAgent.id,
         epoch,
-        leaseExpiry(),
+        leaseExpiry(mutationNow),
         worktree?.repoPath ?? (options.repoPath ? path.resolve(options.repoPath) : null),
         worktree?.branch ?? null,
         worktree?.worktreePath ?? null,
@@ -534,24 +690,35 @@ export async function startTask(
     if (!task) throw new Error(`Failed to start task "${slug}".`);
     insertEvent(db, task, eventKind, actor, {
       previous_owner: previousOwner,
+      previous_owner_agent_id: previousOwnerId,
+      owner_agent_id: actorAgent.id,
       repo_path: task.repo_path,
       branch: task.branch,
       worktree_path: task.worktree_path,
       claim_kind: effectiveClaimKind(task),
     }, timestamp);
-    return { task, eventKind, previousOwner };
-  }) as StartTaskResult;
+    let notificationId: number | null = null;
+    if (claimed && previousOwner && previousOwnerId) {
+      notificationId = enqueueDirectMessage(
+        db,
+        swarmId,
+        actorAgent.name,
+        previousOwner,
+        `Task ${slug} was claimed by ${actorAgent.name} at lease epoch ${task.lease_epoch}. ` +
+        'Your prior task authority is fenced; inspect the ledger before continuing.',
+        {
+          createdAt: timestamp,
+          kind: 'handoff',
+          fromAgentId: actorAgent.id,
+          recipientAgentId: previousOwnerId,
+        }
+      );
+    }
+    return { task, eventKind, previousOwner, notificationId };
+  }) as StartTaskResult & { notificationId: number | null };
 
-  if (result.eventKind === 'claimed' && result.previousOwner) {
-    await sendMessage(
-      db,
-      swarmId,
-      actor,
-      result.previousOwner,
-      `Task ${slug} was claimed by ${actor} at lease epoch ${result.task.lease_epoch}. Your prior task authority is fenced; inspect the ledger before continuing.`,
-      undefined,
-      'handoff'
-    );
+  if (result.notificationId !== null) {
+    await flushMessageOutbox(db, [result.notificationId]);
   }
   return result;
 }
@@ -564,6 +731,11 @@ export async function reopenTask(
   options: ReopenTaskOptions
 ): Promise<ReopenTaskResult> {
   validateTaskSlug(slug);
+  const actorAgent = requireActiveAgent(db, swarmId, actor, 'reopen task');
+  const mutationNow = options.now ?? Date.now();
+  if (!Number.isFinite(mutationNow) || !Number.isSafeInteger(mutationNow)) {
+    throw new Error('Task mutation time must be a finite integer millisecond timestamp.');
+  }
   const reason = options.reason?.trim();
   if (!reason) throw new Error(`Task reopen requires --reason "<text>" for "${slug}".`);
 
@@ -572,9 +744,25 @@ export async function reopenTask(
   if (!['done', 'abandoned'].includes(prior.state)) {
     throw new Error(`Task "${slug}" is ${prior.state}; reopen only accepts done or abandoned tasks.`);
   }
-  if (!options.takeover) requireTaskAuthority(db, swarmId, slug, actor, 'reopen');
+  if (prior.owner_agent !== null && prior.owner_agent_id === null) {
+    throw new Error(
+      `Task "${slug}" has legacy name-only ownership. ` +
+      `An active Owner/Lead must explicitly rebind it before mutation.`
+    );
+  }
+  if (options.takeover && prior.owner_agent_id !== actorAgent.id) {
+    requireSwarmAuthority(db, swarmId, actor, `take over reopened task "${slug}"`);
+  }
+  if (!options.takeover) {
+    requireTaskAuthority(db, swarmId, slug, actor, 'reopen', undefined, mutationNow);
+  }
 
   const result = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'task', mutationNow);
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'reopen task');
+    if (currentActor.id !== actorAgent.id) {
+      return { error: `Refused reopen: ${actor}'s registration changed before the mutation committed.` };
+    }
     const current = getTask(db, swarmId, slug);
     if (!current) return { error: `Task "${slug}" not found in this swarm.` };
     if (!['done', 'abandoned'].includes(current.state)) {
@@ -582,51 +770,187 @@ export async function reopenTask(
     }
 
     if (!options.takeover) {
-      const presentedEpoch = latestActorEpoch(db, current, actor);
-      if (!sameName(current.owner_agent, actor) || presentedEpoch !== current.lease_epoch) {
+      const presentedEpoch = latestActorEpoch(db, current, actorAgent.id);
+      if (
+        current.owner_agent_id === null ||
+        current.owner_agent_id !== actorAgent.id ||
+        presentedEpoch !== current.lease_epoch
+      ) {
         insertEvent(db, current, 'refused_stale_epoch', actor, {
           verb: 'reopen',
           owner_agent: current.owner_agent,
+          owner_agent_id: current.owner_agent_id,
           current_epoch: current.lease_epoch,
           presented_epoch: presentedEpoch,
         });
         return { error: staleAuthorityMessage(current, actor, 'reopen', presentedEpoch) };
       }
+    } else if (current.owner_agent_id !== currentActor.id) {
+      requireSwarmAuthority(db, swarmId, actor, `take over reopened task "${slug}"`);
     }
 
     const previousOwner = current.owner_agent;
+    const previousOwnerId = current.owner_agent_id;
     const priorDisposition = current.disposition;
-    const timestamp = nowIso();
+    const timestamp = new Date(mutationNow).toISOString();
     db.prepare(`
       UPDATE tasks
-      SET state = 'active', owner_agent = ?, lease_epoch = ?, lease_expires_at = ?,
+      SET state = 'active', owner_agent = ?, owner_agent_id = ?,
+          lease_epoch = ?, lease_expires_at = ?,
           disposition = NULL, updated_at = ?
       WHERE swarm_id = ? AND id = ?
-    `).run(actor, current.lease_epoch + 1, leaseExpiry(), timestamp, swarmId, slug);
+    `).run(
+      currentActor.name,
+      currentActor.id,
+      current.lease_epoch + 1,
+      leaseExpiry(mutationNow),
+      timestamp,
+      swarmId,
+      slug
+    );
     const reopened = getTask(db, swarmId, slug);
     if (!reopened) return { error: `Failed to reopen task "${slug}".` };
     insertEvent(db, reopened, 'reopened', actor, {
       reason,
       prior_disposition: priorDisposition,
       previous_owner: previousOwner,
+      previous_owner_agent_id: previousOwnerId,
+      owner_agent_id: currentActor.id,
       takeover: options.takeover === true,
     }, timestamp);
-    return { task: reopened, previousOwner, priorDisposition };
-  }) as ReopenTaskResult & { error?: string };
+    let notificationId: number | null = null;
+    if (options.takeover && previousOwner && previousOwnerId && previousOwnerId !== currentActor.id) {
+      notificationId = enqueueDirectMessage(
+        db,
+        swarmId,
+        currentActor.name,
+        previousOwner,
+        `Task ${slug} was reopened and taken over by ${actorAgent.name} at lease epoch ${reopened.lease_epoch}. ` +
+        'Your prior task authority is fenced; inspect the ledger before continuing.',
+        {
+          createdAt: timestamp,
+          kind: 'handoff',
+          fromAgentId: currentActor.id,
+          recipientAgentId: previousOwnerId,
+        }
+      );
+    }
+    return { task: reopened, previousOwner, priorDisposition, notificationId };
+  }) as ReopenTaskResult & { error?: string; notificationId: number | null };
 
   if (result.error || !result.task) throw new Error(result.error ?? `Failed to reopen task "${slug}".`);
-  if (options.takeover && result.previousOwner && !sameName(result.previousOwner, actor)) {
-    await sendMessage(
+  if (result.notificationId !== null) {
+    await flushMessageOutbox(db, [result.notificationId]);
+  }
+  return result;
+}
+
+/**
+ * Explicit upgrade path for pre-provenance task rows. It never treats a
+ * matching display name as proof of ownership: an active Owner/Lead selects an
+ * exact live registration, a fresh epoch is minted, and both authorizer and
+ * new owner IDs are audited.
+ */
+export async function rebindLegacyTask(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  slug: string,
+  options: RebindLegacyTaskOptions
+): Promise<Task> {
+  validateTaskSlug(slug);
+  const reason = options.reason?.replace(/\s+/g, ' ').trim();
+  if (!reason) throw new Error(`Task rebind requires --reason "<text>" for "${slug}".`);
+  const issuer = requireSwarmAuthority(db, swarmId, actor, `rebind legacy task "${slug}"`);
+  const target = requireActiveAgent(db, swarmId, options.target, `rebind legacy task "${slug}"`);
+  const mutationNow = options.now ?? Date.now();
+  if (!Number.isFinite(mutationNow) || !Number.isSafeInteger(mutationNow)) {
+    throw new Error('Task mutation time must be a finite integer millisecond timestamp.');
+  }
+
+  const result = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'task', mutationNow);
+    const currentIssuer = requireSwarmAuthority(
       db,
       swarmId,
       actor,
-      result.previousOwner,
-      `Task ${slug} was reopened and taken over by ${actor} at lease epoch ${result.task.lease_epoch}. Your prior task authority is fenced; inspect the ledger before continuing.`,
-      undefined,
-      'handoff'
+      `rebind legacy task "${slug}"`
     );
+    const currentTarget = requireActiveAgent(
+      db,
+      swarmId,
+      options.target,
+      `rebind legacy task "${slug}"`
+    );
+    if (currentIssuer.agent.id !== issuer.agent.id || currentTarget.id !== target.id) {
+      throw new Error(
+        `Refused legacy rebind for "${slug}": an issuer or target registration changed before commit.`
+      );
+    }
+    const current = getTask(db, swarmId, slug);
+    if (!current) throw new Error(`Task "${slug}" not found in this swarm.`);
+    if (current.owner_agent_id !== null) {
+      throw new Error(
+        `Task "${slug}" already has immutable owner registration ${current.owner_agent_id}; ` +
+        'use the normal Owner/Lead --takeover path instead of legacy rebind.'
+      );
+    }
+    const timestamp = new Date(mutationNow).toISOString();
+    const previousOwner = current.owner_agent;
+    const nextEpoch = current.lease_epoch + 1;
+    db.prepare(`
+      UPDATE tasks
+      SET state = 'active', owner_agent = ?, owner_agent_id = ?,
+          lease_epoch = ?, lease_expires_at = ?, updated_at = ?
+      WHERE swarm_id = ? AND id = ? AND owner_agent_id IS NULL
+    `).run(
+      target.name,
+      target.id,
+      nextEpoch,
+      leaseExpiry(mutationNow),
+      timestamp,
+      swarmId,
+      slug
+    );
+    const rebound = getTask(db, swarmId, slug);
+    if (!rebound || rebound.owner_agent_id !== target.id) {
+      throw new Error(`Failed to rebind legacy task "${slug}".`);
+    }
+    insertEvent(db, rebound, 'legacy_rebind_authorized', issuer.agent.name, {
+      reason,
+      previous_owner: previousOwner,
+      target_agent: target.name,
+      target_agent_id: target.id,
+      authorized_by_agent_id: issuer.agent.id,
+    }, timestamp);
+    insertEvent(db, rebound, 'legacy_rebound', target.name, {
+      reason,
+      previous_owner: previousOwner,
+      owner_agent_id: target.id,
+      authorized_by_agent_id: issuer.agent.id,
+    }, timestamp);
+    const notificationId = target.id === issuer.agent.id
+      ? null
+      : enqueueDirectMessage(
+        db,
+        swarmId,
+        issuer.agent.name,
+        target.name,
+        `Legacy task ${slug} was explicitly rebound to your registration at lease epoch ${nextEpoch}; ` +
+        `reason=${reason}.`,
+        {
+          createdAt: timestamp,
+          kind: 'handoff',
+          fromAgentId: issuer.agent.id,
+          recipientAgentId: target.id,
+        }
+      );
+    return { task: rebound, notificationId };
+  }) as { task: Task; notificationId: number | null };
+  if (result.notificationId !== null) {
+    await flushMessageOutbox(db, [result.notificationId]);
   }
-  return result;
+  return result.task;
 }
 
 export function taskGitFacts(task: Task): GitFacts {
@@ -657,11 +981,26 @@ function checkpointDir(task: Task): string {
   return path.join(swarmHome(), 'briefs', 'checkpoints', task.swarm_id, task.id);
 }
 
-function checkpointSkeleton(task: Task, sequence: number, facts: GitFacts, notes?: string): string {
+function checkpointDraftMarker(draftId: string): string {
+  return `<!-- swarm-checkpoint-draft:${draftId} -->`;
+}
+
+function checkpointHasDraftId(contents: string, draftId: string): boolean {
+  return contents.includes(checkpointDraftMarker(draftId));
+}
+
+function checkpointSkeleton(
+  task: Task,
+  sequence: number,
+  facts: GitFacts,
+  draftId: string,
+  notes?: string
+): string {
   const number = String(sequence).padStart(3, '0');
   const decisions = notes ?? '<FILL>';
   const other = notes === undefined ? '<FILL>' : '- none noted';
   return `# checkpoint ${task.id} #${number}
+${checkpointDraftMarker(draftId)}
 - state: ${task.state}; owner ${task.owner_agent ?? 'unowned'}; lease epoch ${task.lease_epoch}
 - head: ${facts.head} on ${facts.branch} (dirty: ${facts.dirtyTracked}, untracked: ${facts.untracked})
 ## decisions (+why, +rejected alternatives)
@@ -691,6 +1030,31 @@ function recordedCheckpointPaths(db: SwarmDb, task: Task): Set<string> {
   return paths;
 }
 
+function currentOwnerCheckpointDrafts(db: SwarmDb, task: Task): Map<string, string> {
+  if (task.owner_agent_id === null) return new Map();
+  const rows = db.prepare(`
+    SELECT data FROM task_events
+    WHERE swarm_id = ? AND task_id = ?
+      AND kind = 'checkpoint_draft_created'
+      AND epoch = ?
+      AND actor_agent_id = ?
+  `).all(
+    task.swarm_id,
+    task.id,
+    task.lease_epoch,
+    task.owner_agent_id
+  ) as Array<{ data: string | null }>;
+  const drafts = new Map<string, string>();
+  for (const row of rows) {
+    if (!row.data) continue;
+    try {
+      const parsed = JSON.parse(row.data) as { path?: string; draft_id?: string };
+      if (parsed.path && parsed.draft_id) drafts.set(parsed.path, parsed.draft_id);
+    } catch { /* malformed draft provenance is never reusable */ }
+  }
+  return drafts;
+}
+
 function existingCheckpointFiles(dir: string): Array<{ sequence: number; path: string }> {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir)
@@ -717,17 +1081,71 @@ export function checkpointTask(
 
   const files = existingCheckpointFiles(dir);
   const recorded = recordedCheckpointPaths(db, task);
-  const pending = [...files].reverse().find(entry => !recorded.has(entry.path));
+  const currentOwnerDrafts = currentOwnerCheckpointDrafts(db, task);
+  const pending = [...files].reverse().find(
+    entry => {
+      const draftId = currentOwnerDrafts.get(entry.path);
+      if (recorded.has(entry.path) || !draftId) return false;
+      try {
+        return checkpointHasDraftId(fs.readFileSync(entry.path, 'utf-8'), draftId);
+      } catch {
+        return false;
+      }
+    }
+  );
   const sequence = pending?.sequence ?? ((files.at(-1)?.sequence ?? 0) + 1);
   const checkpointPath = pending?.path ?? path.join(dir, `${String(sequence).padStart(3, '0')}.md`);
+  const draftId = pending
+    ? currentOwnerDrafts.get(pending.path)!
+    : randomUUID();
 
   if (notes !== undefined) {
-    fs.writeFileSync(checkpointPath, checkpointSkeleton(task, sequence, taskGitFacts(task), notes), 'utf-8');
+    fs.writeFileSync(
+      checkpointPath,
+      checkpointSkeleton(task, sequence, taskGitFacts(task), draftId, notes),
+      'utf-8'
+    );
   } else if (!fs.existsSync(checkpointPath)) {
-    fs.writeFileSync(checkpointPath, checkpointSkeleton(task, sequence, taskGitFacts(task)), 'utf-8');
+    fs.writeFileSync(
+      checkpointPath,
+      checkpointSkeleton(task, sequence, taskGitFacts(task), draftId),
+      'utf-8'
+    );
+    const draft = withImmediateTransaction(db, () => {
+      const currentActor = requireActiveAgent(db, swarmId, actor, 'checkpoint draft');
+      const checked = getTask(db, swarmId, slug);
+      if (
+        !checked ||
+        checked.owner_agent_id !== currentActor.id ||
+        checked.lease_epoch !== authority.epoch
+      ) {
+        return {
+          error: checked
+            ? staleAuthorityMessage(checked, actor, 'checkpoint', authority.epoch)
+            : `Task "${slug}" not found in this swarm.`,
+        };
+      }
+      insertEvent(
+        db,
+        checked,
+        'checkpoint_draft_created',
+        actor,
+        { path: checkpointPath, sequence, draft_id: draftId }
+      );
+      return { task: checked };
+    }) as { task?: Task; error?: string };
+    if (draft.error || !draft.task) {
+      throw new Error(draft.error ?? `Failed to bind checkpoint draft for "${slug}".`);
+    }
   }
 
   const contents = fs.readFileSync(checkpointPath, 'utf-8');
+  if (!checkpointHasDraftId(contents, draftId)) {
+    throw new Error(
+      `Checkpoint draft ${checkpointPath} no longer matches its owner/epoch generation. ` +
+      'The file was preserved; rerun the checkpoint command to create a fresh draft.'
+    );
+  }
   if (contents.includes('<FILL>')) {
     return { task, path: checkpointPath, sequence, recorded: false, exitCode: 2 };
   }
@@ -736,12 +1154,19 @@ export function checkpointTask(
   if (committed.error || !committed.task) throw new Error(committed.error ?? `Task "${slug}" authority changed.`);
   const timestamp = nowIso();
   const updatedTask = withImmediateTransaction(db, () => {
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'checkpoint');
     const checked = getTask(db, swarmId, slug);
-    if (!checked || !sameName(checked.owner_agent, actor) || checked.lease_epoch !== authority.epoch) {
+    if (
+      !checked ||
+      checked.owner_agent_id !== currentActor.id ||
+      checked.lease_epoch !== authority.epoch
+    ) {
       if (checked) {
         insertEvent(db, checked, 'refused_stale_epoch', actor, {
           verb: 'checkpoint',
           owner_agent: checked.owner_agent,
+          owner_agent_id: checked.owner_agent_id,
+          actor_agent_id: currentActor.id,
           current_epoch: checked.lease_epoch,
           presented_epoch: authority.epoch,
         });
@@ -751,7 +1176,12 @@ export function checkpointTask(
     }
     db.prepare('UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE swarm_id = ? AND id = ?')
       .run(leaseExpiry(), timestamp, swarmId, slug);
-    insertEvent(db, checked, 'checkpoint', actor, { path: checkpointPath, sequence }, timestamp);
+    insertEvent(db, checked, 'checkpoint', actor, {
+      path: checkpointPath,
+      sequence,
+      draft_id: draftId,
+      content_sha256: sha256(contents),
+    }, timestamp);
     return { task: getTask(db, swarmId, slug) };
   }) as { task?: Task | null; error?: string };
   if (updatedTask.error || !updatedTask.task) throw new Error(updatedTask.error ?? `Failed to record checkpoint for "${slug}".`);
@@ -1146,12 +1576,19 @@ export async function closeTask(
   }
 
   const result = withImmediateTransaction(db, () => {
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'close task');
     const current = getTask(db, swarmId, slug);
-    if (!current || !sameName(current.owner_agent, actor) || current.lease_epoch !== authority.epoch) {
+    if (
+      !current ||
+      current.owner_agent_id !== currentActor.id ||
+      current.lease_epoch !== authority.epoch
+    ) {
       if (current) {
         insertEvent(db, current, 'refused_stale_epoch', actor, {
           verb: 'close',
           owner_agent: current.owner_agent,
+          owner_agent_id: current.owner_agent_id,
+          actor_agent_id: currentActor.id,
           current_epoch: current.lease_epoch,
           presented_epoch: authority.epoch,
         });
@@ -1327,7 +1764,18 @@ export function runTaskCommand(
   return { task, exitCode, logPath, durationMs, summary };
 }
 
-function latestCheckpoint(db: SwarmDb, task: Task): { event: TaskEvent; path: string } | null {
+interface BoundCheckpoint {
+  event: TaskEvent;
+  path: string;
+  draftId: string | null;
+  contentSha256: string | null;
+}
+
+interface VerifiedCheckpoint extends BoundCheckpoint {
+  body: string;
+}
+
+function latestCheckpoint(db: SwarmDb, task: Task): BoundCheckpoint | null {
   const event = db.prepare(`
     SELECT * FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND kind = 'checkpoint'
@@ -1335,11 +1783,70 @@ function latestCheckpoint(db: SwarmDb, task: Task): { event: TaskEvent; path: st
   `).get(task.swarm_id, task.id) as TaskEvent | undefined;
   if (!event?.data) return null;
   try {
-    const data = JSON.parse(event.data) as { path?: string };
-    return data.path ? { event, path: data.path } : null;
+    const data = JSON.parse(event.data) as {
+      path?: string;
+      draft_id?: string;
+      content_sha256?: string;
+    };
+    return data.path
+      ? {
+          event,
+          path: data.path,
+          draftId: data.draft_id ?? null,
+          contentSha256: data.content_sha256 ?? null,
+        }
+      : null;
   } catch {
     return null;
   }
+}
+
+function requireCurrentOwnerCheckpoint(
+  checkpoint: BoundCheckpoint | null,
+  task: Task
+): VerifiedCheckpoint {
+  if (!checkpoint || !fs.existsSync(checkpoint.path)) {
+    throw new Error(
+      `Task "${task.id}" has no readable checkpoint. ` +
+      `Run "swarm task checkpoint ${task.id}" before offering a handoff.`
+    );
+  }
+  if (
+    task.owner_agent_id === null ||
+    checkpoint.event.epoch !== task.lease_epoch ||
+    checkpoint.event.actor_agent_id !== task.owner_agent_id
+  ) {
+    throw new Error(
+      `Task "${task.id}" latest checkpoint is not bound to current owner registration ` +
+      `${task.owner_agent_id ?? 'legacy/unrecorded'} at lease epoch ${task.lease_epoch}. ` +
+      `The current owner must create a fresh checkpoint before offering a handoff.`
+    );
+  }
+  if (!checkpoint.draftId || !checkpoint.contentSha256) {
+    throw new Error(
+      `Task "${task.id}" latest checkpoint predates generation-bound content verification. ` +
+      `Run "swarm task checkpoint ${task.id}" to create a fresh checkpoint before handoff.`
+    );
+  }
+  let body: string;
+  try {
+    body = fs.readFileSync(checkpoint.path, 'utf-8');
+  } catch {
+    throw new Error(
+      `Task "${task.id}" checkpoint became unreadable. ` +
+      `Run "swarm task checkpoint ${task.id}" before offering a handoff.`
+    );
+  }
+  if (
+    !checkpointHasDraftId(body, checkpoint.draftId) ||
+    sha256(body) !== checkpoint.contentSha256
+  ) {
+    throw new Error(
+      `Task "${task.id}" latest checkpoint bytes no longer match the recorded owner/epoch generation and digest. ` +
+      `The file was preserved; run "swarm task checkpoint ${task.id}" to create a fresh checkpoint before handoff.`
+    );
+  }
+  return { ...checkpoint, body };
 }
 
 function minuteStamp(date: Date): string {
@@ -1347,44 +1854,360 @@ function minuteStamp(date: Date): string {
   return `${digits.slice(0, 8)}-${digits.slice(9, 13)}`;
 }
 
-export async function handoffTask(
+function sha256(contents: string): string {
+  return createHash('sha256').update(contents, 'utf-8').digest('hex');
+}
+
+export function parseHandoffOfferTtl(value: string): number {
+  const durationMs = parseGrantTtl(value);
+  if (durationMs > HANDOFF_OFFER_MAX_TTL_MS) {
+    throw new Error(
+      `Invalid handoff --ttl "${value}". Handoff offers must expire within 1d so abandoned offers dead-letter promptly.`
+    );
+  }
+  return durationMs;
+}
+
+function getHandoffOffer(db: SwarmDb, swarmId: string, offerId: number): HandoffOffer | null {
+  return db.prepare('SELECT * FROM handoff_offers WHERE swarm_id = ? AND id = ?')
+    .get(swarmId, offerId) as HandoffOffer | undefined ?? null;
+}
+
+function pendingHandoffOffer(
+  db: SwarmDb,
+  swarmId: string,
+  taskId: string,
+  actor: string,
+  role: 'sender' | 'recipient',
+  offerId?: number
+): HandoffOffer | null {
+  const actorAgent = getAgent(db, swarmId, actor);
+  if (!actorAgent) return null;
+  const partyIdColumn = role === 'sender' ? 'from_agent_id' : 'to_agent_id';
+  const params: Array<string | number> = [swarmId, taskId, actorAgent.id];
+  let idClause = '';
+  if (offerId !== undefined) {
+    idClause = 'AND id = ?';
+    params.push(offerId);
+  }
+  return db.prepare(`
+    SELECT * FROM handoff_offers
+    WHERE swarm_id = ? AND task_id = ?
+      AND ${partyIdColumn} = ?
+      ${idClause}
+    ORDER BY id DESC
+    LIMIT 1
+  `).get(...params) as HandoffOffer | undefined ?? null;
+}
+
+function transitionStaleHandoffOffer(
+  db: SwarmDb,
+  offer: HandoffOffer,
+  status: 'expired' | 'invalidated',
+  task: Task | null,
+  resolvedAt: string,
+  detail: Record<string, unknown>
+): HandoffOffer | null {
+  const changed = db.prepare(`
+    UPDATE handoff_offers
+    SET status = ?, resolved_at = ?, resolved_by = NULL
+    WHERE swarm_id = ? AND id = ? AND status = 'pending'
+  `).run(status, resolvedAt, offer.swarm_id, offer.id);
+  if (Number(changed.changes) === 0) return null;
+  if (task) {
+    insertEvent(
+      db,
+      task,
+      status === 'expired' ? 'handoff_offer_expired' : 'handoff_offer_invalidated',
+      null,
+      {
+        offer_id: offer.id,
+        from: offer.from_agent,
+        to: offer.to_agent,
+        source_epoch: offer.source_epoch,
+        charter_sha256: offer.charter_sha256,
+        ...detail,
+      },
+      resolvedAt
+    );
+  }
+  if (status === 'expired') {
+    enqueueHandoffExpiryNotifications(db, offer, resolvedAt);
+  }
+  return getHandoffOffer(db, offer.swarm_id, offer.id);
+}
+
+function enqueueHandoffExpiryNotifications(
+  db: SwarmDb,
+  offer: HandoffOffer,
+  createdAt: string
+): void {
+  const recipients: Array<{
+    id: string;
+    name: string;
+    audience: 'sender' | 'authority';
+  }> = [];
+  if (offer.from_agent_id) {
+    recipients.push({
+      id: offer.from_agent_id,
+      name: offer.from_agent,
+      audience: 'sender',
+    });
+  }
+  for (const authority of listSwarmAuthorities(db, offer.swarm_id)) {
+    const active = db.prepare(
+      'SELECT id, name FROM agents WHERE swarm_id = ? AND id = ?'
+    ).get(offer.swarm_id, authority.agent_id) as { id: string; name: string } | undefined;
+    if (!active) continue;
+    if (recipients.some(row => row.id === active.id && row.audience === 'authority')) continue;
+    recipients.push({ id: active.id, name: active.name, audience: 'authority' });
+  }
+
+  for (const recipient of recipients) {
+    const prior = db.prepare(`
+      SELECT message_id FROM handoff_expiry_notifications
+      WHERE offer_id = ? AND recipient_agent_id = ? AND audience = ?
+    `).get(offer.id, recipient.id, recipient.audience);
+    if (prior) continue;
+    const body = recipient.audience === 'sender'
+      ? `Handoff offer #${offer.id} for ${offer.task_id} expired at ${offer.expires_at}; ` +
+        'your source lease was not transferred. Refresh the checkpoint and issue a new offer if needed.'
+      : `ESCALATION: handoff offer #${offer.id} for ${offer.task_id} expired without pickup; ` +
+        `${offer.from_agent} retained source lease epoch ${offer.source_epoch}. Inspect ownership and reassign only through an authorized takeover.`;
+    const messageId = enqueueDirectMessage(
+      db,
+      offer.swarm_id,
+      'swarm-janitor',
+      recipient.name,
+      body,
+      {
+        createdAt,
+        kind: 'escalation',
+        fromAgentId: null,
+        recipientAgentId: recipient.id,
+      }
+    );
+    db.prepare(`
+      INSERT INTO handoff_expiry_notifications (
+        offer_id, recipient_agent_id, audience, message_id, created_at
+      ) VALUES (?, ?, ?, ?, ?)
+    `).run(offer.id, recipient.id, recipient.audience, messageId, createdAt);
+  }
+}
+
+/**
+ * Deterministically resolves offers that can no longer be accepted. The source
+ * owner keeps the task lease throughout: expiry is a dead letter, not a
+ * best-effort authority transfer.
+ */
+export function sweepHandoffOffers(
+  db: SwarmDb,
+  swarmId: string,
+  now: number = Date.now()
+): HandoffSweepResult {
+  if (!Number.isFinite(now)) throw new Error('Handoff sweep time must be finite.');
+  if (!Number.isSafeInteger(now)) throw new Error('Handoff sweep time must be an integer millisecond timestamp.');
+  const pending = db.prepare(`
+    SELECT * FROM handoff_offers
+    WHERE swarm_id = ? AND status = 'pending'
+    ORDER BY id ASC
+  `).all(swarmId) as unknown as HandoffOffer[];
+  if (pending.length === 0) return { expired: [], invalidated: [] };
+  withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'handoff', now);
+  });
+  const at = new Date(now).toISOString();
+  const result: HandoffSweepResult = { expired: [], invalidated: [] };
+
+  for (const offer of pending) {
+    const transitioned = withImmediateTransaction(db, () => {
+      const current = getHandoffOffer(db, swarmId, offer.id);
+      if (!current || current.status !== 'pending') return null;
+      const task = getTask(db, swarmId, current.task_id);
+      if (
+        !task ||
+        task.owner_agent_id === null ||
+        current.from_agent_id === null ||
+        task.owner_agent_id !== current.from_agent_id ||
+        task.lease_epoch !== current.source_epoch
+      ) {
+        return transitionStaleHandoffOffer(db, current, 'invalidated', task, at, {
+          reason: 'source task authority changed before acceptance',
+          current_owner: task?.owner_agent ?? null,
+          current_epoch: task?.lease_epoch ?? null,
+        });
+      }
+      if (current.expires_at <= at) {
+        return transitionStaleHandoffOffer(db, current, 'expired', task, at, {
+          reason: 'recipient did not accept before the pickup deadline',
+        });
+      }
+      return null;
+    }) as HandoffOffer | null;
+    if (!transitioned) continue;
+    if (transitioned.status === 'expired') result.expired.push(transitioned);
+    if (transitioned.status === 'invalidated') result.invalidated.push(transitioned);
+  }
+  return result;
+}
+
+export function listHandoffOffers(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  taskId?: string
+): HandoffOfferView[] {
+  if (taskId) validateTaskSlug(taskId);
+  const actorAgent = getAgent(db, swarmId, actor);
+  if (!actorAgent) return [];
+  const params: Array<string> = [
+    swarmId,
+    actorAgent.id,
+    actorAgent.id,
+    actor,
+    actor,
+  ];
+  if (taskId) params.push(taskId);
+  return db.prepare(`
+    SELECT
+      o.*,
+      CASE
+        WHEN o.message_id IS NULL THEN 'not-recorded'
+        WHEN d.status IS NOT NULL THEN d.status
+        WHEN m.delivered = 0 THEN 'queued'
+        ELSE 'pushed-unconfirmed'
+      END AS pickup_status,
+      d.first_injected_at,
+      d.acked_at
+    FROM handoff_offers o
+    LEFT JOIN messages m
+      ON m.id = o.message_id
+      AND m.swarm_id = o.swarm_id
+    LEFT JOIN message_deliveries d
+      ON d.message_id = o.message_id
+      AND d.swarm_id = o.swarm_id
+      AND d.recipient = o.to_agent COLLATE NOCASE
+      AND (
+        d.recipient_agent_id = o.to_agent_id
+        OR (d.recipient_agent_id IS NULL AND o.to_agent_id IS NULL)
+      )
+    WHERE o.swarm_id = ?
+      AND (
+        o.from_agent_id = ?
+        OR o.to_agent_id = ?
+        OR (o.from_agent_id IS NULL AND o.from_agent = ? COLLATE NOCASE)
+        OR (o.to_agent_id IS NULL AND o.to_agent = ? COLLATE NOCASE)
+      )
+      ${taskId ? 'AND o.task_id = ?' : ''}
+    ORDER BY o.id DESC
+  `).all(...params) as unknown as HandoffOfferView[];
+}
+
+export function getHandoffOfferHookLines(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  now: number = Date.now()
+): string[] {
+  sweepHandoffOffers(db, swarmId, now);
+  const cutoff = new Date(now - 24 * 60 * 60_000).toISOString();
+  return listHandoffOffers(db, swarmId, actor)
+    .filter(offer =>
+      offer.status === 'pending' ||
+      (
+        ['expired', 'invalidated', 'declined'].includes(offer.status) &&
+        (offer.resolved_at ?? offer.created_at) >= cutoff
+      )
+    )
+    .slice(0, 5)
+    .map(offer => {
+      if (offer.status === 'pending') {
+        const minutes = Math.max(0, Math.ceil((new Date(offer.expires_at).getTime() - now) / 60_000));
+        if (sameName(offer.to_agent, actor)) {
+          return `Handoff offer #${offer.id}: ${offer.task_id} from ${offer.from_agent}; ${minutes}m to accept — swarm handoff accept ${offer.task_id} --offer ${offer.id}`;
+        }
+        return `Handoff offer #${offer.id}: ${offer.task_id} to ${offer.to_agent}; pickup ${offer.pickup_status}; ${minutes}m remaining — swarm handoff status ${offer.task_id}`;
+      }
+      if (sameName(offer.from_agent, actor)) {
+        return `Handoff DEAD LETTER #${offer.id}: ${offer.task_id} is ${offer.status}; your source lease was not transferred — swarm handoff status ${offer.task_id}`;
+      }
+      return `Handoff offer #${offer.id}: ${offer.task_id} is ${offer.status}; no lease transfer occurred.`;
+    });
+}
+
+export async function offerTaskHandoff(
   db: SwarmDb,
   swarmId: string,
   actor: string,
   slug: string,
   targetName: string,
-  staleOk: boolean = false
-): Promise<HandoffResult> {
+  options: OfferTaskHandoffOptions = {}
+): Promise<HandoffOfferResult> {
   validateTaskSlug(slug);
+  const now = options.now ?? Date.now();
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Handoff offer time must be a finite integer millisecond timestamp.');
+  }
+  sweepHandoffOffers(db, swarmId, now);
+  const source = getAgent(db, swarmId, actor);
+  if (!source) throw new Error(`Source agent "${actor}" is not registered in this swarm.`);
   const target = getAgent(db, swarmId, targetName);
   if (!target) throw new Error(`Agent "${targetName}" not found in this swarm.`);
-  if (sameName(target.name, actor)) throw new Error('Cannot hand a task off to yourself.');
+  if (sameName(target.name, actor)) throw new Error('Cannot offer a task handoff to yourself.');
 
-  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'handoff');
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'handoff offer');
   const task = authority.task;
-  const checkpoint = latestCheckpoint(db, task);
-  if (!checkpoint || !fs.existsSync(checkpoint.path)) {
-    throw new Error(`Task "${slug}" has no readable checkpoint. Run "swarm task checkpoint ${slug}" before handoff.`);
+  if (task.owner_agent_id !== source.id) {
+    throw new Error(
+      `Refused handoff offer: task "${slug}" owner registration ${task.owner_agent_id ?? 'legacy/unrecorded'} ` +
+      `does not match source registration ${source.id}.`
+    );
   }
-  const ageMinutes = Math.floor((Date.now() - new Date(checkpoint.event.created_at).getTime()) / 60_000);
+  const checkpoint = requireCurrentOwnerCheckpoint(latestCheckpoint(db, task), task);
+  const ageMinutes = Math.floor((now - new Date(checkpoint.event.created_at).getTime()) / 60_000);
+  if (ageMinutes < 0) {
+    throw new Error(
+      `Refused handoff offer because the supplied clock precedes the current checkpoint ` +
+      `(${new Date(now).toISOString()} < ${checkpoint.event.created_at}).`
+    );
+  }
   const stale = ageMinutes > HANDOFF_FRESH_MINUTES;
-  if (stale && !staleOk) {
+  if (stale && !options.staleOk) {
     throw new Error(`Task "${slug}" checkpoint is ${ageMinutes}m old; handoff requires one within ${HANDOFF_FRESH_MINUTES}m. Checkpoint now or re-run with --stale-ok.`);
   }
+  const ttl = options.ttl ?? HANDOFF_OFFER_DEFAULT_TTL;
+  const ttlMs = parseHandoffOfferTtl(ttl);
+  if (Math.abs(now + ttlMs) > 8.64e15) {
+    throw new Error(`Invalid handoff --ttl "${ttl}": expiry is outside the supported date range.`);
+  }
+  const createdAt = new Date(now).toISOString();
+  const expiresAt = new Date(now + ttlMs).toISOString();
 
   const facts = taskGitFacts(task);
   const title = `${stale ? 'STALE ' : ''}${task.title.replace(/[\r\n]+/g, ' ')}`;
-  const checkpointBody = fs.readFileSync(checkpoint.path, 'utf-8');
-  const briefDir = path.join(swarmHome(), 'briefs', 'handoffs');
+  const checkpointBody = checkpoint.body;
+  const briefDir = path.join(swarmHome(), 'briefs', 'handoff-offers');
   fs.mkdirSync(briefDir, { recursive: true });
-  const briefPath = path.join(briefDir, `${slug}--${minuteStamp(new Date())}.md`);
+  const briefPath = path.join(
+    briefDir,
+    `${slug}--${minuteStamp(new Date(now))}--${randomUUID()}.md`
+  );
   const brief = `# ${title}
+
+## handoff contract
+- from: ${actor}
+- to: ${target.name}
+- source registration id: ${source.id}
+- recipient registration id: ${target.id}
+- source lease epoch: ${task.lease_epoch}
+- pickup deadline: ${expiresAt}
+- acceptance command: swarm handoff accept ${task.id}
+- authority rule: the source owner retains the lease until the named recipient accepts this exact charter
 
 ## task facts
 - slug: ${task.id}
 - state: ${task.state}
 - owner: ${task.owner_agent ?? 'unowned'}
-- lease epoch before handoff: ${task.lease_epoch}
 - repo: ${task.repo_path ?? 'none'}
 - branch: ${task.branch ?? 'none'}
 - worktree: ${task.worktree_path ?? 'none'}
@@ -1398,46 +2221,432 @@ ${task.transcript_hint ?? 'not available'}
 
 ## latest checkpoint (verbatim)
 ${checkpointBody}`;
-  fs.writeFileSync(briefPath, brief, 'utf-8');
+  const charterSha256 = sha256(brief);
+  fs.writeFileSync(briefPath, brief, { encoding: 'utf-8', flag: 'wx' });
 
-  const transferred = withImmediateTransaction(db, () => {
+  const offered = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'handoff', now);
+    const currentSource = requireActiveAgent(db, swarmId, actor, 'handoff offer');
+    const currentTarget = getAgent(db, swarmId, target.name);
+    if (!currentTarget || currentTarget.id !== target.id) {
+      return {
+        error:
+          `Recipient ${target.name} registration changed before the offer committed. ` +
+          'Resolve the current member and issue a fresh offer.',
+      };
+    }
     const current = getTask(db, swarmId, slug);
-    if (!current || !sameName(current.owner_agent, actor) || current.lease_epoch !== authority.epoch) {
+    if (
+      !current ||
+      current.owner_agent_id !== currentSource.id ||
+      currentSource.id !== source.id ||
+      current.lease_epoch !== authority.epoch
+    ) {
       if (current) {
         insertEvent(db, current, 'refused_stale_epoch', actor, {
-          verb: 'handoff',
+          verb: 'handoff offer',
           owner_agent: current.owner_agent,
+          owner_agent_id: current.owner_agent_id,
+          actor_agent_id: currentSource.id,
           current_epoch: current.lease_epoch,
           presented_epoch: authority.epoch,
         });
-        return { error: staleAuthorityMessage(current, actor, 'handoff', authority.epoch) };
+        return { error: staleAuthorityMessage(current, actor, 'handoff offer', authority.epoch) };
       }
       return { error: `Task "${slug}" not found in this swarm.` };
     }
-    const nextEpoch = current.lease_epoch + 1;
-    const timestamp = nowIso();
-    db.prepare(`
-      UPDATE tasks SET owner_agent = ?, lease_epoch = ?, lease_expires_at = ?, updated_at = ?
-      WHERE swarm_id = ? AND id = ?
-    `).run(target.name, nextEpoch, leaseExpiry(), timestamp, swarmId, slug);
-    const next = getTask(db, swarmId, slug);
-    if (!next) return { error: `Failed to transfer task "${slug}".` };
-    insertEvent(db, next, 'handoff', actor, {
+    const existing = db.prepare(`
+      SELECT id FROM handoff_offers
+      WHERE swarm_id = ? AND task_id = ? AND status = 'pending'
+    `).get(swarmId, slug) as { id: number } | undefined;
+    if (existing) {
+      return {
+        error:
+          `Task "${slug}" already has pending handoff offer #${existing.id}. ` +
+          `Accept, decline, cancel, or let it expire before creating another.`,
+      };
+    }
+    const inserted = db.prepare(`
+      INSERT INTO handoff_offers (
+        swarm_id, task_id, from_agent, to_agent, from_agent_id, to_agent_id, source_epoch,
+        brief_path, charter_sha256, status, created_at, expires_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+    `).run(
+      swarmId,
+      slug,
+      actor,
+      target.name,
+      source.id,
+      target.id,
+      authority.epoch,
+      briefPath,
+      charterSha256,
+      createdAt,
+      expiresAt
+    );
+    const offer = getHandoffOffer(db, swarmId, Number(inserted.lastInsertRowid));
+    if (!offer) return { error: `Failed to create a handoff offer for "${slug}".` };
+    insertEvent(db, current, 'handoff_offered', actor, {
+      offer_id: offer.id,
       to: target.name,
+      from_agent_id: source.id,
+      to_agent_id: target.id,
+      source_epoch: authority.epoch,
       brief_path: briefPath,
+      charter_sha256: charterSha256,
+      expires_at: expiresAt,
       stale,
       checkpoint_age_minutes: ageMinutes,
-    }, timestamp);
-    return { task: next };
-  }) as { task?: Task; error?: string };
-  if (transferred.error || !transferred.task) throw new Error(transferred.error ?? `Failed to hand off task "${slug}".`);
-
-  const body = `Handoff ${slug}: ${briefPath.replace(/[\r\n]+/g, ' ')} — ${title}`;
-  const delivery = await sendMessage(db, swarmId, actor, target.name, body, undefined, 'handoff');
-  if (!delivery.delivered && !delivery.queued) {
-    throw new Error(`Task authority transferred, but handoff pointer delivery failed: ${delivery.message}`);
+    }, createdAt);
+    const body =
+      `Handoff offer #${offer.id} for ${slug}; accept by ${expiresAt} with ` +
+      `swarm handoff accept ${slug} --offer ${offer.id}; ` +
+      `charter sha256=${charterSha256}; brief=${briefPath.replace(/[\r\n]+/g, ' ')}`;
+    const messageId = enqueueDirectMessage(
+      db,
+      swarmId,
+      currentSource.name,
+      target.name,
+      body,
+      {
+        createdAt,
+        kind: 'handoff',
+        fromAgentId: currentSource.id,
+        recipientAgentId: target.id,
+      }
+    );
+    db.prepare(`
+      UPDATE handoff_offers SET message_id = ?
+      WHERE swarm_id = ? AND id = ? AND status = 'pending'
+    `).run(messageId, swarmId, offer.id);
+    return {
+      offer: getHandoffOffer(db, swarmId, offer.id) ?? offer,
+      messageId,
+    };
+  }) as { offer?: HandoffOffer; messageId?: number; error?: string };
+  if (offered.error || !offered.offer) {
+    throw new Error(
+      `${offered.error ?? `Failed to offer task "${slug}".`} Unreferenced charter preserved at ${briefPath}.`
+    );
   }
-  return { task: transferred.task, briefPath, stale, message: delivery.message };
+
+  if (options.failpoint === 'after-commit-before-push') {
+    throw new Error(
+      `Injected crash after durable handoff offer #${offered.offer.id} commit and before outbox push.`
+    );
+  }
+  const delivery = await flushMessageOutbox(db, [offered.messageId!]);
+  const offer = getHandoffOffer(db, swarmId, offered.offer.id) ?? offered.offer;
+  return {
+    offer,
+    task,
+    briefPath,
+    stale,
+    message: delivery.pushed > 0
+      ? `Message sent to ${target.name}`
+      : `Handoff offer is durable; pointer queued in outbox for ${target.name}.`,
+  };
+}
+
+function verifyHandoffCharter(offer: HandoffOffer): string | null {
+  if (!fs.existsSync(offer.brief_path)) return 'charter file is missing';
+  try {
+    const digest = sha256(fs.readFileSync(offer.brief_path, 'utf-8'));
+    return digest === offer.charter_sha256
+      ? null
+      : `charter digest mismatch (expected ${offer.charter_sha256}, got ${digest})`;
+  } catch (error: unknown) {
+    return `charter could not be read: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+
+export async function acceptTaskHandoff(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  slug: string,
+  options: ResolveHandoffOfferOptions = {}
+): Promise<HandoffOfferResolutionResult> {
+  validateTaskSlug(slug);
+  const now = options.now ?? Date.now();
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Handoff acceptance time must be a finite integer millisecond timestamp.');
+  }
+  sweepHandoffOffers(db, swarmId, now);
+  const selected = pendingHandoffOffer(db, swarmId, slug, actor, 'recipient', options.offerId);
+  if (!selected) {
+    throw new Error(`No handoff offer for task "${slug}" is addressed to ${actor}.`);
+  }
+  if (selected.status !== 'pending') {
+    throw new Error(`Handoff offer #${selected.id} is ${selected.status}; it cannot transfer a lease.`);
+  }
+
+  const resolved = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'handoff', now);
+    const offer = getHandoffOffer(db, swarmId, selected.id);
+    const task = getTask(db, swarmId, slug);
+    if (!offer || offer.status !== 'pending') {
+      return { error: `Handoff offer #${selected.id} is no longer pending.` };
+    }
+    if (!task) return { error: `Task "${slug}" not found in this swarm.` };
+    const acceptedAt = new Date(now).toISOString();
+    const recipient = getAgent(db, swarmId, actor);
+    if (!recipient || offer.to_agent_id === null || recipient.id !== offer.to_agent_id) {
+      transitionStaleHandoffOffer(db, offer, 'invalidated', task, acceptedAt, {
+        reason: 'named recipient registration changed before acceptance',
+        expected_recipient_agent_id: offer.to_agent_id,
+        current_recipient_agent_id: recipient?.id ?? null,
+      });
+      return {
+        error:
+          `Handoff offer #${offer.id} was invalidated because ${actor}'s agent registration changed. ` +
+          'The source owner must issue a fresh offer.',
+      };
+    }
+    if (offer.expires_at <= acceptedAt) {
+      transitionStaleHandoffOffer(db, offer, 'expired', task, acceptedAt, {
+        reason: 'recipient acceptance arrived after the pickup deadline',
+      });
+      return { error: `Handoff offer #${offer.id} expired at ${offer.expires_at}; the source lease was not transferred.` };
+    }
+    if (
+      task.owner_agent_id === null ||
+      offer.from_agent_id === null ||
+      task.owner_agent_id !== offer.from_agent_id ||
+      task.lease_epoch !== offer.source_epoch
+    ) {
+      transitionStaleHandoffOffer(db, offer, 'invalidated', task, acceptedAt, {
+        reason: 'source task authority changed before acceptance',
+        current_owner: task.owner_agent,
+        current_owner_agent_id: task.owner_agent_id,
+        current_epoch: task.lease_epoch,
+      });
+      return { error: `Handoff offer #${offer.id} was invalidated because task authority changed.` };
+    }
+    const charterError = verifyHandoffCharter(offer);
+    if (charterError) {
+      transitionStaleHandoffOffer(db, offer, 'invalidated', task, acceptedAt, {
+        reason: charterError,
+      });
+      return {
+        error:
+          `Handoff offer #${offer.id} was invalidated: ${charterError}. ` +
+          `The source lease was not transferred.`,
+      };
+    }
+
+    const nextEpoch = task.lease_epoch + 1;
+    db.prepare(`
+      UPDATE tasks
+      SET owner_agent = ?, owner_agent_id = ?, lease_epoch = ?, lease_expires_at = ?, updated_at = ?
+      WHERE swarm_id = ? AND id = ?
+    `).run(
+      recipient.name,
+      recipient.id,
+      nextEpoch,
+      leaseExpiry(now),
+      acceptedAt,
+      swarmId,
+      slug
+    );
+    db.prepare(`
+      UPDATE handoff_offers
+      SET status = 'accepted', resolved_at = ?, resolved_by = ?, accepted_epoch = ?
+      WHERE swarm_id = ? AND id = ? AND status = 'pending'
+    `).run(acceptedAt, actor, nextEpoch, swarmId, offer.id);
+    const nextTask = getTask(db, swarmId, slug);
+    const nextOffer = getHandoffOffer(db, swarmId, offer.id);
+    if (!nextTask || !nextOffer) return { error: `Failed to accept handoff offer #${offer.id}.` };
+    insertEvent(db, nextTask, 'handoff_accepted', actor, {
+      offer_id: offer.id,
+      from: offer.from_agent,
+      to: actor,
+      from_agent_id: offer.from_agent_id,
+      to_agent_id: recipient.id,
+      source_epoch: offer.source_epoch,
+      accepted_epoch: nextEpoch,
+      brief_path: offer.brief_path,
+      charter_sha256: offer.charter_sha256,
+    }, acceptedAt);
+    const notificationId = enqueueDirectMessage(
+      db,
+      swarmId,
+      recipient.name,
+      offer.from_agent,
+      `Accepted handoff offer #${offer.id} for ${slug}; lease epoch is now ${nextTask.lease_epoch}; ` +
+      `charter sha256=${offer.charter_sha256}.`,
+      {
+        createdAt: acceptedAt,
+        kind: 'handoff',
+        fromAgentId: recipient.id,
+        recipientAgentId: offer.from_agent_id,
+      }
+    );
+    return { task: nextTask, offer: nextOffer, notificationId };
+  }) as { task?: Task; offer?: HandoffOffer; notificationId?: number; error?: string };
+  if (resolved.error || !resolved.task || !resolved.offer) {
+    throw new Error(resolved.error ?? `Failed to accept handoff offer #${selected.id}.`);
+  }
+
+  if (options.failpoint === 'after-commit-before-push') {
+    throw new Error(
+      `Injected crash after durable handoff acceptance #${selected.id} commit and before outbox push.`
+    );
+  }
+  const delivery = await flushMessageOutbox(db, [resolved.notificationId!]);
+  return {
+    offer: resolved.offer,
+    task: resolved.task,
+    message:
+      delivery.pushed > 0
+        ? `Message sent to ${selected.from_agent}`
+        : `Acceptance is durable; sender notification is queued in the outbox.`,
+  };
+}
+
+export async function declineTaskHandoff(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  slug: string,
+  options: ResolveHandoffOfferOptions = {}
+): Promise<HandoffOfferResolutionResult> {
+  validateTaskSlug(slug);
+  const now = options.now ?? Date.now();
+  sweepHandoffOffers(db, swarmId, now);
+  const selected = pendingHandoffOffer(db, swarmId, slug, actor, 'recipient', options.offerId);
+  if (!selected) throw new Error(`No handoff offer for task "${slug}" is addressed to ${actor}.`);
+  if (selected.status !== 'pending') {
+    throw new Error(`Handoff offer #${selected.id} is ${selected.status}; it cannot be declined.`);
+  }
+  const resolvedAt = new Date(now).toISOString();
+  const reason = options.reason?.replace(/\s+/g, ' ').trim() || 'recipient declined';
+  const result = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'handoff', now);
+    const offer = getHandoffOffer(db, swarmId, selected.id);
+    const task = getTask(db, swarmId, slug);
+    if (!offer || offer.status !== 'pending') return { error: `Handoff offer #${selected.id} is no longer pending.` };
+    if (!task) return { error: `Task "${slug}" not found in this swarm.` };
+    const recipient = getAgent(db, swarmId, actor);
+    if (
+      !recipient ||
+      offer.to_agent_id === null ||
+      recipient.id !== offer.to_agent_id ||
+      offer.from_agent_id === null
+    ) {
+      transitionStaleHandoffOffer(db, offer, 'invalidated', task, resolvedAt, {
+        reason: 'named recipient registration changed before decline',
+        expected_recipient_agent_id: offer.to_agent_id,
+        current_recipient_agent_id: recipient?.id ?? null,
+      });
+      return {
+        error:
+          `Handoff offer #${offer.id} was invalidated because ${actor}'s agent registration changed.`
+      };
+    }
+    db.prepare(`
+      UPDATE handoff_offers
+      SET status = 'declined', resolved_at = ?, resolved_by = ?
+      WHERE swarm_id = ? AND id = ? AND status = 'pending'
+    `).run(resolvedAt, actor, swarmId, offer.id);
+    insertEvent(db, task, 'handoff_declined', actor, {
+      offer_id: offer.id,
+      from: offer.from_agent,
+      to: offer.to_agent,
+      source_epoch: offer.source_epoch,
+      charter_sha256: offer.charter_sha256,
+      reason,
+    }, resolvedAt);
+    const notificationId = enqueueDirectMessage(
+      db,
+      swarmId,
+      recipient.name,
+      offer.from_agent,
+      `Declined handoff offer #${offer.id} for ${slug}; source lease remains unchanged; reason=${reason}.`,
+      {
+        createdAt: resolvedAt,
+        kind: 'handoff',
+        fromAgentId: recipient.id,
+        recipientAgentId: offer.from_agent_id,
+      }
+    );
+    return { offer: getHandoffOffer(db, swarmId, offer.id), task, notificationId };
+  }) as {
+    offer?: HandoffOffer | null;
+    task?: Task;
+    notificationId?: number;
+    error?: string;
+  };
+  if (result.error || !result.offer || !result.task) {
+    throw new Error(result.error ?? `Failed to decline handoff offer #${selected.id}.`);
+  }
+  const delivery = await flushMessageOutbox(db, [result.notificationId!]);
+  return {
+    offer: result.offer,
+    task: result.task,
+    message:
+      delivery.pushed > 0
+        ? `Message sent to ${selected.from_agent}`
+        : `Decline is durable; sender notification is queued in the outbox.`,
+  };
+}
+
+export function cancelTaskHandoff(
+  db: SwarmDb,
+  swarmId: string,
+  actor: string,
+  slug: string,
+  options: ResolveHandoffOfferOptions = {}
+): HandoffOfferResolutionResult {
+  validateTaskSlug(slug);
+  const now = options.now ?? Date.now();
+  sweepHandoffOffers(db, swarmId, now);
+  const selected = pendingHandoffOffer(db, swarmId, slug, actor, 'sender', options.offerId);
+  if (!selected) throw new Error(`No handoff offer for task "${slug}" was sent by ${actor}.`);
+  if (selected.status !== 'pending') {
+    throw new Error(`Handoff offer #${selected.id} is ${selected.status}; it cannot be cancelled.`);
+  }
+  const source = getAgent(db, swarmId, actor);
+  if (!source || selected.from_agent_id === null || source.id !== selected.from_agent_id) {
+    throw new Error(
+      `Handoff offer #${selected.id} belongs to a different ${actor} registration; ` +
+      'let it expire or have the original source registration cancel it.'
+    );
+  }
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'handoff cancel', selected.source_epoch);
+  const resolvedAt = new Date(now).toISOString();
+  const reason = options.reason?.replace(/\s+/g, ' ').trim() || 'sender cancelled';
+  const result = withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'handoff', now);
+    const offer = getHandoffOffer(db, swarmId, selected.id);
+    const task = getTask(db, swarmId, slug);
+    if (!offer || offer.status !== 'pending') return { error: `Handoff offer #${selected.id} is no longer pending.` };
+    if (
+      !task ||
+      task.owner_agent_id !== source.id ||
+      task.lease_epoch !== authority.epoch
+    ) {
+      return { error: task ? staleAuthorityMessage(task, actor, 'handoff cancel', authority.epoch) : `Task "${slug}" not found.` };
+    }
+    db.prepare(`
+      UPDATE handoff_offers
+      SET status = 'cancelled', resolved_at = ?, resolved_by = ?
+      WHERE swarm_id = ? AND id = ? AND status = 'pending'
+    `).run(resolvedAt, actor, swarmId, offer.id);
+    insertEvent(db, task, 'handoff_cancelled', actor, {
+      offer_id: offer.id,
+      from: offer.from_agent,
+      to: offer.to_agent,
+      source_epoch: offer.source_epoch,
+      charter_sha256: offer.charter_sha256,
+      reason,
+    }, resolvedAt);
+    return { offer: getHandoffOffer(db, swarmId, offer.id), task };
+  }) as { offer?: HandoffOffer | null; task?: Task; error?: string };
+  if (result.error || !result.offer || !result.task) {
+    throw new Error(result.error ?? `Failed to cancel handoff offer #${selected.id}.`);
+  }
+  return { offer: result.offer, task: result.task, message: 'Cancellation recorded.' };
 }
 
 export function recordDecision(
@@ -1446,30 +2655,135 @@ export function recordDecision(
   actor: string,
   body: string,
   taskId?: string,
-  supersedes?: number
+  supersedes?: number,
+  now: number = Date.now()
 ): DecisionResult {
   const text = body.replace(/\s+/g, ' ').trim();
   if (!text) throw new Error('Decision text cannot be empty.');
-  if (taskId) {
-    validateTaskSlug(taskId);
-    if (!getTask(db, swarmId, taskId)) throw new Error(`Task "${taskId}" not found in this swarm.`);
+  if (taskId) validateTaskSlug(taskId);
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Decision time must be a finite integer millisecond timestamp.');
+  }
+  const actorAgent = requireActiveAgent(db, swarmId, actor, 'record decision');
+  const authority = taskId
+    ? requireTaskAuthority(db, swarmId, taskId, actor, 'record decision')
+    : null;
+  if (!taskId) {
+    requireSwarmAuthority(db, swarmId, actor, 'record program decision');
   }
   return withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'decision', now);
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'record decision');
+    if (currentActor.id !== actorAgent.id) {
+      throw new Error(`Refused decision: ${actor}'s registration changed before commit.`);
+    }
+    let task: Task | null = null;
+    if (taskId && authority) {
+      task = getTask(db, swarmId, taskId);
+      if (
+        !task ||
+        currentActor.id !== actorAgent.id ||
+        task.owner_agent_id !== actorAgent.id ||
+        task.lease_epoch !== authority.epoch
+      ) {
+        if (task) {
+          insertEvent(db, task, 'refused_stale_epoch', actor, {
+            verb: 'record decision',
+            owner_agent: task.owner_agent,
+            owner_agent_id: task.owner_agent_id,
+            actor_agent_id: currentActor.id,
+            current_epoch: task.lease_epoch,
+            presented_epoch: authority.epoch,
+          });
+        }
+        throw new Error(
+          task
+            ? staleAuthorityMessage(task, actor, 'record decision', authority.epoch)
+            : `Task "${taskId}" not found in this swarm.`
+        );
+      }
+    } else {
+      requireSwarmAuthority(db, swarmId, actor, 'record program decision');
+    }
     if (supersedes !== undefined) {
-      const previous = db.prepare('SELECT id FROM decisions WHERE id = ? AND swarm_id = ?')
-        .get(supersedes, swarmId);
+      const previous = db.prepare(`
+        SELECT id, made_by, actor_agent_id, task_id, status FROM decisions
+        WHERE id = ? AND swarm_id = ?
+      `).get(supersedes, swarmId) as {
+        id: number;
+        made_by: string;
+        actor_agent_id: string | null;
+        task_id: string | null;
+        status: string;
+      } | undefined;
       if (!previous) throw new Error(`Decision #${supersedes} does not exist in this swarm.`);
+      if (previous.status !== 'active') {
+        throw new Error(
+          `Decision #${supersedes} is ${previous.status}; only an active decision may be superseded.`
+        );
+      }
+      if (previous.actor_agent_id === null || previous.actor_agent_id !== actorAgent.id) {
+        throw new Error(
+          `Decision #${supersedes} belongs to registration ` +
+          `${previous.actor_agent_id ?? 'legacy/unrecorded'} (${previous.made_by}); ` +
+          'only that exact active author registration may supersede it.'
+        );
+      }
+      if ((previous.task_id ?? null) !== (taskId ?? null)) {
+        throw new Error(
+          `Decision #${supersedes} belongs to ${previous.task_id ? `task "${previous.task_id}"` : 'program scope'}; ` +
+          'a superseding decision must keep the same scope.'
+        );
+      }
+      const existingSuccessor = db.prepare(`
+        SELECT id FROM decisions
+        WHERE swarm_id = ? AND supersedes = ?
+        ORDER BY id ASC
+        LIMIT 1
+      `).get(swarmId, supersedes) as { id: number } | undefined;
+      if (existingSuccessor) {
+        throw new Error(
+          `Decision #${supersedes} already has successor #${existingSuccessor.id}; ` +
+          'the single-successor slot is closed.'
+        );
+      }
     }
-    const createdAt = nowIso();
+    const createdAt = new Date(now).toISOString();
     const result = db.prepare(`
-      INSERT INTO decisions (swarm_id, task_id, body, made_by, supersedes, status, created_at)
-      VALUES (?, ?, ?, ?, ?, 'active', ?)
-    `).run(swarmId, taskId ?? null, text, actor, supersedes ?? null, createdAt);
+      INSERT INTO decisions (
+        swarm_id, task_id, body, made_by, actor_agent_id, task_epoch,
+        supersedes, status, created_at
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?)
+    `).run(
+      swarmId,
+      taskId ?? null,
+      text,
+      actorAgent.name,
+      actorAgent.id,
+      authority?.epoch ?? null,
+      supersedes ?? null,
+      createdAt
+    );
+    const decisionId = Number(result.lastInsertRowid);
     if (supersedes !== undefined) {
-      db.prepare("UPDATE decisions SET status = 'superseded' WHERE id = ? AND swarm_id = ?")
-        .run(supersedes, swarmId);
+      const superseded = db.prepare(`
+        UPDATE decisions SET status = 'superseded'
+        WHERE id = ? AND swarm_id = ? AND status = 'active'
+      `).run(supersedes, swarmId);
+      if (Number(superseded.changes) !== 1) {
+        throw new Error(`Decision #${supersedes} no longer has an active single-successor slot.`);
+      }
     }
-    return { id: Number(result.lastInsertRowid) };
+    if (task) {
+      insertEvent(db, task, 'decision_recorded', actor, {
+        decision_id: decisionId,
+        actor_agent_id: actorAgent.id,
+        task_epoch: authority!.epoch,
+        supersedes: supersedes ?? null,
+      }, createdAt);
+    }
+    return { id: decisionId };
   }) as DecisionResult;
 }
 
@@ -1491,11 +2805,13 @@ export function getActiveTaskHookLines(
   actor: string,
   at: Date = new Date()
 ): string[] {
+  const actorAgent = getAgent(db, swarmId, actor);
+  if (!actorAgent) return [];
   const tasks = db.prepare(`
     SELECT * FROM tasks
-    WHERE swarm_id = ? AND owner_agent = ? COLLATE NOCASE AND state = 'active'
+    WHERE swarm_id = ? AND owner_agent_id = ? AND state = 'active'
     ORDER BY updated_at ASC, id ASC
-  `).all(swarmId, actor) as unknown as Task[];
+  `).all(swarmId, actorAgent.id) as unknown as Task[];
 
   const lines: string[] = [];
   for (const task of tasks) {

@@ -2,9 +2,16 @@ import { withImmediateTransaction, type SwarmDb } from './db.js';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { sendMessage } from './mailbox.js';
-import { getAgent, listAgents } from './registry.js';
-import { getTask, taskGitFacts, validateTaskSlug, type Task } from './tasks.js';
+import { enqueueDirectMessage, flushMessageOutbox } from './mailbox.js';
+import { getAgent, listAgents, type Agent } from './registry.js';
+import {
+  getTask,
+  requireTaskAuthority,
+  taskGitFacts,
+  validateTaskSlug,
+  type Task,
+} from './tasks.js';
+import { requireActiveAgent } from './authority.js';
 
 const RECENT_EVENT_LIMIT = 12;
 
@@ -215,12 +222,13 @@ export async function escalateTask(
   options: EscalateOptions = {}
 ): Promise<EscalationResult> {
   validateTaskSlug(slug);
-  const task = getTask(db, swarmId, slug);
-  if (!task) throw new Error(`Task "${slug}" not found in this swarm.`);
+  const authority = requireTaskAuthority(db, swarmId, slug, actor, 'escalate');
+  const task = authority.task;
   const checkpoint = latestCheckpoint(db, task);
   const question = resolveQuestion(task, options.question, checkpoint.body);
 
   let recipient: string | null = null;
+  let recipientAgent: Agent | null = null;
   if (options.to) {
     const target = getAgent(db, swarmId, options.to);
     if (!target) throw new Error(`Agent "${options.to}" not found in this swarm. Run "swarm members" and retry --to.`);
@@ -231,13 +239,15 @@ export async function escalateTask(
       );
     }
     recipient = target.name;
+    recipientAgent = target;
   } else {
     const agents = await listAgents(db, swarmId);
     // Never route an escalation to its own sender: in a fresh one-agent swarm
     // the old first-joined fallback picked the escalator itself, ghost-delivering
     // (pushed to the terminal but inbox-filtered as an own-message, unackable).
     // No other agent live -> the manual-delivery path below.
-    recipient = agents.find(agent => agent.name.toLowerCase() !== actor.toLowerCase())?.name ?? null;
+    recipientAgent = agents.find(agent => agent.name.toLowerCase() !== actor.toLowerCase()) ?? null;
+    recipient = recipientAgent?.name ?? null;
   }
 
   const now = options.now ?? new Date();
@@ -247,31 +257,69 @@ export async function escalateTask(
   fs.writeFileSync(briefPath, packetBody(db, task, checkpoint, question), 'utf-8');
 
   const updated = withImmediateTransaction(db, () => {
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'escalate');
+    if (recipientAgent) {
+      const currentRecipient = getAgent(db, swarmId, recipientAgent.name);
+      if (!currentRecipient || currentRecipient.id !== recipientAgent.id) {
+        throw new Error(
+          `Escalation recipient "${recipientAgent.name}" registration changed while the packet was prepared. ` +
+          `Re-run swarm escalate ${slug}.`
+        );
+      }
+    }
     const current = getTask(db, swarmId, slug);
-    if (!current) throw new Error(`Task "${slug}" not found in this swarm.`);
+    if (
+      !current ||
+      current.owner_agent_id !== currentActor.id ||
+      currentActor.id !== task.owner_agent_id ||
+      current.lease_epoch !== authority.epoch
+    ) {
+      throw new Error(
+        `Task "${slug}" authority changed while the escalation packet was being prepared. ` +
+        `Re-run swarm escalate ${slug}.`
+      );
+    }
     const createdAt = now.toISOString();
     db.prepare(`
       UPDATE tasks SET state = 'awaiting_review', updated_at = ?
       WHERE swarm_id = ? AND id = ?
     `).run(createdAt, swarmId, slug);
     db.prepare(`
-      INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
-      VALUES (?, ?, ?, 'escalated', ?, ?, ?)
-    `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
+      INSERT INTO task_events (
+        swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+      ) VALUES (?, ?, ?, 'escalated', ?, ?, ?, ?)
+    `).run(swarmId, slug, current.lease_epoch, currentActor.name, currentActor.id, JSON.stringify({
       brief_path: briefPath,
       question,
       to: recipient,
+      to_agent_id: recipientAgent?.id ?? null,
     }), createdAt);
-    return getTask(db, swarmId, slug)!;
-  }) as Task;
+    const messageId = recipientAgent
+      ? enqueueDirectMessage(
+        db,
+        swarmId,
+        currentActor.name,
+        recipientAgent.name,
+        briefPath,
+        {
+          createdAt,
+          kind: 'escalation',
+          fromAgentId: currentActor.id,
+          recipientAgentId: recipientAgent.id,
+        }
+      )
+      : null;
+    return { task: getTask(db, swarmId, slug)!, messageId };
+  }) as { task: Task; messageId: number | null };
 
-  let messageId: number | null = null;
-  if (recipient) {
-    const delivery = await sendMessage(db, swarmId, actor, recipient, briefPath, undefined, 'escalation');
-    if (!delivery.delivered && !delivery.queued) {
-      throw new Error(`Escalation packet was written to ${briefPath}, but pointer delivery failed: ${delivery.message}`);
-    }
-    messageId = delivery.messageId ?? null;
+  if (updated.messageId !== null) {
+    await flushMessageOutbox(db, [updated.messageId]);
   }
-  return { task: updated, briefPath, question, recipient, messageId };
+  return {
+    task: updated.task,
+    briefPath,
+    question,
+    recipient,
+    messageId: updated.messageId,
+  };
 }

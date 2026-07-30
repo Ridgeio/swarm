@@ -4,6 +4,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { REPO_DIR } from './version.js';
+import { sweepHandoffOffers } from './tasks.js';
+import { sweepRequiredResponses } from './mailbox.js';
 
 const MODULE_ROOT = REPO_DIR;
 const DEFAULT_CONTROLS_PATH = path.join(MODULE_ROOT, 'docs', 'controls.md');
@@ -795,7 +797,8 @@ export function runJanitorTick(
 
   const started = performance.now();
   try {
-    const tickAt = new Date(options.now ?? Date.now()).toISOString();
+    const tickNow = options.now ?? Date.now();
+    const tickAt = new Date(tickNow).toISOString();
     checkSwarmVersion(db, {
       now: options.now,
       repoDir: options.versionRepoDir,
@@ -806,6 +809,16 @@ export function runJanitorTick(
     const findings = new Map<string, Finding>();
     const kvUpdates = new Map<string, string>();
     const counters = emptyCounters();
+
+    // Deadline enforcement is fleet-wide, not dependent on either handoff
+    // party opening a hook. Each sweep is idempotent and writes its expiry
+    // notifications to the durable outbox in the same transaction.
+    const swarms = db.prepare('SELECT id FROM swarms ORDER BY id ASC')
+      .all() as Array<{ id: string }>;
+    for (const swarm of swarms) {
+      sweepHandoffOffers(db, swarm.id, tickNow);
+      sweepRequiredResponses(db, swarm.id, tickNow);
+    }
 
     scanWorkerEpochs(db, findings, kvUpdates);
     scanControls(
@@ -872,7 +885,7 @@ export function shouldSpawnJanitorTick(status: JanitorStatus | null, now: number
   return !status || now - new Date(status.lastTickAt).getTime() > JANITOR_TICK_STALENESS_MS;
 }
 
-/** Fire-and-forget an observe-only janitor tick (no-op if spawn fails). */
+/** Fire-and-forget a janitor census/deadline tick (no-op if spawn fails). */
 export function spawnJanitorTick(): void {
   // Node's test runner marks test workers with this internal context. Tests use
   // the injected spawn seam above; suppressing real detached children prevents

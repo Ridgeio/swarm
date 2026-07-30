@@ -68,6 +68,15 @@ function runCli(home: string, args: string[], env: Record<string, string> = {}):
   }
 }
 
+function joinedSendPayload(log: string, workspace: string, surface: string): string {
+  const prefix = `send --workspace ${workspace} --surface ${surface} `;
+  return log
+    .split(/\r?\n/)
+    .filter(line => line.startsWith(prefix))
+    .map(line => line.slice(prefix.length))
+    .join('');
+}
+
 describe('T8 CLI cmux layout discipline', () => {
   test('board --tab splits by default while --own-workspace preserves the named path', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t8-board-'));
@@ -78,8 +87,10 @@ describe('T8 CLI cmux layout discipline', () => {
       assert.strictEqual(split.status, 0, split.stderr || split.stdout);
       let log = fs.readFileSync(fixture.log, 'utf-8');
       assert.match(log, /^new-split right$/m);
-      assert.match(log, /send --workspace workspace:9 --surface surface:2 .*swarm board$/m);
-      assert.match(log, /send --workspace workspace:9 --surface surface:2  --watch 7$/m);
+      assert.strictEqual(
+        joinedSendPayload(log, 'workspace:9', 'surface:2'),
+        `cd '${process.cwd()}' && swarm board --watch 7`
+      );
 
       fs.writeFileSync(fixture.log, '');
       const own = runCli(path.join(root, 'home-own'), ['board', '--tab', '--own-workspace'], env);

@@ -129,16 +129,26 @@ swarm reset --all
 2. **When starting a task**: Run `swarm status --set "description of what I'm doing"`
 3. **When you need help**: Send a targeted message to the right agent, or broadcast if unsure who can help.
 4. **When you finish a task**: Notify anyone who was waiting on it via `swarm send`.
-5. **When you receive a message**: Read it. If it requires action, do it (or explain why you can't). If it's informational, acknowledge briefly.
+5. **When you receive a message**: Read it. If it requires action, act. If it is informational, do not send a receipt-only reply; delivery acknowledgement is metadata.
 
 ### Responding to Messages
-When a message appears in your terminal as `[SWARM from <name>]: <text>`, treat it as a direct request or communication from that agent. Respond naturally. If you need to reply, use `swarm send <name> "your reply"`.
+When a message appears in your terminal as `[SWARM from <name>]: <text>`, treat it as a direct request or communication from that agent. Reply only with a result, a decision-bearing question, or a true blocker. If a reply is needed, use `swarm send <name> "your reply"`.
 
 ## Rules
 - Be concise in messages. Other agents have limited context windows too.
 - Don't argue over messages. If there's a disagreement, one message each, then move on.
 - If an agent doesn't respond after one message, they may be busy. Check with `swarm read` before resending when that agent is a local terminal agent.
 - This is a trusted environment. All agents can read each other's terminal output. Don't put secrets in your terminal that you wouldn't want other agents to see.
+
+## Quiet goals and inactive recipients
+
+- One goal produces one condition-complete final evidence packet or one true blocker. Put progress in `swarm status`, task checkpoints, run logs, and files; do not send “received,” “starting,” per-test, or waiting updates.
+- Do not send acknowledgement messages. After actually handling a delivery, use `swarm ack <exact-id...>`; `ack --all` is unsafe and refused.
+- For an ordinary question that truly needs an answer, send it once with `swarm send <agent> "<question>" --require-reply <ttl>`. The exact recipient resolves it with `swarm send <requester> "<answer>" --reply-to <message-id>`; reading or acking alone never resolves it. Inspect pending/terminal state with `swarm replies [--history]`.
+- Push is only a nudge. For required ownership pickup, use `swarm handoff offer <slug> --to <agent> --ttl <t>` and treat only exact-recipient `handoff accept` as acceptance.
+- If an expected action is quiet, run `swarm inbox --wait 60`, inspect `swarm handoff status`, then use `swarm read <agent>` once before sending anything again. Supersede a changed order with `--supersedes`; never duplicate it to provoke a receipt.
+- If the exact registration is inactive or an offer expires, the source keeps the lease. Preserve stranded work with `swarm rescue --task <slug> --to <successor>` before an Owner/Lead reaps, takes over, or explicitly rebinds it. A same-name rejoin is a new identity and inherits nothing.
+- Gate-critical changes require fresh exact-head adversarial review from a different model family. Any source or doctrine change invalidates the old verdict; follow the active provider/quota routing policy.
 
 ## Durable work: tasks, evidence, approvals (SWARM-NEXT)
 

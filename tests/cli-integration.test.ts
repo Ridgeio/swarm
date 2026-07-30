@@ -543,6 +543,36 @@ describe('cli supersession and pull/ack delivery', () => {
     }
   });
 
+  test('conversational --kind ack is refused without writing a message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-no-ack-noise-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      const before = openDb(home);
+      const countBefore = (before.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      before.close();
+
+      for (const args of [
+        ['send', 'Bob', 'received', '--kind', 'ack'],
+        ['broadcast', 'acknowledged', '--kind', 'ack'],
+      ]) {
+        const refused = runCli(home, args, { SWARM_AGENT_NAME: 'Alice' });
+        assert.notStrictEqual(refused.status, 0);
+        assert.match(
+          refused.stderr,
+          /Refused conversational acknowledgement: delivery acknowledgement is transport metadata.*send only a result or a true blocker/s
+        );
+      }
+
+      const after = openDb(home);
+      const countAfter = (after.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      after.close();
+      assert.strictEqual(countAfter, countBefore);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('hook turn loss keeps a message pending, third injection collapses, and ack clears it', () => {
     const home = mkdtempSync(join(tmpdir(), 'swarm-cli-hook-'));
     try {
@@ -634,8 +664,14 @@ describe('cli supersession and pull/ack delivery', () => {
       const finalSend = runCli(home, ['send', 'Bob', 'ack all'], { SWARM_AGENT_NAME: 'Alice' });
       assert.strictEqual(finalSend.status, 0, finalSend.stderr || finalSend.stdout);
       const ackAll = runCli(home, ['ack', '--all'], { SWARM_AGENT_NAME: 'Bob' });
-      assert.strictEqual(ackAll.status, 0, ackAll.stderr || ackAll.stdout);
-      assert.match(ackAll.stdout, /Acknowledged 1 message\(s\)/);
+      assert.notStrictEqual(ackAll.status, 0);
+      assert.match(ackAll.stderr, /Refused unsafe "swarm ack --all"/);
+      const finalDb = openDb(home);
+      const finalId = finalDb.prepare("SELECT id FROM messages WHERE body = 'ack all'").get() as { id: number };
+      finalDb.close();
+      const exactAck = runCli(home, ['ack', String(finalId.id)], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(exactAck.status, 0, exactAck.stderr || exactAck.stdout);
+      assert.match(exactAck.stdout, /Acknowledged 1 message\(s\)/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

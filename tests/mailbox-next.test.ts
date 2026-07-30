@@ -6,7 +6,6 @@ import path from 'node:path';
 import type { SwarmDb } from '../src/db.js';
 import { DEFAULT_SWARM_ID, getDbAt } from '../src/db.js';
 import {
-  acknowledgeAllMessages,
   acknowledgeMessages,
   broadcastMessage,
   getInbox,
@@ -88,6 +87,22 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
 
     assert.strictEqual(cursor('Returner'), historicalId);
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Returner', true).map(message => message.id), [missedId]);
+  });
+
+  test('same-name replacement does not inherit a durable broadcast delivery bound to the prior registration', async () => {
+    joinHeadlessAgent(db, SWARM_ID, 'Alice');
+    const prior = joinHeadlessAgent(db, SWARM_ID, 'Bob');
+    const sent = await broadcastMessage(db, SWARM_ID, 'Alice', 'exact audience');
+    assert.ok(sent.messageId);
+
+    assert.strictEqual(leaveHeadlessAgent(db, SWARM_ID, 'Bob'), true);
+    const replacement = joinHeadlessAgent(db, SWARM_ID, 'Bob');
+    assert.notStrictEqual(replacement.id, prior.id);
+    assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob', true), []);
+    assert.throws(
+      () => acknowledgeMessages(db, SWARM_ID, 'Bob', [sent.messageId!]),
+      /not addressed to you/
+    );
   });
 
   test('only the owner may supersede and a replacement hides its target for every recipient', async () => {
@@ -272,16 +287,16 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
     `).get('Bob') as { n: number };
     assert.strictEqual(acked.n, 0);
     assert.strictEqual(cursor('Bob'), 0);
-    assert.deepStrictEqual(acknowledgeAllMessages(db, SWARM_ID, 'Bob'), [gate, status]);
+    assert.deepStrictEqual(acknowledgeMessages(db, SWARM_ID, 'Bob', [gate, status]), [gate, status]);
   });
 
-  test('delivery rows are lazy and absent rows interoperate with the legacy cursor', async () => {
+  test('new durable-outbox messages eagerly bind delivery rows while legacy rows still use the cursor', async () => {
     const historical = insertMessage('Alice', null, 'pre-join history');
     joinHeadlessAgent(db, SWARM_ID, 'Bob');
     joinHeadlessAgent(db, SWARM_ID, 'Alice');
     const sent = await sendMessage(db, SWARM_ID, 'Alice', 'Bob', 'post-join message');
     assert.ok(sent.messageId);
-    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM message_deliveries').get() as { n: number }).n, 0);
+    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM message_deliveries').get() as { n: number }).n, 1);
 
     const visible = getInbox(db, SWARM_ID, 'Bob', true);
     assert.deepStrictEqual(visible.map(message => message.id), [sent.messageId]);

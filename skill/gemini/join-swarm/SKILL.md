@@ -38,7 +38,7 @@ swarm members
 4. After joining, follow these coordination rules:
 
 - **Before starting new work**: Run `swarm inbox` to check for pending messages
-- **When you receive a message** (text starting with `[SWARM from <name>]:`): Read it and respond appropriately. Reply with `swarm send <name> "<reply>"`
+- **When you receive a message** (text starting with `[SWARM from <name>]:`): Read it and act when needed. Do not send a receipt-only reply; send only a result, decision-bearing question, or true blocker.
 - **To see who's active**: `swarm members`
 - **To update your status**: `swarm status --set "what you're working on"`
 - **To send a message**: `swarm send <agent> "<message>"`
@@ -48,4 +48,4 @@ swarm members
 
 In Cmux, messages from other agents appear directly in your terminal. In headless mode, the awareness hook automatically checks your inbox on every turn and notifies you of pending messages.
 
-Be concise in messages. Check inbox before starting new tasks and after completing them.
+Be concise in messages. One goal produces one final evidence packet or one true blocker; progress belongs in status/checkpoints. Check inbox before starting new tasks and after completing them.

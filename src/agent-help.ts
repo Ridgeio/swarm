@@ -57,20 +57,21 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'inbox', group: 'messaging', line: 'inbox — read queued messages' },
   { command: 'redeliver', group: 'messaging', line: 'redeliver — retry pending pushes' },
 
-  { command: 'task', group: 'tasks+evidence', line: 'task — start, checkpoint, show, list, close, reopen' },
+  { command: 'task', group: 'tasks+evidence', line: 'task — lifecycle, checkpoints, and legacy rebind' },
   { command: 'run', group: 'tasks+evidence', line: 'run — capture a task evidence log' },
   { command: 'handoff', group: 'tasks+evidence', line: 'handoff — offer/accept a charter-bound task lease transfer' },
   { command: 'decision', group: 'tasks+evidence', line: 'decision — record a durable decision' },
   { command: 'harness-review', group: 'tasks+evidence', line: 'harness-review — review a task handoff loop' },
 
   { command: 'grant', group: 'grants+escalation', line: 'grant — create, list, or revoke authority' },
+  { command: 'authority', group: 'grants+escalation', line: 'authority — show or assign Owner/Lead IDs' },
   { command: 'escalate', group: 'grants+escalation', line: 'escalate — create a decision packet' },
   { command: 'review', group: 'grants+escalation', line: 'review — route a cross-family gate review' },
 
   { command: 'board', group: 'board', line: 'board — render fleet state or graph (splits beside you; --own-workspace for program setup)' },
   { command: 'stats', group: 'board', line: 'stats — show fleet metrics' },
 
-  { command: 'janitor', group: 'janitor', line: 'janitor — census debris and controls' },
+  { command: 'janitor', group: 'janitor', line: 'janitor — census debris and enforce handoff deadlines' },
 
   { command: 'rescue', group: 'rescue', line: 'rescue — preserve stranded work' },
   { command: 'reap', group: 'rescue', line: 'reap — prune dead agents' },

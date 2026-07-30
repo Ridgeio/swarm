@@ -94,7 +94,9 @@ function createCurrentTables(db: SwarmDb): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       swarm_id TEXT NOT NULL,
       from_agent TEXT NOT NULL,
+      from_agent_id TEXT,
       to_agent TEXT,
+      to_agent_id TEXT,
       body TEXT NOT NULL,
       delivered INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -115,6 +117,7 @@ function createCurrentTables(db: SwarmDb): void {
       message_id INTEGER NOT NULL,
       swarm_id TEXT NOT NULL,
       recipient TEXT NOT NULL COLLATE NOCASE,
+      recipient_agent_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       first_injected_at TEXT,
       inject_count INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +131,7 @@ function createCurrentTables(db: SwarmDb): void {
       title TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'open',
       owner_agent TEXT COLLATE NOCASE,
+      owner_agent_id TEXT,
       lease_epoch INTEGER NOT NULL DEFAULT 0,
       lease_expires_at TEXT,
       repo_path TEXT,
@@ -148,6 +152,7 @@ function createCurrentTables(db: SwarmDb): void {
       epoch INTEGER NOT NULL,
       kind TEXT NOT NULL,
       actor TEXT,
+      actor_agent_id TEXT,
       data TEXT,
       created_at TEXT NOT NULL
     );
@@ -195,12 +200,62 @@ function createCurrentTables(db: SwarmDb): void {
       op TEXT NOT NULL,
       resource TEXT NOT NULL,
       granted_to TEXT COLLATE NOCASE,
+      granted_to_agent_id TEXT,
       granted_by TEXT NOT NULL,
+      granted_by_agent_id TEXT,
       note TEXT,
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       revoked_at TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS swarm_authorities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('owner', 'lead')),
+      agent_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL COLLATE NOCASE,
+      assigned_by_agent_id TEXT NOT NULL,
+      assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('bootstrap', 'assigned')),
+      created_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS coordination_clocks (
+      swarm_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      last_wall_ms INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (swarm_id, scope),
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS message_outbox (
+      message_id INTEGER NOT NULL,
+      swarm_id TEXT NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'pushed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      pushed_at TEXT,
+      PRIMARY KEY (message_id, recipient_agent_id),
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS handoff_expiry_notifications (
+      offer_id INTEGER NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      audience TEXT NOT NULL CHECK (audience IN ('sender', 'authority')),
+      message_id INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (offer_id, recipient_agent_id, audience),
+      FOREIGN KEY (offer_id) REFERENCES handoff_offers(id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS janitor_status (
@@ -427,6 +482,45 @@ function ensureHandoffOfferProvenanceColumns(db: SwarmDb): void {
   }
 }
 
+function ensureCoordinationProvenanceColumns(db: SwarmDb): void {
+  if (tableExists(db, 'tasks')) {
+    const columns = tableColumns(db, 'tasks');
+    if (!columns.has('owner_agent_id')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN owner_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'task_events')) {
+    const columns = tableColumns(db, 'task_events');
+    if (!columns.has('actor_agent_id')) {
+      db.exec('ALTER TABLE task_events ADD COLUMN actor_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'messages')) {
+    const columns = tableColumns(db, 'messages');
+    if (!columns.has('from_agent_id')) {
+      db.exec('ALTER TABLE messages ADD COLUMN from_agent_id TEXT');
+    }
+    if (!columns.has('to_agent_id')) {
+      db.exec('ALTER TABLE messages ADD COLUMN to_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'message_deliveries')) {
+    const columns = tableColumns(db, 'message_deliveries');
+    if (!columns.has('recipient_agent_id')) {
+      db.exec('ALTER TABLE message_deliveries ADD COLUMN recipient_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'grants')) {
+    const columns = tableColumns(db, 'grants');
+    if (!columns.has('granted_to_agent_id')) {
+      db.exec('ALTER TABLE grants ADD COLUMN granted_to_agent_id TEXT');
+    }
+    if (!columns.has('granted_by_agent_id')) {
+      db.exec('ALTER TABLE grants ADD COLUMN granted_by_agent_id TEXT');
+    }
+  }
+}
+
 function ensureAgentSessionTokenColumn(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
   const columns = tableColumns(db, 'agents');
@@ -443,6 +537,28 @@ function ensureAgentWorkerVersionColumn(db: SwarmDb): void {
   }
 }
 
+function ensureDecisionSingleSuccessorIndex(db: SwarmDb): void {
+  if (!tableExists(db, 'decisions')) return;
+  const duplicate = db.prepare(`
+    SELECT swarm_id, supersedes
+    FROM decisions
+    WHERE supersedes IS NOT NULL
+    GROUP BY swarm_id, supersedes
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  `).get();
+  // Preserve legacy audit rows rather than silently rewriting them. New
+  // databases and clean upgrades get the physical uniqueness fence; dirty
+  // legacy databases still fail closed in the IMMEDIATE mutation transaction.
+  if (!duplicate) {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_single_successor
+      ON decisions(swarm_id, supersedes)
+      WHERE supersedes IS NOT NULL
+    `);
+  }
+}
+
 function migrate(db: SwarmDb): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -454,8 +570,10 @@ function migrate(db: SwarmDb): void {
   ensureTaskClaimKindColumn(db);
   ensureHandoffOfferProvenanceColumns(db);
   ensureDecisionProvenanceColumns(db);
+  ensureCoordinationProvenanceColumns(db);
   ensureAgentSessionTokenColumn(db);
   ensureAgentWorkerVersionColumn(db);
+  ensureDecisionSingleSuccessorIndex(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);
@@ -464,6 +582,7 @@ function migrate(db: SwarmDb): void {
     CREATE INDEX IF NOT EXISTS idx_messages_broadcast ON messages(swarm_id, id);
     CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient ON message_deliveries(swarm_id, recipient, status, message_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
+    CREATE INDEX IF NOT EXISTS idx_tasks_owner_id_state ON tasks(swarm_id, owner_agent_id, state);
     CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_handoff_offers_parties ON handoff_offers(swarm_id, from_agent, to_agent, status, id);
     CREATE INDEX IF NOT EXISTS idx_handoff_offers_deadline ON handoff_offers(swarm_id, status, expires_at);
@@ -472,6 +591,13 @@ function migrate(db: SwarmDb): void {
       WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_grants_swarm_live ON grants(swarm_id, op, revoked_at, expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_swarm_authorities_active_role
+      ON swarm_authorities(swarm_id, role)
+      WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_swarm_authorities_agent
+      ON swarm_authorities(swarm_id, agent_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_message_outbox_pending
+      ON message_outbox(state, message_id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);
     CREATE INDEX IF NOT EXISTS idx_janitor_findings_state ON janitor_findings(state, kind);
     CREATE INDEX IF NOT EXISTS idx_janitor_snapshots_tick ON janitor_snapshots(tick_at);

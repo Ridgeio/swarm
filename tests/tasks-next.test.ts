@@ -16,6 +16,8 @@ import {
   taskGitFacts,
   type GitQueryRunner,
 } from '../src/tasks.js';
+import { joinHeadlessAgent } from '../src/registry.js';
+import { assignSwarmAuthority } from '../src/authority.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
 const TSX_IMPORT = import.meta.resolve('tsx');
@@ -149,6 +151,8 @@ describe('WI-3 task ledger CLI', () => {
       assert.match(explicitClaim.stdout, /^claim: journey-works — close requires: journey$/m);
 
       joinAgent(home, 'Bob');
+      const authority = runCli(home, ['authority', 'assign', 'lead', '--to', 'Bob'], 'Alice');
+      assert.strictEqual(authority.status, 0, authority.stderr || authority.stdout);
       const changedAtTakeover = runCli(home, [
         'task', 'start', 'explicit-claim', '--takeover', '--no-worktree', '--claim', 'probe',
       ], 'Bob');
@@ -314,6 +318,8 @@ describe('WI-3 task ledger CLI', () => {
     const report = path.join(root, 'report.md');
     fs.writeFileSync(report, 'repair evidence\n');
     try {
+      joinHeadlessAgent(db, 'default', 'Alice');
+      joinHeadlessAgent(db, 'default', 'Bob');
       await startTask(db, 'default', 'Alice', 'repair-close', {
         title: 'Repair a close', noWorktree: true, claimKind: 'analysis',
       });
@@ -340,10 +346,14 @@ describe('WI-3 task ledger CLI', () => {
       `).get() as { epoch: number; actor: string; data: string };
       assert.strictEqual(event.epoch, 2);
       assert.strictEqual(event.actor, 'Alice');
+      const aliceId = (db.prepare("SELECT id FROM agents WHERE name = 'Alice'")
+        .get() as { id: string }).id;
       assert.deepStrictEqual(JSON.parse(event.data), {
         reason: 'default branch verification was false',
         prior_disposition: 'archive',
         previous_owner: 'Alice',
+        previous_owner_agent_id: aliceId,
+        owner_agent_id: aliceId,
         takeover: false,
       });
       const boardTask = collectBoardData(db, 'default').tasks.find(task => task.id === 'repair-close');
@@ -360,6 +370,7 @@ describe('WI-3 task ledger CLI', () => {
       await closeTask(db, 'default', 'Alice', 'takeover-close', {
         disposition: 'archive', evidence: [`report:${report}`], notEstablished: 'runtime behavior',
       });
+      assignSwarmAuthority(db, 'default', 'Alice', 'lead', 'Bob');
       const taken = await reopenTask(db, 'default', 'Bob', 'takeover-close', {
         reason: 'new owner will repair', takeover: true,
       });
@@ -405,6 +416,8 @@ describe('WI-3 task ledger CLI', () => {
     try {
       joinAgent(home, 'Alice');
       joinAgent(home, 'Bob');
+      const authority = runCli(home, ['authority', 'assign', 'lead', '--to', 'Bob'], 'Alice');
+      assert.strictEqual(authority.status, 0, authority.stderr || authority.stdout);
       assert.strictEqual(runCli(home, ['task', 'start', 'fenced-task', '--title', 'Fence me', '--no-worktree'], 'Alice').status, 0);
 
       const blocked = runCli(home, ['task', 'start', 'fenced-task', '--no-worktree'], 'Bob');
@@ -606,7 +619,7 @@ describe('WI-3 task ledger CLI', () => {
     }
   });
 
-  test('handoff enforces freshness, labels stale briefs, sends only a pointer summary, and target start re-fences', () => {
+  test('two-phase handoff enforces freshness, labels stale charters, and removes the immediate-transfer bypass', () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-handoff-'));
     try {
       joinAgent(home, 'Alice');
@@ -618,31 +631,54 @@ describe('WI-3 task ledger CLI', () => {
         .run(new Date(Date.now() - 61 * 60_000).toISOString());
       db.close();
 
-      const refused = runCli(home, ['handoff', 'handoff-me', '--to', 'Bob'], 'Alice');
+      const legacy = runCli(home, ['handoff', 'handoff-me', '--to', 'Bob'], 'Alice');
+      assert.notStrictEqual(legacy.status, 0);
+      assert.match(legacy.stderr, /Immediate handoff is not supported/);
+      let before = openDb(home);
+      assert.deepStrictEqual(
+        { ...before.prepare("SELECT owner_agent, lease_epoch FROM tasks WHERE id = 'handoff-me'").get() as object },
+        { owner_agent: 'Alice', lease_epoch: 1 }
+      );
+      before.close();
+
+      const refused = runCli(home, ['handoff', 'offer', 'handoff-me', '--to', 'Bob'], 'Alice');
       assert.notStrictEqual(refused.status, 0);
       assert.match(refused.stderr, /checkpoint is 61m old.*--stale-ok/s);
-      const handed = runCli(home, ['handoff', 'handoff-me', '--to', 'Bob', '--stale-ok'], 'Alice');
+      const handed = runCli(home, [
+        'handoff', 'offer', 'handoff-me', '--to', 'Bob', '--stale-ok',
+      ], 'Alice');
       assert.strictEqual(handed.status, 0, handed.stderr || handed.stdout);
-      assert.match(handed.stdout, /lease epoch 2/);
+      assert.match(handed.stdout, /retains lease epoch 1 until acceptance/);
       assert.match(handed.stdout, /\(STALE\)/);
       const briefPath = handed.stdout.match(/Brief: (.+) \(STALE\)$/m)?.[1];
+      const offerId = Number(handed.stdout.match(/Handoff offer #(\d+)/)?.[1]);
       assert.ok(briefPath);
+      assert.ok(offerId > 0);
       assert.match(fs.readFileSync(briefPath!, 'utf-8'), /^# STALE Context transfer$/m);
 
-      const after = openDb(home);
-      const task = taskRow(after, 'handoff-me');
-      assert.strictEqual(task.owner_agent, 'Bob');
-      assert.strictEqual(task.lease_epoch, 2);
-      const pointer = after.prepare("SELECT body, kind FROM messages WHERE to_agent = 'Bob' COLLATE NOCASE AND kind = 'handoff'").get() as any;
+      let after = openDb(home);
+      let task = taskRow(after, 'handoff-me');
+      assert.strictEqual(task.owner_agent, 'Alice');
+      assert.strictEqual(task.lease_epoch, 1);
+      const pointer = after.prepare(
+        "SELECT body, kind FROM messages WHERE to_agent = 'Bob' COLLATE NOCASE AND kind = 'handoff'"
+      ).get() as any;
       assert.strictEqual(pointer.kind, 'handoff');
       assert.ok(pointer.body.includes(briefPath));
       assert.strictEqual(pointer.body.split('\n').length, 1);
       assert.doesNotMatch(pointer.body, /## latest checkpoint/);
       after.close();
 
-      const accepted = runCli(home, ['task', 'start', 'handoff-me', '--no-worktree'], 'Bob');
+      const accepted = runCli(home, [
+        'handoff', 'accept', 'handoff-me', '--offer', String(offerId),
+      ], 'Bob');
       assert.strictEqual(accepted.status, 0, accepted.stderr || accepted.stdout);
-      assert.match(accepted.stdout, /lease epoch 3/);
+      assert.match(accepted.stdout, /lease epoch 2/);
+      after = openDb(home);
+      task = taskRow(after, 'handoff-me');
+      assert.strictEqual(task.owner_agent, 'Bob');
+      assert.strictEqual(task.lease_epoch, 2);
+      after.close();
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -688,6 +724,11 @@ describe('WI-3 task ledger CLI', () => {
       const firstId = Number(first.stdout.match(/#(\d+)/)?.[1]);
       const second = runCli(home, ['decision', 'DECISION: keep all rows BECAUSE history matters', '--task', 'reset-ledger', '--supersedes', String(firstId)], 'Alice');
       assert.strictEqual(second.status, 0, second.stderr || second.stdout);
+      const preResetGrant = runCli(home, [
+        'grant', 'create', '--op', 'override', '--resource', '*', '--ttl', '2h',
+      ], 'Alice');
+      assert.strictEqual(preResetGrant.status, 0, preResetGrant.stderr || preResetGrant.stdout);
+      const preResetGrantId = Number(preResetGrant.stdout.match(/Grant #(\d+)/)?.[1]);
 
       let db = openDb(home);
       const foreignId = Number(db.prepare(`
@@ -708,9 +749,28 @@ describe('WI-3 task ledger CLI', () => {
       assert.ok((db.prepare('SELECT COUNT(*) AS n FROM task_events').get() as any).n >= 2);
       assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM decisions').get().n, 2);
       assert.strictEqual((db.prepare('SELECT status FROM decisions WHERE id = ?').get(firstId) as any).status, 'superseded');
+      assert.ok(
+        (db.prepare('SELECT revoked_at FROM grants WHERE id = ?').get(preResetGrantId) as any).revoked_at,
+        'reset must revoke wildcard grants before a new registration epoch bootstraps'
+      );
       db.close();
 
+      joinAgent(home, 'Bob');
+      const recovered = runCli(home, [
+        'task', 'start', 'reset-ledger', '--takeover', '--no-worktree',
+      ], 'Bob');
+      assert.strictEqual(recovered.status, 0, recovered.stderr || recovered.stdout);
+      const authority = runCli(home, ['authority', 'show'], 'Bob');
+      assert.strictEqual(authority.status, 0, authority.stderr || authority.stdout);
+      assert.match(authority.stdout, /owner: Bob .*\(active; bootstrap;/s);
+      assert.match(authority.stdout, /lead: Bob .*\(active; bootstrap;/s);
+
       assert.strictEqual(runCli(home, ['reset', '--all']).status, 0);
+      joinAgent(home, 'Carol');
+      const recoveredAgain = runCli(home, [
+        'task', 'start', 'reset-ledger', '--takeover', '--no-worktree',
+      ], 'Carol');
+      assert.strictEqual(recoveredAgain.status, 0, recoveredAgain.stderr || recoveredAgain.stdout);
       db = openDb(home);
       assert.strictEqual(db.prepare('SELECT COUNT(*) AS n FROM tasks').get().n, 1);
       assert.ok((db.prepare('SELECT COUNT(*) AS n FROM task_events').get() as any).n >= 2);
@@ -1114,6 +1174,7 @@ describe('WI-3 task ledger CLI', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-t1-deploy-stub-'));
     const db = getDbAt(path.join(root, 'swarm.db'));
     try {
+      joinHeadlessAgent(db, 'default', 'Alice');
       await startTask(db, 'default', 'Alice', 'deploy-url', {
         title: 'Deploy URL',
         noWorktree: true,

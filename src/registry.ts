@@ -368,6 +368,25 @@ export function joinAgent(
       now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion
     );
 
+    // Bootstrap is a one-time provenance event, never a name convention. The
+    // immutable registration ID is what owns both initial roles; a same-name
+    // rejoin receives a new ID and therefore inherits neither role.
+    if (agentType !== 'a2a' && sessionToken !== null) {
+      const authorityHistory = db.prepare(
+        'SELECT id FROM swarm_authorities WHERE swarm_id = ? LIMIT 1'
+      ).get(swarmId);
+      if (!authorityHistory) {
+        const insertAuthority = db.prepare(`
+          INSERT INTO swarm_authorities (
+            swarm_id, role, agent_id, agent_name, assigned_by_agent_id,
+            assignment_kind, created_at, revoked_at
+          ) VALUES (?, ?, ?, ?, ?, 'bootstrap', ?, NULL)
+        `);
+        insertAuthority.run(swarmId, 'owner', id, name, id, now);
+        insertAuthority.run(swarmId, 'lead', id, name, id, now);
+      }
+    }
+
     db.prepare(`
       INSERT OR IGNORE INTO inbox_cursors (swarm_id, agent_name, last_read_id)
       SELECT ?, ?, COALESCE(MAX(id), 0)
@@ -578,6 +597,34 @@ export function getAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | nul
   // Existing A2A endpoint identity remains unchanged. Legacy local rows with a
   // NULL token are grandfathered until their next join mints one.
   if (agent.agent_type === 'a2a' || agent.session_token === null) return agent;
+  if (!tokensMatch(agent.session_token, presentedToken)) {
+    throw new Error(`identity could not be authenticated for ${agent.name} — rejoin with swarm join ${agent.name}`);
+  }
+  return agent;
+}
+
+/**
+ * High-impact mutations require a locally token-bound registration. Legacy
+ * NULL-token rows and A2A name/endpoint identity remain readable and may use
+ * non-privileged messaging, but they cannot mutate leases, grants, decisions,
+ * or authority until they rejoin through a token-minting local session.
+ */
+export function getPrivilegedAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | null {
+  const resolved = resolveSelf(db, swarmId);
+  if (!resolved) return null;
+  const { agent, presentedToken } = resolved;
+  if (agent.agent_type === 'a2a') {
+    throw new Error(
+      `privileged identity is unavailable for A2A agent ${agent.name}; ` +
+      'use a token-bound local Owner/Lead or task-owner registration'
+    );
+  }
+  if (agent.session_token === null) {
+    throw new Error(
+      `legacy identity ${agent.name} has no session token and cannot perform privileged mutations; ` +
+      `rejoin with swarm join ${agent.name}`
+    );
+  }
   if (!tokensMatch(agent.session_token, presentedToken)) {
     throw new Error(`identity could not be authenticated for ${agent.name} — rejoin with swarm join ${agent.name}`);
   }

@@ -2,8 +2,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { execFileSync } from 'child_process';
-import { DEFAULT_SWARM_ID } from './db.js';
-import { getDb, getDbReadOnly } from './db.js';
+import { DEFAULT_SWARM_ID, getDb, getDbReadOnly, withImmediateTransaction } from './db.js';
 import {
   Agent,
   Swarm,
@@ -12,6 +11,7 @@ import {
   forceReap,
   getAgent,
   getAuthenticatedSelf,
+  getPrivilegedAuthenticatedSelf,
   getOrCreateSwarm,
   getSelf,
   getSurfaceMarkerConflictWarning,
@@ -80,9 +80,9 @@ import {
   getHandoffOfferHookLines,
   getTask,
   getActiveTaskHookLines,
-  handoffTask,
   listHandoffOffers,
   offerTaskHandoff,
+  rebindLegacyTask,
   reopenTask,
   recordDecision,
   runTaskCommand,
@@ -132,6 +132,11 @@ import { escalateTask } from './escalations.js';
 import { requestTaskReview } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
 import { renderAgentHelp } from './agent-help.js';
+import {
+  assignSwarmAuthority,
+  listSwarmAuthorities,
+  type SwarmAuthorityRole,
+} from './authority.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -265,7 +270,9 @@ function resolveSelectedSwarmReadOnly(db: NonNullable<ReturnType<typeof getDbRea
   throw new Error('No swarm database state found. Run "swarm create <name>" first.');
 }
 
-function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
+function requireSelf(
+  authenticate: boolean | 'privileged' = false
+): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
   const db = getDb();
   const explicitSwarm = explicitSwarmName ? getSwarm(db, explicitSwarmName) : null;
   if (explicitSwarmName && !explicitSwarm) {
@@ -273,9 +280,11 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
     process.exit(1);
   }
 
-  const self = authenticate
-    ? getAuthenticatedSelf(db, explicitSwarm?.id)
-    : getSelf(db, explicitSwarm?.id);
+  const self = authenticate === 'privileged'
+    ? getPrivilegedAuthenticatedSelf(db, explicitSwarm?.id)
+    : authenticate
+      ? getAuthenticatedSelf(db, explicitSwarm?.id)
+      : getSelf(db, explicitSwarm?.id);
   if (!self) {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     const agentName = process.env.SWARM_AGENT_NAME;
@@ -362,11 +371,15 @@ Task Ledger:
     [--force-discard] [--override --reason <text>]
   swarm task reopen <slug> --reason <text>         Reactivate done/abandoned work
     [--takeover]
+  swarm task rebind <slug> --to <agent>            Explicitly upgrade legacy name-only ownership
+    --reason <text>
   swarm run [--task <slug>] -- <cmd> [args...]     Capture full output as task evidence
   swarm grant create --op <op> --resource <r>      Create a scoped, expiring grant
     --ttl <30m|2h|1d> [--to <agent>] [--note <t>]
   swarm grant list [--live]                        List grants
   swarm grant revoke <id>                          Revoke a grant
+  swarm authority show                             Show immutable Owner/Lead bindings
+  swarm authority assign <owner|lead> --to <agent> Assign a role (Owner/Lead only)
   swarm escalate <slug> [--question <text>]        Write and send a decision-ready packet
     [--to <agent>]
   swarm review <slug> [--to <agent>]               Route an inverted-family review request
@@ -381,7 +394,6 @@ Task Ledger:
   swarm handoff cancel <slug> [--offer <id>]       Cancel your pending offer
     [--reason <text>]
   swarm handoff status [slug]                      Show pickup/dead-letter/acceptance state
-  swarm handoff <slug> --to <agent> [--stale-ok]   Legacy immediate transfer (unsafe for async pickup)
   swarm decision <text> [--task <slug>]            Record a durable decision
     [--supersedes <decision-id>]
   swarm harness-review <slug>                      Review the full task handoff timeline
@@ -979,7 +991,9 @@ async function main() {
           console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf(
+          subcommand === 'list' || subcommand === 'show' ? true : 'privileged'
+        );
         if (subcommand === 'list') {
           const tasks = db.prepare(`
             SELECT id, title, state, owner_agent, lease_epoch, disposition, claim_kind, updated_at
@@ -1018,14 +1032,17 @@ async function main() {
             process.exit(1);
           }
           console.log(`${task.id}: ${task.title}`);
-          console.log(`state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; lease epoch: ${task.lease_epoch}`);
+          console.log(
+            `state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; ` +
+            `owner registration: ${task.owner_agent_id ?? 'legacy/unrecorded'}; lease epoch: ${task.lease_epoch}`
+          );
           console.log(`claim: ${effectiveClaimKind(task)}`);
           console.log(`lease expires: ${task.lease_expires_at ?? 'none'}; disposition: ${task.disposition ?? 'none'}`);
           console.log(`repo: ${task.repo_path ?? 'none'}`);
           console.log(`branch: ${task.branch ?? 'none'}; worktree: ${task.worktree_path ?? 'none'}`);
           console.log(`transcript: ${task.transcript_hint ?? 'not available'}`);
           const events = db.prepare(`
-            SELECT id, epoch, kind, actor, data, created_at
+            SELECT id, epoch, kind, actor, actor_agent_id, data, created_at
             FROM task_events
             WHERE swarm_id = ? AND task_id = ?
             ORDER BY id ASC
@@ -1034,6 +1051,7 @@ async function main() {
             epoch: number;
             kind: string;
             actor: string | null;
+            actor_agent_id: string | null;
             data: string | null;
             created_at: string;
           }>;
@@ -1082,7 +1100,11 @@ async function main() {
           if (events.length === 0) console.log('  none');
           for (const event of events) {
             const data = event.data ? ` \u2014 ${oneLineForCli(event.data)}` : '';
-            console.log(`  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} @${event.epoch}${data}`);
+            const actorId = event.actor_agent_id ?? (event.actor ? 'legacy/unrecorded' : 'system');
+            console.log(
+              `  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} ` +
+              `@${event.epoch} [${actorId}]${data}`
+            );
           }
           const decisions = db.prepare(`
             SELECT id, body, made_by, actor_agent_id, task_epoch, supersedes, status, created_at
@@ -1185,6 +1207,23 @@ async function main() {
           );
           break;
         }
+        if (subcommand === 'rebind') {
+          const target = getFlag('--to');
+          const reason = getFlag('--reason');
+          if (!target || !reason) {
+            console.error('Usage: swarm task rebind <slug> --to <agent> --reason <text>');
+            process.exit(1);
+          }
+          const task = await rebindLegacyTask(db, self.swarm_id, self.name, slug, {
+            target,
+            reason,
+          });
+          console.log(
+            `Task "${slug}" explicitly rebound to ${task.owner_agent} registration ` +
+            `${task.owner_agent_id} at lease epoch ${task.lease_epoch}.`
+          );
+          break;
+        }
         console.error(`Unknown task command: ${subcommand}`);
         console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
         process.exit(1);
@@ -1202,7 +1241,7 @@ async function main() {
             console.error(usage);
             process.exit(1);
           }
-          const { db, self } = requireSelf(true);
+          const { db, self } = requireSelf('privileged');
           const grant = createGrant(db, self.swarm_id, self.name, {
             op,
             resource,
@@ -1236,7 +1275,7 @@ async function main() {
           break;
         }
         if (subcommand === 'revoke') {
-          const { db: authenticatedDb, self } = requireSelf(true);
+          const { db: authenticatedDb, self } = requireSelf('privileged');
           const rawId = args[2];
           const id = Number(rawId);
           if (!rawId || !/^\d+$/.test(rawId) || id <= 0 || !Number.isSafeInteger(id)) {
@@ -1248,7 +1287,7 @@ async function main() {
             console.error('Authenticated identity is not a member of the selected swarm.');
             process.exit(1);
           }
-          const grant = revokeGrant(authenticatedDb, swarm.id, id);
+          const grant = revokeGrant(authenticatedDb, swarm.id, self.name, id);
           if (!grant) {
             console.error(`Grant #${id} not found in swarm "${swarm.name}".`);
             process.exit(1);
@@ -1261,13 +1300,60 @@ async function main() {
         break;
       }
 
+      case 'authority': {
+        const subcommand = args[1];
+        if (subcommand === 'show') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listSwarmAuthorities(db, swarm.id, false);
+          if (rows.length === 0) {
+            console.log('No Owner/Lead authority has been bootstrapped in this swarm.');
+            break;
+          }
+          for (const row of rows) {
+            const state = row.revoked_at ? `revoked ${row.revoked_at}` : 'active';
+            console.log(
+              `#${row.id} ${row.role}: ${row.agent_name} [${row.agent_id}] ` +
+              `(${state}; ${row.assignment_kind}; by ${row.assigned_by_agent_id})`
+            );
+          }
+          break;
+        }
+        if (subcommand === 'assign') {
+          const role = args[2] as SwarmAuthorityRole | undefined;
+          const target = getFlag('--to');
+          if ((role !== 'owner' && role !== 'lead') || !target) {
+            console.error('Usage: swarm authority assign <owner|lead> --to <agent>');
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const authority = assignSwarmAuthority(
+            db,
+            self.swarm_id,
+            self.name,
+            role,
+            target
+          );
+          console.log(
+            `${role === 'owner' ? 'Owner' : 'Lead'} authority assigned to ` +
+            `${authority.agent_name} registration ${authority.agent_id}.`
+          );
+          break;
+        }
+        console.error(
+          'Usage: swarm authority show | swarm authority assign <owner|lead> --to <agent>'
+        );
+        process.exit(1);
+        break;
+      }
+
       case 'escalate': {
         const slug = args[1];
         if (!slug) {
           console.error('Usage: swarm escalate <slug> [--question <text>] [--to <agent>]');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf('privileged');
         const result = await escalateTask(db, self.swarm_id, self.name, slug, {
           question: getFlag('--question'),
           to: getFlag('--to'),
@@ -1287,7 +1373,7 @@ async function main() {
           console.error('Usage: swarm review <slug> [--to <agent>] [--same-family-ok --reason <text>]');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf('privileged');
         const result = await requestTaskReview(db, self.swarm_id, self.name, slug, {
           to: getFlag('--to'),
           sameFamilyOk: hasFlag('--same-family-ok'),
@@ -1318,7 +1404,7 @@ async function main() {
           taskId = wrapperArgs[index + 1];
           index += 1;
         }
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf('privileged');
         const result = runTaskCommand(db, self.swarm_id, self.name, args.slice(separator + 1), {
           taskId,
           cwd: process.cwd(),
@@ -1360,7 +1446,9 @@ async function main() {
 
       case 'handoff': {
         const subcommand = args[1];
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf(
+          subcommand === 'status' ? true : 'privileged'
+        );
         if (subcommand === 'offer') {
           const slug = args[2];
           const target = getFlag('--to');
@@ -1463,27 +1551,39 @@ async function main() {
           break;
         }
 
-        const slug = subcommand;
-        const target = getFlag('--to');
-        if (!slug || !target) {
-          console.error(
-            'Usage: swarm handoff offer|accept|decline|cancel|status ... | ' +
-            'swarm handoff <slug> --to <agent> [--stale-ok] (legacy immediate)'
-          );
-          process.exit(1);
-        }
-        console.warn(
-          'Warning: legacy immediate handoff transfers authority before recipient acceptance. ' +
-          'Use "swarm handoff offer <slug> --to <agent>" for deterministic asynchronous pickup.'
+        console.error(
+          'Immediate handoff is not supported. Use "swarm handoff offer <slug> --to <agent>", ' +
+          'then have that exact recipient registration accept the offer.'
         );
-        const result = await handoffTask(db, self.swarm_id, self.name, slug, target, hasFlag('--stale-ok'));
-        console.log(`Task "${slug}" handed off immediately to ${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`);
-        console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
+        console.error('Usage: swarm handoff offer|accept|decline|cancel|status ...');
+        process.exit(1);
         break;
       }
 
       case 'decision': {
         const usage = 'Usage: swarm decision <text> [--task <slug>] [--supersedes <decision-id>]';
+        if (args[1] === '--help' || args[1] === '-h') {
+          console.log(usage);
+          break;
+        }
+        for (let index = 1; index < args.length; index += 1) {
+          const token = args[index];
+          if (token === '--task' || token === '--supersedes') {
+            const value = args[index + 1];
+            if (!value || value.startsWith('-')) {
+              console.error(`${token} requires a value.`);
+              console.error(usage);
+              process.exit(1);
+            }
+            index += 1;
+            continue;
+          }
+          if (token.startsWith('-')) {
+            console.error(`Unknown decision option "${token}".`);
+            console.error(usage);
+            process.exit(1);
+          }
+        }
         const supersedes = requirePositiveIdFlag('--supersedes', 'Decision ID', usage);
         const tokens: string[] = [];
         for (let index = 1; index < args.length; index += 1) {
@@ -1495,7 +1595,7 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf('privileged');
         const result = recordDecision(db, self.swarm_id, self.name, body, getFlag('--task'), supersedes);
         console.log(`Decision #${result.id} recorded.`);
         break;
@@ -1550,7 +1650,8 @@ async function main() {
             console.error('only --observe is implemented; destructive phases are deliberately unbuilt — see docs/design/SWARM-NEXT-V1.md');
             process.exit(1);
           }
-          const result = runJanitorTick(getDb());
+          const db = getDb();
+          const result = runJanitorTick(db);
           if (result.lockedOut) {
             console.log('Janitor tick already running; no-op.');
           } else {
@@ -1560,6 +1661,7 @@ async function main() {
               `${counters.reposScanned} repos, ${counters.worktrees} worktrees, ` +
               `${result.findings} findings.`
             );
+            if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
           }
           break;
         }
@@ -2344,19 +2446,40 @@ async function main() {
           if (host) removeHook(host, a.name, a.swarm_id);
         }
 
+        const resetAt = new Date().toISOString();
         if (all) {
-          db.exec('DELETE FROM agents');
-          db.exec('DELETE FROM message_deliveries');
-          db.exec('DELETE FROM messages');
-          db.exec('DELETE FROM inbox_cursors');
-          db.prepare('DELETE FROM swarms WHERE id != ?').run(DEFAULT_SWARM_ID);
+          withImmediateTransaction(db, () => {
+            // A fleet reset deliberately closes the old registration epoch.
+            // Preserve grant rows as audit, but no wildcard or recipient-less
+            // grant may survive into the next fleet generation.
+            db.prepare(`
+              UPDATE grants SET revoked_at = ?
+              WHERE revoked_at IS NULL
+            `).run(resetAt);
+            db.exec('DELETE FROM swarm_authorities');
+            db.exec('DELETE FROM agents');
+            db.exec('DELETE FROM message_deliveries');
+            db.exec('DELETE FROM messages');
+            db.exec('DELETE FROM inbox_cursors');
+            db.prepare('DELETE FROM swarms WHERE id != ?').run(DEFAULT_SWARM_ID);
+          });
           console.log(`Swarm reset. Cleared ${agents.length} agent(s), all messages, and all non-default swarms.`);
         } else {
           const swarm = resolveSelectedSwarm(db);
-          db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
+          withImmediateTransaction(db, () => {
+            db.prepare(`
+              UPDATE grants SET revoked_at = ?
+              WHERE swarm_id = ? AND revoked_at IS NULL
+            `).run(resetAt, swarm.id);
+            // Clearing the role rows is the explicit recovery ceremony: the
+            // next token-bound local join can bootstrap a fresh Owner/Lead ID,
+            // while task leases remain fenced until authorized takeover/rebind.
+            db.prepare('DELETE FROM swarm_authorities WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
+          });
           console.log(`Swarm "${swarm.name}" reset. Cleared ${agents.length} agent(s) and its messages.`);
         }
         break;

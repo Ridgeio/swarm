@@ -228,6 +228,9 @@ describe('T6 model-inversion review routing', () => {
       assert.deepStrictEqual(JSON.parse(event.data), {
         author_family: 'claude',
         reviewer: 'OpenAIAuthor',
+        reviewer_agent_id: (value.db.prepare(
+          "SELECT id FROM agents WHERE name = 'OpenAIAuthor'"
+        ).get() as { id: string }).id,
         reviewer_family: 'openai',
         brief_path: claude.briefPath,
       });

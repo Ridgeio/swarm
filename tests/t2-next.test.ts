@@ -84,6 +84,7 @@ describe('T2.1 typed grants', () => {
   test('CRUD, TTL parsing, expiry, revoke, recipient scope, and custom ops', () => {
     const fixture = tempDb('swarm-t2-grants-');
     try {
+      joinHeadlessAgent(fixture.db, 'default', 'Lead');
       joinHeadlessAgent(fixture.db, 'default', 'Alice');
       joinHeadlessAgent(fixture.db, 'default', 'Bob');
       assert.strictEqual(parseGrantTtl('30m'), 30 * 60_000);
@@ -116,10 +117,10 @@ describe('T2.1 typed grants', () => {
         op: 'custom:release-window', resources: ['service/api'], actor: 'Bob', now: NOW,
       }), null);
 
-      const revoked = revokeGrant(fixture.db, 'default', grant.id, NOW + 1_000);
+      const revoked = revokeGrant(fixture.db, 'default', 'Lead', grant.id, NOW + 1_000);
       assert.strictEqual(revoked?.revoked_at, new Date(NOW + 1_000).toISOString());
       assert.deepStrictEqual(listGrants(fixture.db, 'default', true, NOW + 2_000), []);
-      assert.strictEqual(revokeGrant(fixture.db, 'default', 999), null);
+      assert.strictEqual(revokeGrant(fixture.db, 'default', 'Lead', 999), null);
     } finally {
       fixture.db.close();
       fs.rmSync(fixture.root, { recursive: true, force: true });
@@ -177,6 +178,7 @@ describe('T2.2 close chokepoints', () => {
   test('merged code claim routes authorization through escalation and an operator remedy, then records grant use', async () => {
     const fixture = tempDb('swarm-t2-merge-');
     try {
+      joinHeadlessAgent(fixture.db, 'default', 'Lead');
       joinHeadlessAgent(fixture.db, 'default', 'Alice');
       await startTask(fixture.db, 'default', 'Alice', 'merge-gated', {
         title: 'Merge gated', noWorktree: true, claimKind: 'code-merged',
@@ -201,9 +203,18 @@ describe('T2.2 close chokepoints', () => {
       const used = fixture.db.prepare(`
         SELECT data FROM task_events WHERE task_id = 'merge-gated' AND kind = 'grant_used'
       `).get() as { data: string };
-      assert.deepStrictEqual(JSON.parse(used.data), {
-        grant_id: grant.id, op: 'merge', resource: 'merge-gated', actor: 'Alice',
-      });
+      assert.deepStrictEqual(
+        {
+          grant_id: JSON.parse(used.data).grant_id,
+          op: JSON.parse(used.data).op,
+          resource: JSON.parse(used.data).resource,
+          actor: JSON.parse(used.data).actor,
+        },
+        { grant_id: grant.id, op: 'merge', resource: 'merge-gated', actor: 'Alice' }
+      );
+      assert.ok(JSON.parse(used.data).actor_agent_id);
+      assert.strictEqual(JSON.parse(used.data).granted_by_agent_id, grant.granted_by_agent_id);
+      assert.strictEqual(JSON.parse(used.data).granted_to_agent_id, grant.granted_to_agent_id);
 
       await startTask(fixture.db, 'default', 'Alice', 'branch-gated', {
         title: 'Branch gated', noWorktree: true, claimKind: 'code-merged',
@@ -229,6 +240,8 @@ describe('T2.2 close chokepoints', () => {
   test('override requires both a reason and a live slug-matching override grant', async () => {
     const fixture = tempDb('swarm-t2-override-');
     try {
+      joinHeadlessAgent(fixture.db, 'default', 'Lead');
+      joinHeadlessAgent(fixture.db, 'default', 'Alice');
       await startTask(fixture.db, 'default', 'Alice', 'override-gated', {
         title: 'Override gated', noWorktree: true, claimKind: 'analysis',
       });
@@ -396,6 +409,7 @@ May we accept the remaining rollout risk?
 
       const empty = tempDb('swarm-t2-escalate-manual-');
       try {
+        joinHeadlessAgent(empty.db, 'default', 'Ghost');
         await startTask(empty.db, 'default', 'Ghost', 'manual-route', {
           title: 'Manual route', noWorktree: true, claimKind: 'analysis',
         });
@@ -510,6 +524,9 @@ describe('T2.5 board projection', () => {
         title: 'Board grants', noWorktree: true, claimKind: 'analysis',
       });
       fixture.db.prepare("UPDATE tasks SET state = 'awaiting_review' WHERE id = 'board-grants'").run();
+      createGrant(fixture.db, 'default', 'Lead', {
+        op: 'spend', resource: 'expired', ttl: '1m', now: NOW - 2 * 60_000,
+      });
       const expiring = createGrant(fixture.db, 'default', 'Lead', {
         op: 'override', resource: 'board-grants', ttl: '14m', now: NOW,
       });
@@ -519,10 +536,7 @@ describe('T2.5 board projection', () => {
       const revoked = createGrant(fixture.db, 'default', 'Lead', {
         op: 'prod', resource: 'revoked', ttl: '10m', now: NOW,
       });
-      revokeGrant(fixture.db, 'default', revoked.id, NOW + 1_000);
-      createGrant(fixture.db, 'default', 'Lead', {
-        op: 'spend', resource: 'expired', ttl: '1m', now: NOW - 2 * 60_000,
-      });
+      revokeGrant(fixture.db, 'default', 'Lead', revoked.id, NOW + 1_000);
       fixture.db.prepare(`
         INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
         VALUES ('default', 'board-grants', 1, 'grant_used', 'Lead', ?, ?)

@@ -104,7 +104,7 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 ## Task-based operation
 
-Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff offer` creates a digest-bound transfer that moves the lease only after the named recipient runs `handoff accept`; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, handoff offers, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
+Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff offer` creates a digest-bound transfer that moves the lease only after the named recipient runs `handoff accept`; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, handoff offers, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`. Reset explicitly ends the old registration generation: it revokes live grants and clears Owner/Lead bindings, so the first subsequent token-bound local join bootstraps fresh roles while every surviving task remains fenced pending authorized takeover or legacy rebind.
 
 For asynchronous work, use the two-phase path:
 
@@ -115,7 +115,13 @@ swarm handoff status auth-refresh
 swarm handoff accept auth-refresh --offer 7
 ```
 
-The source owner retains the current lease and epoch until acceptance. The offer stores the source epoch, charter SHA-256, pickup deadline, pointer message ID, and delivery/ack state. An expired offer becomes a durable dead letter and does not transfer authority. The older `swarm handoff <slug> --to <agent>` form remains for compatibility but transfers immediately and is unsafe when recipient pickup is uncertain.
+The source owner retains the current lease and epoch until acceptance. The offer stores both parties' immutable registration IDs, the source epoch, charter SHA-256, pickup deadline, pointer message ID, and delivery/ack state. Offer creation, acceptance, and their notification rows commit atomically before any terminal push. An expired offer becomes a durable dead letter, notifies the sender and active Owner/Lead registrations exactly once, and never transfers authority. Immediate handoff has been removed; `offer` → named-recipient `accept` is the only ownership-transfer path.
+
+Every task lease is bound to both an immutable agent-registration ID and an epoch. Rejoining with the same display name does not inherit a lease, role, grant, message, or decision-author identity. Legacy name-only task rows deliberately fail privileged mutation until an Owner/Lead performs an explicit audited upgrade:
+
+```bash
+swarm task rebind legacy-task --to Alice --reason "verified recovery owner"
+```
 
 `task close` only records a disposition; it never performs a merge. For a `code-merged` task, `--disposition merged` verifies that the task commit is reachable from origin's default branch (`origin/HEAD`, then `origin/main` or `origin/master`).
 With a local `file://` remote, the operator merges in the default-branch checkout and pushes that branch; fetch it in the task repository if needed, then retry close. Pushing only the feature branch is enough for `pr`, never for `merged`.
@@ -124,9 +130,11 @@ Claim kinds are `code-merged`, `journey-works`, `deploy-healthy`, `analysis`, `d
 
 ## Grants and escalations
 
-Use typed grants for time-bounded authority and `swarm escalate` for the decision-ready request. A `code-merged` task closing with `--disposition merged` needs a live `merge` grant matching its slug or branch. Resources match exactly, globally with `*`, or by a trailing-prefix wildcard such as `swarm/Foreman/*`.
+Use typed grants for time-bounded authority and `swarm escalate` for the decision-ready request. The first privileged local registration bootstraps the swarm's Owner and Lead roles to that exact registration ID. Only an active Owner/Lead can assign those roles, create or revoke grants, recover/take over another registration's task, or record program-scope decisions. A `code-merged` task closing with `--disposition merged` needs a live `merge` grant matching its slug or branch. Grant issuer and recipient are exact registration IDs; a same-name replacement cannot inherit either side. Resources match exactly, globally with `*`, or by a trailing-prefix wildcard such as `swarm/Foreman/*`.
 
 ```bash
+swarm authority show
+swarm authority assign lead --to Alice
 swarm grant create --op merge --resource my-task --ttl 2h --to Alice
 swarm grant list --live
 swarm grant revoke 12
@@ -137,7 +145,7 @@ Escalation packets are written under `~/.swarm/briefs/escalations/`; the mailbox
 
 Use `swarm review <task-slug>` to route gate review to a live reviewer from a different model family; same-family exceptions require `--same-family-ok --reason "<text>"` and are audited.
 
-Trust model: on this trusted, single-operator machine, grants and session tokens add records, expiry, scope, and audit; they do not create cryptographic separation from a malicious local process. Local joins mint a session token and identity-resolving mutation verbs verify the matching session marker. Legacy NULL-token rows remain usable until rejoin. A2A identity remains endpoint-based.
+Trust model: on this trusted, single-operator machine, grants and session tokens add records, expiry, scope, and audit; they do not create cryptographic separation from a malicious local process. Local joins mint a session token and privileged mutation verbs require a matching non-NULL session marker plus an active, exact registration ID. Legacy NULL-token and A2A identities may use read/messaging paths, but privileged task, role, grant, review, escalation, run, handoff, and decision mutations fail closed until a supported privileged local identity performs them.
 
 The operating principles are in [docs/philosophy.md](docs/philosophy.md), the ledger contracts are in [docs/design/SWARM-NEXT-V1.md](docs/design/SWARM-NEXT-V1.md), and the claim/evidence contracts are in [docs/design/SWARM-NEXT-V2.md](docs/design/SWARM-NEXT-V2.md).
 
@@ -195,8 +203,13 @@ Task ledger:
         [--override --reason <text>]
   swarm task reopen <slug> --reason <text>      Reactivate done/abandoned work
         [--takeover]
+  swarm task rebind <slug> --to <agent>         Explicitly upgrade legacy name-only ownership
+        --reason <text>
   swarm run [--task <slug>] -- <cmd> [args...] Capture a full task evidence log
   swarm harness-review <task-slug>             Review a task's handoff loop
+  swarm authority show                         Show immutable Owner/Lead registrations
+  swarm authority assign owner|lead --to <agent>
+                                                Assign a role (Owner/Lead only)
   swarm grant create --op <op> --resource <r>   Create an expiring scoped grant
         --ttl <30m|2h|1d> [--to <agent>] [--note <text>]
   swarm grant list [--live]                     List grants
@@ -221,7 +234,7 @@ Recovery and hygiene:
         | --task <slug> | --agent <name>
   swarm rescue --list                          List rescue manifests and verification state
   swarm rescue --verify <artifact-dir>         Re-verify an existing rescue artifact
-  swarm janitor tick --observe                 Run the observe-only debris census
+  swarm janitor tick --observe                 Census debris and enforce handoff deadlines
   swarm janitor roots list                     List census roots
   swarm janitor roots add|remove <path>        Manage census roots
   swarm janitor install|uninstall              Manage the launchd schedule

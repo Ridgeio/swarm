@@ -241,11 +241,18 @@ describe('two-phase asynchronous task handoff', () => {
     db.close();
     assert.notStrictEqual(replacement.id, prior.id);
 
+    const replacementStatus = runCli(home, ['handoff', 'status', 'recipient-binding'], 'Bob');
+    assert.strictEqual(replacementStatus.status, 0, replacementStatus.stderr || replacementStatus.stdout);
+    assert.match(replacementStatus.stdout, /No handoff offers recorded/);
+    const replacementInbox = runCli(home, ['inbox', '--peek'], 'Bob');
+    assert.strictEqual(replacementInbox.status, 0, replacementInbox.stderr || replacementInbox.stdout);
+    assert.match(replacementInbox.stdout, /No new messages/);
+
     const accepted = runCli(home, [
       'handoff', 'accept', 'recipient-binding', '--offer', String(offerId),
     ], 'Bob');
     assert.notStrictEqual(accepted.status, 0);
-    assert.match(accepted.stderr, /agent registration changed.*source owner must issue a fresh offer/s);
+    assert.match(accepted.stderr, /No handoff offer.*is addressed to Bob/s);
 
     db = openDb(home);
     const task = db.prepare("SELECT owner_agent, lease_epoch FROM tasks WHERE id = 'recipient-binding'")
@@ -253,7 +260,8 @@ describe('two-phase asynchronous task handoff', () => {
     assert.deepStrictEqual({ ...task }, { owner_agent: 'Alice', lease_epoch: 1 });
     assert.strictEqual(
       (db.prepare('SELECT status FROM handoff_offers WHERE id = ?').get(offerId) as { status: string }).status,
-      'invalidated'
+      'pending',
+      'a same-name replacement must not mutate an offer bound to the prior registration'
     );
     db.close();
   });
@@ -415,6 +423,6 @@ describe('coordination authority hardening', () => {
       'decision', 'DECISION: hostile replacement', '--supersedes', String(programId),
     ], 'Bob');
     assert.notStrictEqual(spoofSupersede.status, 0);
-    assert.match(spoofSupersede.stderr, /only that authenticated author may supersede it/);
+    assert.match(spoofSupersede.stderr, /not an active Owner\/Lead authority/);
   });
 });

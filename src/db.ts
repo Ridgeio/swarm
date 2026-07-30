@@ -152,12 +152,38 @@ function createCurrentTables(db: SwarmDb): void {
       created_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS handoff_offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      from_agent TEXT NOT NULL COLLATE NOCASE,
+      to_agent TEXT NOT NULL COLLATE NOCASE,
+      from_agent_id TEXT,
+      to_agent_id TEXT,
+      source_epoch INTEGER NOT NULL,
+      brief_path TEXT NOT NULL,
+      charter_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled', 'expired', 'invalidated')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      resolved_at TEXT,
+      resolved_by TEXT COLLATE NOCASE,
+      message_id INTEGER,
+      accepted_epoch INTEGER,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+      FOREIGN KEY (swarm_id, task_id) REFERENCES tasks(swarm_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
     CREATE TABLE IF NOT EXISTS decisions (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       swarm_id TEXT NOT NULL,
       task_id TEXT,
       body TEXT NOT NULL,
       made_by TEXT NOT NULL,
+      actor_agent_id TEXT,
+      task_epoch INTEGER,
       supersedes INTEGER,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL
@@ -379,6 +405,28 @@ function ensureTaskClaimKindColumn(db: SwarmDb): void {
   }
 }
 
+function ensureDecisionProvenanceColumns(db: SwarmDb): void {
+  if (!tableExists(db, 'decisions')) return;
+  const columns = tableColumns(db, 'decisions');
+  if (!columns.has('actor_agent_id')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN actor_agent_id TEXT');
+  }
+  if (!columns.has('task_epoch')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN task_epoch INTEGER');
+  }
+}
+
+function ensureHandoffOfferProvenanceColumns(db: SwarmDb): void {
+  if (!tableExists(db, 'handoff_offers')) return;
+  const columns = tableColumns(db, 'handoff_offers');
+  if (!columns.has('from_agent_id')) {
+    db.exec('ALTER TABLE handoff_offers ADD COLUMN from_agent_id TEXT');
+  }
+  if (!columns.has('to_agent_id')) {
+    db.exec('ALTER TABLE handoff_offers ADD COLUMN to_agent_id TEXT');
+  }
+}
+
 function ensureAgentSessionTokenColumn(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
   const columns = tableColumns(db, 'agents');
@@ -404,6 +452,8 @@ function migrate(db: SwarmDb): void {
   ensureMessageKindColumn(db);
   ensureMessageSupersededByColumn(db);
   ensureTaskClaimKindColumn(db);
+  ensureHandoffOfferProvenanceColumns(db);
+  ensureDecisionProvenanceColumns(db);
   ensureAgentSessionTokenColumn(db);
   ensureAgentWorkerVersionColumn(db);
 
@@ -415,6 +465,11 @@ function migrate(db: SwarmDb): void {
     CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient ON message_deliveries(swarm_id, recipient, status, message_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
     CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_handoff_offers_parties ON handoff_offers(swarm_id, from_agent, to_agent, status, id);
+    CREATE INDEX IF NOT EXISTS idx_handoff_offers_deadline ON handoff_offers(swarm_id, status, expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_handoff_offers_one_pending
+      ON handoff_offers(swarm_id, task_id)
+      WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_grants_swarm_live ON grants(swarm_id, op, revoked_at, expires_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);

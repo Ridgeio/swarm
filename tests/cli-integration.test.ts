@@ -634,8 +634,14 @@ describe('cli supersession and pull/ack delivery', () => {
       const finalSend = runCli(home, ['send', 'Bob', 'ack all'], { SWARM_AGENT_NAME: 'Alice' });
       assert.strictEqual(finalSend.status, 0, finalSend.stderr || finalSend.stdout);
       const ackAll = runCli(home, ['ack', '--all'], { SWARM_AGENT_NAME: 'Bob' });
-      assert.strictEqual(ackAll.status, 0, ackAll.stderr || ackAll.stdout);
-      assert.match(ackAll.stdout, /Acknowledged 1 message\(s\)/);
+      assert.notStrictEqual(ackAll.status, 0);
+      assert.match(ackAll.stderr, /Refused unsafe "swarm ack --all"/);
+      const finalDb = openDb(home);
+      const finalId = finalDb.prepare("SELECT id FROM messages WHERE body = 'ack all'").get() as { id: number };
+      finalDb.close();
+      const exactAck = runCli(home, ['ack', String(finalId.id)], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(exactAck.status, 0, exactAck.stderr || exactAck.stdout);
+      assert.match(exactAck.stdout, /Acknowledged 1 message\(s\)/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

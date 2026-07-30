@@ -722,6 +722,14 @@ describe('migration', () => {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_deliveries'"
       ).get() as { name: string } | undefined;
       assert.strictEqual(deliveryTable?.name, 'message_deliveries');
+      const handoffTable = migrated.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'handoff_offers'"
+      ).get() as { name: string } | undefined;
+      assert.strictEqual(handoffTable?.name, 'handoff_offers');
+      const decisionColumns = (migrated.prepare('PRAGMA table_info(decisions)').all() as any[])
+        .map(column => column.name);
+      assert.ok(decisionColumns.includes('actor_agent_id'));
+      assert.ok(decisionColumns.includes('task_epoch'));
 
       // Old row reads back with kind NULL.
       const inbox = getInboxRaw(migrated, DEFAULT_SWARM_ID, 'Alice');

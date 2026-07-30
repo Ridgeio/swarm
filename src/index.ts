@@ -34,7 +34,6 @@ import {
   updateWorkspace,
 } from './registry.js';
 import {
-  acknowledgeAllMessages,
   acknowledgeMessages,
   broadcastMessage,
   countRecentMessages,
@@ -71,17 +70,24 @@ import { parseGlobalFlags } from './args.js';
 import { assertNameNotReserved, assertNotModelName } from './reserved-names.js';
 import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 import {
+  acceptTaskHandoff,
+  cancelTaskHandoff,
   checkpointTask,
   claimCloseRequirements,
   closeTask,
+  declineTaskHandoff,
   effectiveClaimKind,
+  getHandoffOfferHookLines,
   getTask,
   getActiveTaskHookLines,
   handoffTask,
+  listHandoffOffers,
+  offerTaskHandoff,
   reopenTask,
   recordDecision,
   runTaskCommand,
   startTask,
+  sweepHandoffOffers,
   type ClaimKind,
   type TaskDisposition,
 } from './tasks.js';
@@ -342,7 +348,7 @@ Communication:
     [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
                                                       --recent N replays last N regardless of cursor;
                                                       --kind filters and never advances the cursor)
-  swarm ack <msg-id...> | --all                    Acknowledge messages explicitly
+  swarm ack <msg-id...>                            Acknowledge exact messages explicitly
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Task Ledger:
@@ -367,7 +373,15 @@ Task Ledger:
     [--same-family-ok --reason <text>]
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
-  swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
+  swarm handoff offer <slug> --to <agent>          Offer a checkpoint-bound lease transfer
+    [--ttl <15m|2h|1d>] [--stale-ok]                 (source retains authority until acceptance)
+  swarm handoff accept <slug> [--offer <id>]       Accept the exact charter and transfer the lease
+  swarm handoff decline <slug> [--offer <id>]      Decline without transferring the lease
+    [--reason <text>]
+  swarm handoff cancel <slug> [--offer <id>]       Cancel your pending offer
+    [--reason <text>]
+  swarm handoff status [slug]                      Show pickup/dead-letter/acceptance state
+  swarm handoff <slug> --to <agent> [--stale-ok]   Legacy immediate transfer (unsafe for async pickup)
   swarm decision <text> [--task <slug>]            Record a durable decision
     [--supersedes <decision-id>]
   swarm harness-review <slug>                      Review the full task handoff timeline
@@ -528,7 +542,10 @@ function printHookContext(): void {
       return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
     }).join('\n')}`;
   const taskLines = getActiveTaskHookLines(db, self.swarm_id, self.name);
-  const taskSection = taskLines.length ? `\n${taskLines.join('\n')}` : '';
+  const handoffLines = getHandoffOfferHookLines(db, self.swarm_id, self.name);
+  const taskSection = taskLines.length || handoffLines.length
+    ? `\n${[...taskLines, ...handoffLines].join('\n')}`
+    : '';
   const janitorStatus = getJanitorStatus(db);
   const janitorSection = janitorStatus ? `\n${formatJanitorHookLine(janitorStatus)}` : '';
   const updateBanner = formatSwarmUpdateBanner(getSwarmVersionCache(db));
@@ -929,19 +946,24 @@ async function main() {
         const { db, self } = requireSelf(true);
         const all = hasFlag('--all');
         const rawIds = args.slice(1).filter(arg => arg !== '--all');
-        if ((all && rawIds.length > 0) || (!all && rawIds.length === 0)) {
-          console.error('Usage: swarm ack <msg-id...> | --all');
+        if (all) {
+          console.error(
+            'Refused unsafe "swarm ack --all": bulk acknowledgement can erase an unseen STOP, gate, question, or handoff. ' +
+            'Run "swarm inbox --peek", then acknowledge the exact IDs you actually handled.'
+          );
+          process.exit(1);
+        }
+        if (rawIds.length === 0) {
+          console.error('Usage: swarm ack <msg-id...>');
           process.exit(1);
         }
         const ids = rawIds.map(raw => Number(raw));
         if (ids.some((id, index) => !/^\d+$/.test(rawIds[index]) || id <= 0 || !Number.isSafeInteger(id))) {
           console.error('Message IDs must be positive integers.');
-          console.error('Usage: swarm ack <msg-id...> | --all');
+          console.error('Usage: swarm ack <msg-id...>');
           process.exit(1);
         }
-        const acknowledged = all
-          ? acknowledgeAllMessages(db, self.swarm_id, self.name)
-          : acknowledgeMessages(db, self.swarm_id, self.name, ids);
+        const acknowledged = acknowledgeMessages(db, self.swarm_id, self.name, ids);
         if (acknowledged.length === 0) {
           console.log('No messages to acknowledge.');
         } else {
@@ -1063,7 +1085,7 @@ async function main() {
             console.log(`  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} @${event.epoch}${data}`);
           }
           const decisions = db.prepare(`
-            SELECT id, body, made_by, supersedes, status, created_at
+            SELECT id, body, made_by, actor_agent_id, task_epoch, supersedes, status, created_at
             FROM decisions
             WHERE swarm_id = ? AND task_id = ?
             ORDER BY id ASC
@@ -1071,6 +1093,8 @@ async function main() {
             id: number;
             body: string;
             made_by: string;
+            actor_agent_id: string | null;
+            task_epoch: number | null;
             supersedes: number | null;
             status: string;
             created_at: string;
@@ -1079,7 +1103,13 @@ async function main() {
           if (decisions.length === 0) console.log('  none');
           for (const decision of decisions) {
             const supersedes = decision.supersedes ? ` supersedes #${decision.supersedes}` : '';
-            console.log(`  #${decision.id} [${decision.status}] ${decision.body} \u2014 ${decision.made_by}${supersedes}`);
+            const provenance =
+              `agent-id ${decision.actor_agent_id ?? 'legacy/unrecorded'}` +
+              `; task epoch ${decision.task_epoch ?? 'legacy/unrecorded'}`;
+            console.log(
+              `  #${decision.id} [${decision.status}] ${decision.body} \u2014 ` +
+              `${decision.made_by} (${provenance})${supersedes}`
+            );
           }
           break;
         }
@@ -1206,13 +1236,19 @@ async function main() {
           break;
         }
         if (subcommand === 'revoke') {
+          const { db: authenticatedDb, self } = requireSelf(true);
           const rawId = args[2];
           const id = Number(rawId);
           if (!rawId || !/^\d+$/.test(rawId) || id <= 0 || !Number.isSafeInteger(id)) {
             console.error(usage);
             process.exit(1);
           }
-          const grant = revokeGrant(db, swarm.id, id);
+          const authenticatedSwarm = getSwarmById(authenticatedDb, self.swarm_id);
+          if (!authenticatedSwarm || authenticatedSwarm.id !== swarm.id) {
+            console.error('Authenticated identity is not a member of the selected swarm.');
+            process.exit(1);
+          }
+          const grant = revokeGrant(authenticatedDb, swarm.id, id);
           if (!grant) {
             console.error(`Grant #${id} not found in swarm "${swarm.name}".`);
             process.exit(1);
@@ -1323,15 +1359,125 @@ async function main() {
       }
 
       case 'handoff': {
-        const slug = args[1];
+        const subcommand = args[1];
+        const { db, self } = requireSelf(true);
+        if (subcommand === 'offer') {
+          const slug = args[2];
+          const target = getFlag('--to');
+          if (!slug || !target) {
+            console.error('Usage: swarm handoff offer <slug> --to <agent> [--ttl <15m|2h|1d>] [--stale-ok]');
+            process.exit(1);
+          }
+          const result = await offerTaskHandoff(db, self.swarm_id, self.name, slug, target, {
+            ttl: getFlag('--ttl'),
+            staleOk: hasFlag('--stale-ok'),
+          });
+          console.log(
+            `Handoff offer #${result.offer.id} created for task "${slug}" to ${result.offer.to_agent}; ` +
+            `source owner ${result.offer.from_agent} retains lease epoch ${result.offer.source_epoch} until acceptance.`
+          );
+          console.log(`Pickup deadline: ${result.offer.expires_at}; charter sha256: ${result.offer.charter_sha256}`);
+          console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
+          break;
+        }
+        if (subcommand === 'accept') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff accept <slug> [--offer <id>]');
+            process.exit(1);
+          }
+          const result = await acceptTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff accept <slug> [--offer <id>]'
+            ),
+          });
+          console.log(
+            `Accepted handoff offer #${result.offer.id}; task "${slug}" is owned by ${result.task.owner_agent} ` +
+            `at lease epoch ${result.task.lease_epoch}.`
+          );
+          console.log(`Charter sha256: ${result.offer.charter_sha256}`);
+          break;
+        }
+        if (subcommand === 'decline') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff decline <slug> [--offer <id>] [--reason <text>]');
+            process.exit(1);
+          }
+          const result = await declineTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff decline <slug> [--offer <id>] [--reason <text>]'
+            ),
+            reason: getFlag('--reason'),
+          });
+          console.log(
+            `Declined handoff offer #${result.offer.id}; task "${slug}" remains owned by ` +
+            `${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`
+          );
+          break;
+        }
+        if (subcommand === 'cancel') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff cancel <slug> [--offer <id>] [--reason <text>]');
+            process.exit(1);
+          }
+          const result = cancelTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff cancel <slug> [--offer <id>] [--reason <text>]'
+            ),
+            reason: getFlag('--reason'),
+          });
+          console.log(
+            `Cancelled handoff offer #${result.offer.id}; task "${slug}" remains owned by ` +
+            `${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`
+          );
+          break;
+        }
+        if (subcommand === 'status') {
+          const slug = args[2];
+          sweepHandoffOffers(db, self.swarm_id);
+          const offers = listHandoffOffers(db, self.swarm_id, self.name, slug);
+          if (offers.length === 0) {
+            console.log(slug ? `No handoff offers recorded for task "${slug}".` : 'No handoff offers recorded for you.');
+            break;
+          }
+          for (const offer of offers) {
+            const resolution = offer.resolved_at
+              ? `; resolved ${offer.resolved_at}${offer.resolved_by ? ` by ${offer.resolved_by}` : ''}`
+              : '';
+            const accepted = offer.accepted_epoch === null ? '' : `; accepted epoch ${offer.accepted_epoch}`;
+            console.log(
+              `#${offer.id} ${offer.task_id} [${offer.status}] ${offer.from_agent} -> ${offer.to_agent}; ` +
+              `source epoch ${offer.source_epoch}; pickup ${offer.pickup_status}; deadline ${offer.expires_at}` +
+              `${accepted}${resolution}; charter sha256 ${offer.charter_sha256}`
+            );
+          }
+          console.log(`\n${offers.length} handoff offer(s)`);
+          break;
+        }
+
+        const slug = subcommand;
         const target = getFlag('--to');
         if (!slug || !target) {
-          console.error('Usage: swarm handoff <slug> --to <agent> [--stale-ok]');
+          console.error(
+            'Usage: swarm handoff offer|accept|decline|cancel|status ... | ' +
+            'swarm handoff <slug> --to <agent> [--stale-ok] (legacy immediate)'
+          );
           process.exit(1);
         }
-        const { db, self } = requireSelf();
+        console.warn(
+          'Warning: legacy immediate handoff transfers authority before recipient acceptance. ' +
+          'Use "swarm handoff offer <slug> --to <agent>" for deterministic asynchronous pickup.'
+        );
         const result = await handoffTask(db, self.swarm_id, self.name, slug, target, hasFlag('--stale-ok'));
-        console.log(`Task "${slug}" handed off to ${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`);
+        console.log(`Task "${slug}" handed off immediately to ${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`);
         console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
         break;
       }
@@ -1349,7 +1495,7 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf(true);
         const result = recordDecision(db, self.swarm_id, self.name, body, getFlag('--task'), supersedes);
         console.log(`Decision #${result.id} recorded.`);
         break;

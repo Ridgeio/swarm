@@ -54,14 +54,15 @@ A headless child never owns a task, never joins the bus as a peer, and never res
   `MERGE-REQ #<PR> @<exact-sha> — CI green (run <id>), review PASS @<same-sha>, mergeable clean.`
 - **Prod gate:** migrations, env, promotions, data mutations — lead executes, owner-visible.
 - **Task gate (⚙ WI-3, T1):** `swarm task close` refuses while unpushed/dirty/untracked work exists, and refuses evidence that doesn't match the task's claim kind; every close states its evidence ceiling (`--not-established`). A completion claim without its artifact is an ack, not a fact.
+- **Handoff gate:** asynchronous ownership changes use `swarm handoff offer` → named-recipient `accept`. The source keeps the fenced lease until acceptance of the exact charter digest and source epoch. Expiry dead-letters the offer; it never guesses that a push meant pickup. The legacy immediate form is compatibility-only.
 - **Grant gate (⚙ T2):** closing as *merged* and any `--override` require a live, expiring grant (`swarm grant create --op merge|override --resource <task|branch> --ttl <t>`); every use is audited. Approvals are records with scope and expiry, not chat memories. Request one with `swarm escalate <task>` — the packet carries the state, evidence, and the one question, so the operator decides without reconstructing your trajectory.
 
 ## Messaging rules (the bus is small — P4)
 
 1. **Status goes to the ledger, not the bus.** `swarm task checkpoint` / `swarm decision` — the PM and lead read state on demand. One message per program EVENT (contract agreed, PR open, gate passed, blocker), not per activity.
 2. **Direct send to the single agent who owns the next action.** Multi-send for 2–4 recipients. Broadcast: lead/PM only, and only for content that changes most agents' behavior.
-3. **No acks as messages.** Delivery state is transport metadata (⚙ WI-2 `swarm ack`). Ack your assigner one line ONLY when assignment acceptance itself is the information.
-4. **No receipt checks.** `swarm inbox --recent N` first; escalate only when a REQUIRED response is >30 min overdue.
+3. **No acks as messages.** Delivery state is transport metadata (⚙ WI-2 `swarm ack`). Acknowledge exact IDs only; `ack --all` is refused because it can erase an unseen STOP, gate, question, or handoff. Assignment acceptance is `swarm handoff accept`, not chat.
+4. **No receipt-check chatter.** For a required pickup, use a handoff offer with a deadline and inspect `swarm handoff status`; expiry is the deterministic dead letter. For non-handoff replies, `swarm inbox --recent N` first and escalate only when the required response is overdue.
 5. **Supersede, don't correct-by-append** (⚙ WI-1): a corrected SHA/order replaces the stale message via `--supersedes`; never leave both live.
 6. **Messages carry pointers, not content.** Specs, checkpoints, handoffs live in files; the message says what changed, where it lives, what the recipient must do.
 7. **Terminal reads are context, never decisions.** A decision exists when its owner sends it (or journals it via `swarm decision`).

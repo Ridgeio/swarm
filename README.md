@@ -104,7 +104,18 @@ swarm create docs --root /Users/tom/Developer/docs-site
 
 ## Task-based operation
 
-Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff` transfers authority with a checkpoint-backed brief; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
+Use the durable task ledger for work that must survive context loss, agent replacement, or fleet resets. `task start --claim` declares what completion means; checkpoints preserve mechanical Git facts plus decisions, failed approaches, next action, and blockers; `handoff offer` creates a digest-bound transfer that moves the lease only after the named recipient runs `handoff accept`; and `task close` requires matching evidence plus an explicit `--not-established` ceiling. Repo-backed tasks retain the Git preservation gates for every claim kind. Tasks, task events, handoff offers, decisions, run logs, and audited overrides survive as durable evidence across agent replacement; ledger rows survive `swarm reset`.
+
+For asynchronous work, use the two-phase path:
+
+```bash
+swarm handoff offer auth-refresh --to Bob --ttl 15m
+swarm handoff status auth-refresh
+# Bob, after reading the exact charter:
+swarm handoff accept auth-refresh --offer 7
+```
+
+The source owner retains the current lease and epoch until acceptance. The offer stores the source epoch, charter SHA-256, pickup deadline, pointer message ID, and delivery/ack state. An expired offer becomes a durable dead letter and does not transfer authority. The older `swarm handoff <slug> --to <agent>` form remains for compatibility but transfers immediately and is unsafe when recipient pickup is uncertain.
 
 `task close` only records a disposition; it never performs a merge. For a `code-merged` task, `--disposition merged` verifies that the task commit is reachable from origin's default branch (`origin/HEAD`, then `origin/main` or `origin/master`).
 With a local `file://` remote, the operator merges in the default-branch checkout and pushes that branch; fetch it in the task repository if needed, then retry close. Pushing only the feature branch is enough for `pr`, never for `merged`.
@@ -171,7 +182,7 @@ Messaging:
   swarm inbox [--peek|--unread|--recent [N]]  Read pending or historical messages
         [--wait <seconds>]
         [--kind <kind>]
-  swarm ack <msg-id...> | --all               Acknowledge pending deliveries
+  swarm ack <msg-id...>                       Acknowledge exact pending deliveries
   swarm redeliver [--dry-run]                 Retry eligible push notifications
 
 Task ledger:
@@ -196,8 +207,12 @@ Task ledger:
         [--same-family-ok --reason <text>]
   swarm task list                              List the durable task ledger
   swarm task show <slug>                       Show task facts, events, and decisions
-  swarm handoff <slug> --to <agent>            Transfer with a fresh checkpoint brief
-        [--stale-ok]
+  swarm handoff offer <slug> --to <agent>      Offer a digest-bound transfer
+        [--ttl <15m|2h|1d>] [--stale-ok]
+  swarm handoff accept <slug> [--offer <id>]   Accept and atomically transfer the lease
+  swarm handoff decline <slug> [--offer <id>]  Decline without transferring
+  swarm handoff cancel <slug> [--offer <id>]   Cancel your pending offer
+  swarm handoff status [slug]                  Show pickup/dead-letter state
   swarm decision <text> [--task <slug>]        Record a durable decision
         [--supersedes <decision-id>]
 
@@ -263,7 +278,7 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 
 | Command | One-line example |
 |---|---|
-| Acknowledge delivery | `swarm ack 41 42` or `swarm ack --all` |
+| Acknowledge delivery | `swarm ack 41 42` after handling those exact messages |
 | Supersede an instruction | `swarm send Bob "use the revised migration plan" --kind gate --supersedes 41` |
 | Start or take over a task | `swarm task start auth-refresh --title "Refresh auth" --repo . --claim code-merged --takeover` |
 | Checkpoint a task | `swarm task checkpoint auth-refresh --notes "Token rotation works; next run integration tests"` |
@@ -273,7 +288,8 @@ Joining a swarm auto-renames the agent's Cmux tab to `<swarm>/<agent>` for visua
 | Audit an override | `swarm task close auth-refresh --disposition archive --not-established "none" --override --reason "operator-approved recovery"` |
 | List tasks | `swarm task list` |
 | Show task history | `swarm task show auth-refresh` |
-| Hand off work | `swarm handoff auth-refresh --to Bob` |
+| Offer a safe handoff | `swarm handoff offer auth-refresh --to Bob --ttl 15m` |
+| Accept a handoff | `swarm handoff accept auth-refresh --offer 7` |
 | Record a decision | `swarm decision "DECISION: keep JWT BECAUSE clients depend on it" --task auth-refresh` |
 | Create a rescue | `swarm rescue --task auth-refresh` |
 | List rescues | `swarm rescue --list` |

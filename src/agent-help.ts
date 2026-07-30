@@ -53,13 +53,13 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
 
   { command: 'send', group: 'messaging', line: 'send — message named agents' },
   { command: 'broadcast', group: 'messaging', line: 'broadcast — message the swarm' },
-  { command: 'ack', group: 'messaging', line: 'ack — acknowledge deliveries' },
+  { command: 'ack', group: 'messaging', line: 'ack — acknowledge exact delivery IDs (no --all)' },
   { command: 'inbox', group: 'messaging', line: 'inbox — read queued messages' },
   { command: 'redeliver', group: 'messaging', line: 'redeliver — retry pending pushes' },
 
   { command: 'task', group: 'tasks+evidence', line: 'task — start, checkpoint, show, list, close, reopen' },
   { command: 'run', group: 'tasks+evidence', line: 'run — capture a task evidence log' },
-  { command: 'handoff', group: 'tasks+evidence', line: 'handoff — transfer task authority' },
+  { command: 'handoff', group: 'tasks+evidence', line: 'handoff — offer/accept a charter-bound task lease transfer' },
   { command: 'decision', group: 'tasks+evidence', line: 'decision — record a durable decision' },
   { command: 'harness-review', group: 'tasks+evidence', line: 'harness-review — review a task handoff loop' },
 

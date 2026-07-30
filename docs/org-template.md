@@ -54,7 +54,7 @@ A headless child never owns a task, never joins the bus as a peer, and never res
   `MERGE-REQ #<PR> @<exact-sha> — CI green (run <id>), review PASS @<same-sha>, mergeable clean.`
 - **Prod gate:** migrations, env, promotions, data mutations — lead executes, owner-visible.
 - **Task gate (⚙ WI-3, T1):** `swarm task close` refuses while unpushed/dirty/untracked work exists, and refuses evidence that doesn't match the task's claim kind; every close states its evidence ceiling (`--not-established`). A completion claim without its artifact is an ack, not a fact.
-- **Handoff gate:** asynchronous ownership changes use `swarm handoff offer` → named-recipient `accept`. The source keeps the fenced lease until acceptance of the exact charter digest and source epoch. Expiry dead-letters the offer; it never guesses that a push meant pickup. The legacy immediate form is compatibility-only.
+- **Handoff gate:** ownership changes use `swarm handoff offer` → exact named-registration `accept`. The source keeps the ID+epoch-fenced lease until acceptance of the exact charter digest and source epoch. Expiry dead-letters the offer, durably notifies the source plus active Owner/Lead registrations, and never guesses that a push meant pickup. There is no immediate-transfer compatibility path.
 - **Grant gate (⚙ T2):** closing as *merged* and any `--override` require a live, expiring grant (`swarm grant create --op merge|override --resource <task|branch> --ttl <t>`); every use is audited. Approvals are records with scope and expiry, not chat memories. Request one with `swarm escalate <task>` — the packet carries the state, evidence, and the one question, so the operator decides without reconstructing your trajectory.
 
 ## Messaging rules (the bus is small — P4)

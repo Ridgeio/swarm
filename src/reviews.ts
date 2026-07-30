@@ -3,7 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { evidenceLines, latestCheckpoint } from './escalations.js';
-import { sendMessage } from './mailbox.js';
+import { enqueueDirectMessage, flushMessageOutbox } from './mailbox.js';
 import { getAgent, listAgents, type Agent } from './registry.js';
 import {
   getTask,
@@ -12,6 +12,7 @@ import {
   validateTaskSlug,
   type Task,
 } from './tasks.js';
+import { requireActiveAgent } from './authority.js';
 
 export type ModelFamily = 'claude' | 'openai' | 'xai' | 'google' | 'unknown';
 
@@ -162,7 +163,10 @@ export async function requestTaskReview(
 
   const authority = requireTaskAuthority(db, swarmId, slug, actor, 'review');
   const task = authority.task;
-  const author = task.owner_agent ? getAgent(db, swarmId, task.owner_agent) : null;
+  const author = task.owner_agent_id
+    ? db.prepare('SELECT * FROM agents WHERE swarm_id = ? AND id = ?')
+      .get(swarmId, task.owner_agent_id) as Agent | undefined
+    : undefined;
   const authorFamily = deriveModelFamily(author?.host_agent);
   const liveAgents = await listAgents(db, swarmId);
   const alternatives = differentFamilyAgents(liveAgents, authorFamily);
@@ -203,8 +207,21 @@ export async function requestTaskReview(
   // Recheck the original lease epoch immediately before the state/event mutation.
   requireTaskAuthority(db, swarmId, slug, actor, 'review', authority.epoch);
   const updated = withImmediateTransaction(db, () => {
+    const currentActor = requireActiveAgent(db, swarmId, actor, 'request review');
+    const currentReviewer = getAgent(db, swarmId, reviewer.name);
+    if (!currentReviewer || currentReviewer.id !== reviewer.id) {
+      throw new Error(
+        `Reviewer "${reviewer.name}" registration changed while the review brief was being prepared. ` +
+        `Re-run swarm review ${slug}.`
+      );
+    }
     const current = getTask(db, swarmId, slug);
-    if (!current || !sameName(current.owner_agent, actor) || current.lease_epoch !== authority.epoch) {
+    if (
+      !current ||
+      current.owner_agent_id !== currentActor.id ||
+      currentActor.id !== task.owner_agent_id ||
+      current.lease_epoch !== authority.epoch
+    ) {
       throw new Error(`Task "${slug}" authority changed while the review brief was being prepared. Re-run swarm review ${slug}.`);
     }
     const createdAt = now.toISOString();
@@ -214,36 +231,49 @@ export async function requestTaskReview(
     `).run(createdAt, swarmId, slug);
     if (reviewerFamily === authorFamily && options.sameFamilyOk) {
       db.prepare(`
-        INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
-        VALUES (?, ?, ?, 'same_family_review', ?, ?, ?)
-      `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
+        INSERT INTO task_events (
+          swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+        ) VALUES (?, ?, ?, 'same_family_review', ?, ?, ?, ?)
+      `).run(swarmId, slug, current.lease_epoch, currentActor.name, currentActor.id, JSON.stringify({
         reviewer: reviewer.name,
         reviewer_family: reviewerFamily,
         reason: options.reason!.trim(),
       }), createdAt);
     }
     db.prepare(`
-      INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
-      VALUES (?, ?, ?, 'review_requested', ?, ?, ?)
-    `).run(swarmId, slug, current.lease_epoch, actor, JSON.stringify({
+      INSERT INTO task_events (
+        swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+      ) VALUES (?, ?, ?, 'review_requested', ?, ?, ?, ?)
+    `).run(swarmId, slug, current.lease_epoch, currentActor.name, currentActor.id, JSON.stringify({
       author_family: authorFamily,
       reviewer: reviewer.name,
+      reviewer_agent_id: reviewer.id,
       reviewer_family: reviewerFamily,
       brief_path: briefPath,
     }), createdAt);
-    return getTask(db, swarmId, slug)!;
-  }) as Task;
+    const messageId = enqueueDirectMessage(
+      db,
+      swarmId,
+      currentActor.name,
+      reviewer.name,
+      briefPath,
+      {
+        createdAt,
+        kind: 'gate',
+        fromAgentId: currentActor.id,
+        recipientAgentId: reviewer.id,
+      }
+    );
+    return { task: getTask(db, swarmId, slug)!, messageId };
+  }) as { task: Task; messageId: number };
 
-  const delivery = await sendMessage(db, swarmId, actor, reviewer.name, briefPath, undefined, 'gate');
-  if (!delivery.delivered && !delivery.queued) {
-    throw new Error(`Review brief was written to ${briefPath}, but pointer delivery failed: ${delivery.message}`);
-  }
+  await flushMessageOutbox(db, [updated.messageId]);
   return {
-    task: updated,
+    task: updated.task,
     briefPath,
     reviewer: reviewer.name,
     authorFamily,
     reviewerFamily,
-    messageId: delivery.messageId ?? null,
+    messageId: updated.messageId,
   };
 }

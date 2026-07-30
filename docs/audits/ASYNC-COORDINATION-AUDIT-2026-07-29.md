@@ -1,90 +1,58 @@
 # Deterministic asynchronous coordination audit — 2026-07-29
 
-Scope: the local Swarm CLI at `ef91f8f`, evaluated against five operator requirements:
+Scope: the hardening successor to `0dadc34`, evaluated against the operator's asynchronous-control requirements and the blocking adversarial findings. Delivery, pickup, acceptance, and authority transfer are distinct states: a successful terminal/A2A push is never treated as acceptance.
 
-1. offer → named-recipient acceptance → fenced lease transfer;
-2. sender-visible pickup deadline, watchdog, and dead-letter/escalation;
-3. durable delivery state bound to charter digest and lease epoch;
-4. no unsafe `ack --all`;
-5. ACL/provenance for lead and decision authority.
+## Closed blocking findings
 
-This audit distinguishes **delivery**, **pickup**, **acceptance**, and **authority transfer**. A successful terminal push proves only delivery attempt. It is not acceptance.
+| Control | Landed invariant |
+| --- | --- |
+| Immutable authority | Tasks, task events, direct deliveries, roles, grants, decisions, and handoff parties bind immutable registration IDs. A same-name rejoin receives a new ID and inherits none of them. |
+| Legacy ownership | A task with a NULL owner ID refuses privileged mutation. `task rebind --to --reason` is an explicit Owner/Lead-only recovery that bumps the epoch and records authorization plus rebound events. |
+| Current checkpoint | A handoff charter may use only a checkpoint event from the current owner registration at the current lease epoch. A prior-epoch or same-name-replacement checkpoint is rejected. |
+| Owner/Lead ACL | The first privileged local registration bootstraps Owner and Lead for its exact ID. Only an active Owner/Lead may assign those roles, create/revoke grants, take over/recover another registration's task, or make program-scope decisions. |
+| Grant provenance | Grant issuer and recipient IDs are durable. Expiry checks use a persisted monotonic scope clock. Same-name replacements cannot consume old grants. |
+| Decision provenance | Task decisions require the exact current task owner+epoch; program decisions require Owner/Lead. Only the exact original active author may supersede an active decision at the same scope, and an immediate transaction plus unique fence permits one successor. |
+| Safe handoff only | Immediate handoff is removed. The only transfer path is offer → exact named-registration acceptance. |
+| Commit-before-push | Offer, accept, decline, takeover, review, escalation, and expiry notifications enqueue their canonical message, exact-recipient delivery, and durable outbox row in the same immediate transaction as the state/event change. Push happens only after commit. |
+| Crash recovery | Failpoints after commit/before push prove that canonical state and a pending outbox row survive. The outbox retry path can finish delivery without reconstructing the transition. |
+| Fleet deadline sweep | Every janitor tick sweeps every registered swarm. Expiry transitions once and creates exactly one durable notification row per source/authority audience, deduplicating an agent that holds both roles. |
+| Clock rollback | Handoff and grant deadline scopes persist their last observed wall time. A rollback fails closed instead of extending or reviving authority. |
+| Privileged identity | Privileged mutations require an active local registration with a non-NULL token matching the session marker. Legacy NULL-token and A2A identities retain read/messaging compatibility but cannot mutate privileged coordination state. |
+| Reset generation | Reset revokes every live in-scope grant and clears role bindings before removing agents. The next token-bound local join can bootstrap fresh Owner/Lead IDs; surviving task leases remain fenced until authorized takeover/rebind. |
+| Exact acknowledgement | `ack --all` is refused and the former library bulk-ack helper is removed. Only explicit message IDs can be acknowledged. |
+| Parser no-op | `decision --help`, unknown options, and missing option values exit before authentication/database mutation. A regression test asserts decision-row count is unchanged. |
 
-## Findings before this slice
+## Handoff state machine
 
-| Requirement | Prior state | Evidence / consequence |
-| --- | --- | --- |
-| Two-phase handoff | Failed | `handoffTask` changed owner and incremented the epoch before sending the pointer. An inactive/missing recipient could strand the only active lease. |
-| Pickup deadline / dead letter | Partial | Push retry had a bounded 30-minute window, but the sender had no message-specific pickup deadline or terminal state. Handoffs had no dead-letter state. |
-| Digest + epoch binding | Failed | Handoff briefs were files referenced by a message; acceptance did not re-hash a charter, and no durable row tied the pointer to the source epoch. |
-| Unsafe bulk ack | Failed | `swarm ack --all` acknowledged every live row, including unseen STOP/gate/handoff messages. |
-| ACL / provenance | Partial | Session tokens authenticated several verbs, but `handoff` and `decision` used unauthenticated self-resolution. Task decisions stored only a mutable display name and any agent could supersede another agent's decision. There was no explicit lead role ACL. |
+1. The current ID+epoch owner creates a current checkpoint.
+2. `handoff offer` composes and hashes the immutable charter.
+3. One immediate transaction inserts the pending offer, its audit event, pointer message, exact-recipient delivery, and outbox row. The source lease remains unchanged.
+4. Push is attempted after commit. Failure changes delivery state only; it cannot erase the offer.
+5. Only the offer's exact recipient registration may accept. Acceptance re-hashes the charter and verifies source ID, source epoch, recipient ID, deadline, and monotonic clock.
+6. One immediate transaction transfers owner name+ID, increments the epoch, resolves the offer, records the acceptance event, and queues the acknowledgement.
+7. Expiry or invalidation never transfers authority. The janitor records expiry and durable escalation; late acceptance independently fails closed even if the janitor has not run.
 
-## Landed in this slice
+## Adversarial negative controls
 
-### Handoff safety
+The hardening suite exercises:
 
-- `swarm handoff offer <slug> --to <agent> [--ttl 15m]` writes a durable `handoff_offers` row and leaves the source owner/epoch unchanged.
-- The row binds:
-  - source task epoch;
-  - source and recipient names plus exact agent-registration IDs;
-  - immutable charter path and SHA-256;
-  - pickup deadline;
-  - pointer message ID and its per-recipient delivery/ack projection.
-- `swarm handoff accept <slug> --offer <id>` is named-recipient-only. In one immediate SQLite transaction it:
-  - refuses expired/non-pending offers;
-  - verifies the exact recipient registration;
-  - verifies unchanged source owner + epoch;
-  - re-hashes the charter;
-  - transfers the task and increments the epoch exactly once;
-  - records `handoff_accepted` at the accepted epoch.
-- A recipient can checkpoint/close at the accepted epoch without an extra `task start`.
-- Digest mismatch, changed task authority, or changed recipient registration invalidates the offer without transferring the source lease.
-- Deadline sweeps are idempotent. Expiry records `handoff_offer_expired`; hook/status output calls it a **DEAD LETTER** and explicitly says the source lease was not transferred.
-- `swarm handoff status [slug]` exposes `queued`, `pushed-unconfirmed`, `pending`, `injected`, or `acked` pickup separately from offer resolution.
+- same-name rejoin cannot inherit task, Owner/Lead role, grant, direct-recipient message, or decision-author authority;
+- a member cannot create/revoke grants, make a program decision, or recover another owner's task;
+- a prior-epoch checkpoint cannot authorize handoff after takeover;
+- a second decision successor and supersession by a reassigned same-name registration both fail;
+- crashes after offer/accept commit but before push leave atomic durable state and retryable outbox rows;
+- one janitor tick expires offers in multiple swarms and repeated ticks create no duplicate audience rows;
+- handoff and grant clocks reject rollback;
+- legacy NULL-token and A2A identities can read but cannot perform privileged mutations;
+- help, unknown options, and missing values create no decision rows;
+- exact acknowledgement leaves every unlisted STOP/gate/handoff delivery live.
 
-### Message and decision safety
+The release gate is the full TypeScript build and test suite on the exact candidate SHA, followed by a fresh cross-family adversarial review. Verdicts from `0dadc34` or earlier are not reusable.
 
-- CLI `swarm ack --all` is refused with the recovery path: peek, handle, then acknowledge exact IDs.
-- Handoff, decision, and grant-revoke mutations now require authenticated self-resolution.
-- Task-bound decisions require the current fenced task owner and record both `actor_agent_id` and `task_epoch`.
-- A decision can be superseded only by its original authenticated author and only at the same task/program scope.
+## Honest residual boundaries
 
-## Verified invariants
-
-The dedicated tests prove:
-
-- offer does not change source owner or epoch;
-- ordinary inbox pickup becomes sender-visible as `acked`;
-- exact-recipient acceptance transfers epoch 1 → 2;
-- the former owner is fenced and the recipient can checkpoint at epoch 2;
-- charter mutation invalidates without transfer;
-- same-name recipient rejoin cannot accept an offer bound to the prior registration;
-- expiry is idempotent and late acceptance cannot transfer;
-- `ack --all` leaves an injected gate live;
-- task decision provenance stores exact agent ID + epoch and rejects non-owner writes/foreign supersession.
-
-## Honest residual gaps
-
-This is a coherent high-value slice, not the complete coordination control plane:
-
-1. **The watchdog is opportunistic, not a daemon.** Acceptance always fails closed after the deadline, so authority safety is deterministic. The visible `pending → expired` row is materialized on hook, status, a new offer, or acceptance. No long-lived process currently wakes the sender at the deadline.
-2. **Deadlines are handoff-specific.** General STOP, gate, blocking-question, and required-reply messages retain durable per-recipient rows and hook injection, but a sender cannot yet declare `response_required_by` or an escalation target.
-3. **No lead ACL exists.** Any authenticated agent can still create grants and record program-scope decisions. The database has no explicit immutable Owner/Lead role assignment or authority-transfer event.
-4. **Legacy compatibility remains a bypass.** `swarm handoff <slug> --to <agent>` still transfers immediately and now emits a warning. New asynchronous workflows must use `handoff offer`; making the safe path the only/default path is a deliberate compatibility-breaking follow-up.
-5. **Trust-model caveats remain.** Legacy NULL-token rows and A2A endpoint identity are grandfathered. A malicious same-user local process can read SQLite/session material.
-6. **Library-only bulk ack remains.** The exported `acknowledgeAllMessages` helper remains for source compatibility, while the operator-facing CLI refuses it. It should be removed after downstream-call inventory.
-
-## Next bounded slice
-
-Add a generalized durable `required_actions` envelope:
-
-- kind: STOP / gate / question / reply / handoff;
-- exact sender/recipient agent IDs and source task epoch;
-- payload/charter digest;
-- `required_by`, pickup state, response state, supersession lineage;
-- one per-host watchdog that transitions overdue rows to dead-letter exactly once and emits a routed escalation;
-- explicit swarm roles (`owner`, `lead`, `member`, `auditor`) with authenticated, event-logged role transfer;
-- ACL enforcement for grant creation/revocation, program decisions, and escalation resolution;
-- make two-phase handoff the default and put immediate transfer behind a separately granted recovery verb;
-- remove the library bulk-ack helper after call-site inventory.
+1. **Push transport is at-least-once, durable state is exactly-once.** The SQLite transition/outbox and expiry-audience rows are uniqueness-fenced. A process can still crash after an external push succeeds but before marking the outbox row pushed, so a retry may duplicate the terminal nudge. Consumers must continue treating the inbox row/ID as canonical.
+2. **General required-response deadlines are not implemented.** Handoff deadlines are deterministic. Ordinary STOP, gate, question, and required-reply messages have durable exact-recipient delivery but no generic `required_by` state machine.
+3. **The local-machine trust boundary remains.** These controls stop stale, unauthenticated, A2A, and ordinary member actions through supported APIs. They do not defend against a malicious same-user process that edits SQLite or steals a live session token.
+4. **Wall-clock rollback fails closed; forward jumps expire early.** This is the conservative authority-safety choice until a trusted time source exists.
+5. **Filesystem cleanup remains observe-only.** The janitor mutates only coordination-ledger deadline/audit/outbox state; it still never deletes repositories, worktrees, or artifacts.

@@ -7,7 +7,9 @@ export interface Message {
   id: number;
   swarm_id: string;
   from_agent: string;
+  from_agent_id: string | null;
   to_agent: string | null;
+  to_agent_id: string | null;
   body: string;
   delivered: number;
   created_at: string;
@@ -19,6 +21,7 @@ export interface MessageDelivery {
   message_id: number;
   swarm_id: string;
   recipient: string;
+  recipient_agent_id: string | null;
   status: 'pending' | 'injected' | 'acked';
   first_injected_at: string | null;
   inject_count: number;
@@ -54,39 +57,186 @@ export const HOOK_INJECT_COLLAPSE_COUNT = 3;
 export const HOOK_INJECT_BACKOFF_MINUTES = 45;
 export const HOOK_INJECT_BACKOFF_MS = HOOK_INJECT_BACKOFF_MINUTES * 60_000;
 
-function insertMessage(
+export interface EnqueueDirectMessageOptions {
+  createdAt?: string;
+  kind?: string | null;
+  supersedes?: number;
+  fromAgentId?: string | null;
+  recipientAgentId?: string;
+}
+
+export interface FlushOutboxResult {
+  pushed: number;
+  queued: number;
+}
+
+/**
+ * Insert the canonical message, exact-recipient delivery row, and push outbox
+ * record. This function deliberately does not open a transaction: callers can
+ * compose it into the same IMMEDIATE transaction as an offer/acceptance.
+ */
+export function enqueueDirectMessage(
   db: SwarmDb,
   swarmId: string,
   fromName: string,
-  toName: string | null,
+  toName: string,
   body: string,
-  createdAt: string,
-  kind: string | null,
-  supersedes?: number
+  options: EnqueueDirectMessageOptions = {}
 ): number {
-  return withImmediateTransaction(db, () => {
-    if (supersedes !== undefined) {
-      const owned = db.prepare(`
-        SELECT id FROM messages
-        WHERE id = ? AND swarm_id = ? AND from_agent = ? COLLATE NOCASE
-      `).get(supersedes, swarmId, fromName);
-      if (!owned) {
-        throw new Error(`Cannot supersede message #${supersedes}: you can only supersede your own messages in this swarm.`);
+  const target = getAgent(db, swarmId, toName);
+  const recipientAgentId = options.recipientAgentId ?? target?.id;
+  if (!recipientAgentId) {
+    throw new Error(`Agent "${toName}" not found. Run 'swarm members' to see active agents.`);
+  }
+  const canonicalRecipient = target?.id === recipientAgentId ? target.name : toName;
+  const source = getAgent(db, swarmId, fromName);
+  const fromAgentId = options.fromAgentId === undefined ? source?.id ?? null : options.fromAgentId;
+  if (fromAgentId !== null && source?.id !== fromAgentId) {
+    throw new Error(
+      `Sender registration changed for "${fromName}" before the message committed; ` +
+      're-resolve identity and retry.'
+    );
+  }
+  const createdAt = options.createdAt ?? new Date().toISOString();
+
+  if (options.supersedes !== undefined) {
+    const previous = db.prepare(`
+      SELECT id, from_agent_id FROM messages
+      WHERE id = ? AND swarm_id = ?
+    `).get(options.supersedes, swarmId) as { id: number; from_agent_id: string | null } | undefined;
+    const sameImmutableSender = previous && fromAgentId !== null && previous.from_agent_id === fromAgentId;
+    if (!sameImmutableSender) {
+      throw new Error(
+        `Cannot supersede message #${options.supersedes}: you can only supersede your own messages, ` +
+        'and ownership is the same authenticated sender registration ID.'
+      );
+    }
+  }
+
+  const result = db.prepare(`
+    INSERT INTO messages (
+      swarm_id, from_agent, from_agent_id, to_agent, to_agent_id,
+      body, delivered, created_at, kind
+    ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+  `).run(
+    swarmId,
+    fromName,
+    fromAgentId,
+    canonicalRecipient,
+    recipientAgentId,
+    body,
+    createdAt,
+    options.kind ?? null
+  );
+  const messageId = Number(result.lastInsertRowid);
+
+  db.prepare(`
+    INSERT INTO message_deliveries (
+      message_id, swarm_id, recipient, recipient_agent_id, status
+    ) VALUES (?, ?, ?, ?, 'pending')
+  `).run(messageId, swarmId, canonicalRecipient, recipientAgentId);
+  db.prepare(`
+    INSERT INTO message_outbox (
+      message_id, swarm_id, recipient_agent_id, state, attempts,
+      last_error, created_at, pushed_at
+    ) VALUES (?, ?, ?, 'pending', 0, NULL, ?, NULL)
+  `).run(messageId, swarmId, recipientAgentId, createdAt);
+
+  if (options.supersedes !== undefined) {
+    db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ? AND swarm_id = ?')
+      .run(messageId, options.supersedes, swarmId);
+  }
+  return messageId;
+}
+
+export async function flushMessageOutbox(
+  db: SwarmDb,
+  messageIds?: readonly number[],
+  deliver: typeof deliverToAgent = deliverToAgent
+): Promise<FlushOutboxResult> {
+  if (messageIds?.length === 0) return { pushed: 0, queued: 0 };
+  const params: number[] = [];
+  let filter = '';
+  if (messageIds) {
+    const ids = [...new Set(messageIds)];
+    filter = `AND o.message_id IN (${ids.map(() => '?').join(', ')})`;
+    params.push(...ids);
+  }
+  const rows = db.prepare(`
+    SELECT
+      o.message_id,
+      o.recipient_agent_id,
+      m.swarm_id,
+      m.from_agent,
+      m.body,
+      a.id AS active_agent_id
+    FROM message_outbox o
+    JOIN messages m ON m.id = o.message_id AND m.swarm_id = o.swarm_id
+    LEFT JOIN agents a
+      ON a.id = o.recipient_agent_id AND a.swarm_id = o.swarm_id
+    WHERE o.state = 'pending'
+      ${filter}
+    ORDER BY o.message_id ASC, o.recipient_agent_id ASC
+  `).all(...params) as Array<{
+    message_id: number;
+    recipient_agent_id: string;
+    swarm_id: string;
+    from_agent: string;
+    body: string;
+    active_agent_id: string | null;
+  }>;
+
+  let pushed = 0;
+  let queued = 0;
+  for (const row of rows) {
+    const target = row.active_agent_id
+      ? db.prepare('SELECT * FROM agents WHERE id = ? AND swarm_id = ?')
+        .get(row.recipient_agent_id, row.swarm_id) as unknown as ReturnType<typeof getAgent>
+      : null;
+    if (!target) {
+      db.prepare(`
+        UPDATE message_outbox
+        SET attempts = attempts + 1, last_error = ?
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run('recipient registration is not active', row.message_id, row.recipient_agent_id);
+      queued += 1;
+      continue;
+    }
+    try {
+      const result = await deliver(target, `[SWARM from ${row.from_agent}]: ${row.body}`);
+      if (!result.delivered) {
+        db.prepare(`
+          UPDATE message_outbox
+          SET attempts = attempts + 1, last_error = ?
+          WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+        `).run(result.error ?? 'push delivery failed', row.message_id, row.recipient_agent_id);
+        queued += 1;
+        continue;
       }
+      const pushedAt = new Date().toISOString();
+      const changed = db.prepare(`
+        UPDATE message_outbox
+        SET state = 'pushed', attempts = attempts + 1, last_error = NULL, pushed_at = ?
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run(pushedAt, row.message_id, row.recipient_agent_id);
+      if (Number(changed.changes) > 0) {
+        db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(row.message_id);
+        pushed += 1;
+      }
+    } catch (error: unknown) {
+      db.prepare(`
+        UPDATE message_outbox
+        SET attempts = attempts + 1, last_error = ?
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run(
+        error instanceof Error ? error.message : String(error),
+        row.message_id,
+        row.recipient_agent_id
+      );
+      queued += 1;
     }
-
-    const result = db.prepare(`
-      INSERT INTO messages (swarm_id, from_agent, to_agent, body, delivered, created_at, kind)
-      VALUES (?, ?, ?, ?, 0, ?, ?)
-    `).run(swarmId, fromName, toName, body, createdAt, kind);
-    const messageId = Number(result.lastInsertRowid);
-
-    if (supersedes !== undefined) {
-      db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ? AND swarm_id = ?')
-        .run(messageId, supersedes, swarmId);
-    }
-    return messageId;
-  });
+  }
+  return { pushed, queued };
 }
 
 export async function sendMessage(
@@ -104,18 +254,24 @@ export async function sendMessage(
     return { delivered: false, queued: false, message: `Agent "${toName}" not found. Run 'swarm members' to see active agents.` };
   }
 
-  const now = new Date().toISOString();
-  const formatted = `[SWARM from ${fromName}]: ${body}`;
-
-  // Store the canonical registered name (getAgent matches case-insensitively).
-  // messages.to_agent is compared case-sensitively in getInbox, so persisting the
-  // raw sender-typed casing would make a case-mismatched message invisible to the
-  // recipient's inbox while still reporting success.
-  const msgId = insertMessage(db, swarmId, fromName, target.name, body, now, kind ?? null, supersedes);
-
-  const deliveryResult = await deliverToAgent(target, formatted, options);
-  if (deliveryResult.delivered) {
-    db.prepare('UPDATE messages SET delivered = 1 WHERE id = ?').run(msgId);
+  const msgId = withImmediateTransaction(db, () => enqueueDirectMessage(
+    db,
+    swarmId,
+    fromName,
+    target.name,
+    body,
+    {
+      kind: kind ?? null,
+      supersedes,
+      recipientAgentId: target.id,
+    }
+  ));
+  const deliveryResult = await flushMessageOutbox(
+    db,
+    [msgId],
+    (agent, formatted) => deliverToAgent(agent, formatted, options)
+  );
+  if (deliveryResult.pushed > 0) {
     return { delivered: true, queued: false, message: `Message sent to ${toName}`, messageId: msgId };
   } else {
     // Push failed but the message is in the DB. Cmux/headless recipients pick it
@@ -138,7 +294,7 @@ export async function broadcastMessage(
   supersedes?: number
 ): Promise<{ sent: number; queued: number; failed: number; messageId?: number }> {
   const agents = await listAgents(db, swarmId);
-  const recipients = agents.filter(a => a.name !== fromName);
+  const recipients = agents.filter(a => a.name.toLowerCase() !== fromName.toLowerCase());
 
   if (recipients.length === 0) {
     return { sent: 0, queued: 0, failed: 0 };
@@ -146,14 +302,73 @@ export async function broadcastMessage(
 
   const now = new Date().toISOString();
   const formatted = `[SWARM from ${fromName}]: ${body}`;
-
-  // Insert message row first (one broadcast row, to_agent = NULL)
-  const msgId = insertMessage(db, swarmId, fromName, null, body, now, kind ?? null, supersedes);
+  const source = getAgent(db, swarmId, fromName);
+  const msgId = withImmediateTransaction(db, () => {
+    const currentSource = getAgent(db, swarmId, fromName);
+    if ((currentSource?.id ?? null) !== (source?.id ?? null)) {
+      throw new Error(
+        `Sender registration changed for "${fromName}" before the broadcast committed; ` +
+        're-resolve identity and retry.'
+      );
+    }
+    if (supersedes !== undefined) {
+      const previous = db.prepare(`
+        SELECT from_agent_id FROM messages WHERE id = ? AND swarm_id = ?
+      `).get(supersedes, swarmId) as { from_agent_id: string | null } | undefined;
+      if (!previous || source?.id === undefined || previous.from_agent_id !== source.id) {
+        throw new Error(
+          `Cannot supersede message #${supersedes}: you can only supersede your own messages, ` +
+          'and ownership is the same authenticated sender registration ID.'
+        );
+      }
+    }
+    const inserted = db.prepare(`
+      INSERT INTO messages (
+        swarm_id, from_agent, from_agent_id, to_agent, to_agent_id,
+        body, delivered, created_at, kind
+      ) VALUES (?, ?, ?, NULL, NULL, ?, 0, ?, ?)
+    `).run(swarmId, fromName, source?.id ?? null, body, now, kind ?? null);
+    const id = Number(inserted.lastInsertRowid);
+    const deliveryInsert = db.prepare(`
+      INSERT INTO message_deliveries (
+        message_id, swarm_id, recipient, recipient_agent_id, status
+      ) VALUES (?, ?, ?, ?, 'pending')
+    `);
+    const outboxInsert = db.prepare(`
+      INSERT INTO message_outbox (
+        message_id, swarm_id, recipient_agent_id, state, attempts,
+        last_error, created_at, pushed_at
+      ) VALUES (?, ?, ?, 'pending', 0, NULL, ?, NULL)
+    `);
+    for (const recipient of recipients) {
+      deliveryInsert.run(id, swarmId, recipient.name, recipient.id);
+      outboxInsert.run(id, swarmId, recipient.id, now);
+    }
+    if (supersedes !== undefined) {
+      db.prepare('UPDATE messages SET superseded_by = ? WHERE id = ? AND swarm_id = ?')
+        .run(id, supersedes, swarmId);
+    }
+    return id;
+  });
 
   // Deliver to all recipients in parallel
-  const results = await Promise.all(
-    recipients.map(async agent => ({ agent, result: await deliverToAgent(agent, formatted, options) }))
-  );
+  const results = await Promise.all(recipients.map(async agent => {
+    const result = await deliverToAgent(agent, formatted, options);
+    if (result.delivered) {
+      db.prepare(`
+        UPDATE message_outbox
+        SET state = 'pushed', attempts = attempts + 1, last_error = NULL, pushed_at = ?
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run(new Date().toISOString(), msgId, agent.id);
+    } else {
+      db.prepare(`
+        UPDATE message_outbox
+        SET attempts = attempts + 1, last_error = ?
+        WHERE message_id = ? AND recipient_agent_id = ? AND state = 'pending'
+      `).run(result.error ?? 'push delivery failed', msgId, agent.id);
+    }
+    return { agent, result };
+  }));
 
   let sent = 0;
   let queued = 0;
@@ -189,15 +404,17 @@ function ensureDeliveryRows(
   db: SwarmDb,
   swarmId: string,
   agentName: string,
+  agentId: string | null,
   messageIds: number[]
 ): void {
   if (messageIds.length === 0) return;
   const insert = db.prepare(`
-    INSERT OR IGNORE INTO message_deliveries (message_id, swarm_id, recipient)
-    VALUES (?, ?, ?)
+    INSERT OR IGNORE INTO message_deliveries (
+      message_id, swarm_id, recipient, recipient_agent_id
+    ) VALUES (?, ?, ?, ?)
   `);
   withImmediateTransaction(db, () => {
-    for (const id of messageIds) insert.run(id, swarmId, agentName);
+    for (const id of messageIds) insert.run(id, swarmId, agentName, agentId);
   });
 }
 
@@ -229,30 +446,37 @@ export function acknowledgeMessages(
   if (ids.some(id => !Number.isSafeInteger(id) || id <= 0)) {
     throw new Error('Message IDs must be positive integers.');
   }
-
   const visible = db.prepare(`
-    SELECT id FROM messages
-    WHERE id = ? AND swarm_id = ?
-      AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
-      AND from_agent != ? COLLATE NOCASE
+    SELECT m.id FROM messages m
+    LEFT JOIN message_deliveries d
+      ON d.message_id = m.id
+      AND d.swarm_id = m.swarm_id
+      AND d.recipient = ? COLLATE NOCASE
+    WHERE m.id = ? AND m.swarm_id = ?
+      AND (m.to_agent = ? COLLATE NOCASE OR m.to_agent IS NULL)
+      AND (m.to_agent_id IS NULL OR m.to_agent_id = ?)
+      AND (d.message_id IS NULL OR d.recipient_agent_id IS NULL OR d.recipient_agent_id = ?)
+      AND m.from_agent != ? COLLATE NOCASE
   `);
   const ackedAt = new Date(now).toISOString();
   const upsert = db.prepare(`
     INSERT INTO message_deliveries (
-      message_id, swarm_id, recipient, status, acked_at
-    ) VALUES (?, ?, ?, 'acked', ?)
+      message_id, swarm_id, recipient, recipient_agent_id, status, acked_at
+    ) VALUES (?, ?, ?, ?, 'acked', ?)
     ON CONFLICT(message_id, recipient) DO UPDATE SET
       status = 'acked',
+      recipient_agent_id = COALESCE(message_deliveries.recipient_agent_id, excluded.recipient_agent_id),
       acked_at = COALESCE(message_deliveries.acked_at, excluded.acked_at)
   `);
 
   withImmediateTransaction(db, () => {
+    const agentId = getAgent(db, swarmId, agentName)?.id ?? null;
     for (const id of ids) {
-      if (!visible.get(id, swarmId, agentName, agentName)) {
+      if (!visible.get(agentName, id, swarmId, agentName, agentId, agentId, agentName)) {
         throw new Error(`Message #${id} was not found in this swarm or is not addressed to you.`);
       }
     }
-    for (const id of ids) upsert.run(id, swarmId, agentName, ackedAt);
+    for (const id of ids) upsert.run(id, swarmId, agentName, agentId, ackedAt);
     advanceCursor(db, swarmId, agentName, ids);
   });
   return ids;
@@ -266,10 +490,20 @@ export function getInbox(
   kind?: string
 ): Message[] {
   const lastReadId = getCursor(db, swarmId, agentName);
+  const agentId = getAgent(db, swarmId, agentName)?.id ?? null;
 
   // A delivery row is authoritative once one exists. The legacy cursor remains the
   // fallback for messages written/read by older builds and for the first-join fence.
-  const params: (string | number)[] = [agentName, swarmId, agentName, agentName, lastReadId];
+  const params: Array<string | number | null> = [
+    agentName,
+    agentId,
+    swarmId,
+    agentName,
+    agentId,
+    agentName,
+    agentName,
+    lastReadId,
+  ];
   if (kind) params.push(kind);
   const messages = db.prepare(`
     SELECT m.* FROM messages m
@@ -277,16 +511,30 @@ export function getInbox(
       ON d.message_id = m.id
       AND d.swarm_id = m.swarm_id
       AND d.recipient = ? COLLATE NOCASE
+      AND (d.recipient_agent_id IS NULL OR d.recipient_agent_id = ?)
     WHERE m.swarm_id = ?
       AND (m.to_agent = ? COLLATE NOCASE OR m.to_agent IS NULL)
+      AND (m.to_agent_id IS NULL OR m.to_agent_id = ?)
       AND m.from_agent != ? COLLATE NOCASE
       AND m.superseded_by IS NULL
-      AND ((d.message_id IS NULL AND m.id > ?) OR d.status != 'acked')
+      AND (
+        (
+          d.message_id IS NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM message_deliveries prior_delivery
+            WHERE prior_delivery.message_id = m.id
+              AND prior_delivery.swarm_id = m.swarm_id
+              AND prior_delivery.recipient = ? COLLATE NOCASE
+          )
+          AND m.id > ?
+        )
+        OR d.status != 'acked'
+      )
       ${kind ? 'AND m.kind = ?' : ''}
     ORDER BY m.id ASC
   `).all(...params) as unknown as Message[];
 
-  ensureDeliveryRows(db, swarmId, agentName, messages.map(message => message.id));
+  ensureDeliveryRows(db, swarmId, agentName, agentId, messages.map(message => message.id));
 
   // Kind-filtered reads are peek-only by construction. A plain explicit inbox read
   // acknowledges exactly the rows it returned and advances the compatibility cursor.
@@ -329,16 +577,6 @@ export async function waitForInbox(
   }
 }
 
-export function acknowledgeAllMessages(
-  db: SwarmDb,
-  swarmId: string,
-  agentName: string,
-  now: number = Date.now()
-): number[] {
-  const pending = getInbox(db, swarmId, agentName, true);
-  return acknowledgeMessages(db, swarmId, agentName, pending.map(message => message.id), now);
-}
-
 export function recordHookInjections(
   db: SwarmDb,
   swarmId: string,
@@ -350,26 +588,38 @@ export function recordHookInjections(
   const injectedAt = new Date(now).toISOString();
   const upsert = db.prepare(`
     INSERT INTO message_deliveries (
-      message_id, swarm_id, recipient, status, first_injected_at, inject_count
-    ) VALUES (?, ?, ?, 'injected', ?, 1)
+      message_id, swarm_id, recipient, recipient_agent_id,
+      status, first_injected_at, inject_count
+    ) VALUES (?, ?, ?, ?, 'injected', ?, 1)
     ON CONFLICT(message_id, recipient) DO UPDATE SET
       status = CASE WHEN message_deliveries.status = 'acked' THEN 'acked' ELSE 'injected' END,
+      recipient_agent_id = COALESCE(message_deliveries.recipient_agent_id, excluded.recipient_agent_id),
       first_injected_at = COALESCE(message_deliveries.first_injected_at, excluded.first_injected_at),
       inject_count = CASE
         WHEN message_deliveries.status = 'acked' THEN message_deliveries.inject_count
         ELSE message_deliveries.inject_count + 1
       END
+    WHERE message_deliveries.recipient_agent_id IS NULL
+       OR message_deliveries.recipient_agent_id = excluded.recipient_agent_id
   `);
   const select = db.prepare(`
     SELECT * FROM message_deliveries
     WHERE message_id = ? AND swarm_id = ? AND recipient = ? COLLATE NOCASE
+      AND (recipient_agent_id IS NULL OR recipient_agent_id = ?)
   `);
 
   return withImmediateTransaction(db, () => {
+    const agentId = getAgent(db, swarmId, agentName)?.id ?? null;
     const entries: HookInboxEntry[] = [];
     for (const message of messages) {
-      upsert.run(message.id, swarmId, agentName, injectedAt);
-      const delivery = select.get(message.id, swarmId, agentName) as unknown as MessageDelivery;
+      upsert.run(message.id, swarmId, agentName, agentId, injectedAt);
+      const delivery = select.get(
+        message.id,
+        swarmId,
+        agentName,
+        agentId
+      ) as unknown as MessageDelivery | undefined;
+      if (!delivery) continue;
       if (delivery.status === 'acked') continue;
       const firstInjectedAt = new Date(delivery.first_injected_at ?? injectedAt).getTime();
       const elapsedMs = Math.max(0, now - firstInjectedAt);
@@ -398,13 +648,15 @@ export function getRecentMessages(
   limit: number = 10,
   kind?: string
 ): Message[] {
-  const params: (string | number)[] = [swarmId, agentName, agentName];
+  const agentId = getAgent(db, swarmId, agentName)?.id ?? null;
+  const params: Array<string | number | null> = [swarmId, agentName, agentId, agentName];
   if (kind) params.push(kind);
   params.push(limit);
   const messages = db.prepare(`
     SELECT * FROM messages
     WHERE swarm_id = ?
       AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND (to_agent_id IS NULL OR to_agent_id = ?)
       AND from_agent != ? COLLATE NOCASE
       ${kind ? 'AND kind = ?' : ''}
     ORDER BY id DESC
@@ -426,12 +678,14 @@ export function countRecentMessages(
   hours: number = 24
 ): number {
   const cutoff = new Date(Date.now() - hours * 3_600_000).toISOString();
+  const agentId = getAgent(db, swarmId, agentName)?.id ?? null;
   const row = db.prepare(`
     SELECT COUNT(*) AS n FROM messages
     WHERE swarm_id = ?
       AND (to_agent = ? COLLATE NOCASE OR to_agent IS NULL)
+      AND (to_agent_id IS NULL OR to_agent_id = ?)
       AND from_agent != ? COLLATE NOCASE
       AND created_at > ?
-  `).get(swarmId, agentName, agentName, cutoff) as { n: number };
+  `).get(swarmId, agentName, agentId, agentName, cutoff) as { n: number };
   return row.n;
 }

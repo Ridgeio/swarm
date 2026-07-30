@@ -9,7 +9,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { collectBoardData } from '../src/board-data.js';
 import { getDbAt, type SwarmDb } from '../src/db.js';
 import {
+  checkpointTask,
   closeTask,
+  offerTaskHandoff,
   reopenTask,
   resolveDefaultBranchTarget,
   startTask,
@@ -407,6 +409,197 @@ describe('WI-3 task ledger CLI', () => {
       assert.strictEqual(count.n, 1);
       db.close();
     } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('takeover never adopts an unrecorded prior-owner checkpoint draft into a handoff charter', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-draft-fence-'));
+    try {
+      joinAgent(home, 'Alice');
+      joinAgent(home, 'Bob');
+      joinAgent(home, 'Recipient');
+      assert.strictEqual(
+        runCli(home, ['authority', 'assign', 'lead', '--to', 'Bob'], 'Alice').status,
+        0
+      );
+      assert.strictEqual(
+        runCli(
+          home,
+          ['task', 'start', 'draft-fence', '--title', 'Fence draft provenance', '--no-worktree'],
+          'Alice'
+        ).status,
+        0
+      );
+
+      const aliceDraft = runCli(home, ['task', 'checkpoint', 'draft-fence'], 'Alice');
+      assert.strictEqual(aliceDraft.status, 2, aliceDraft.stderr || aliceDraft.stdout);
+      const alicePath = aliceDraft.stdout.match(/Checkpoint skeleton: (.+)$/m)?.[1];
+      assert.ok(alicePath);
+      let stale = fs.readFileSync(alicePath!, 'utf-8');
+      for (const replacement of [
+        'STALE PRIOR OWNER DECISION',
+        '- stale failure',
+        'STALE PRIOR OWNER NEXT ACTION',
+        '- stale blocker',
+      ]) {
+        stale = stale.replace('<FILL>', replacement);
+      }
+      fs.writeFileSync(alicePath!, stale);
+
+      const takeover = runCli(
+        home,
+        ['task', 'start', 'draft-fence', '--takeover', '--no-worktree'],
+        'Bob'
+      );
+      assert.strictEqual(takeover.status, 0, takeover.stderr || takeover.stdout);
+      const bobDraft = runCli(home, ['task', 'checkpoint', 'draft-fence'], 'Bob');
+      assert.strictEqual(bobDraft.status, 2, bobDraft.stderr || bobDraft.stdout);
+      const bobPath = bobDraft.stdout.match(/Checkpoint skeleton: (.+)$/m)?.[1];
+      assert.ok(bobPath);
+      assert.notStrictEqual(bobPath, alicePath);
+      assert.match(fs.readFileSync(alicePath!, 'utf-8'), /STALE PRIOR OWNER DECISION/);
+
+      const recorded = runCli(
+        home,
+        ['task', 'checkpoint', 'draft-fence', '--notes', 'Fresh Bob-owned charter.'],
+        'Bob'
+      );
+      assert.strictEqual(recorded.status, 0, recorded.stderr || recorded.stdout);
+      assert.match(recorded.stdout, /Checkpoint #002 recorded/);
+      const offered = runCli(
+        home,
+        ['handoff', 'offer', 'draft-fence', '--to', 'Recipient'],
+        'Bob'
+      );
+      assert.strictEqual(offered.status, 0, offered.stderr || offered.stdout);
+      const briefPath = offered.stdout.match(/^Brief: (.+)$/m)?.[1];
+      assert.ok(briefPath);
+      const charter = fs.readFileSync(briefPath!, 'utf-8');
+      assert.match(charter, /Fresh Bob-owned charter/);
+      assert.doesNotMatch(charter, /STALE PRIOR OWNER/);
+
+      const db = openDb(home);
+      const drafts = db.prepare(`
+        SELECT epoch, actor, actor_agent_id, data
+        FROM task_events
+        WHERE task_id = 'draft-fence' AND kind = 'checkpoint_draft_created'
+        ORDER BY id
+      `).all() as Array<{
+        epoch: number;
+        actor: string;
+        actor_agent_id: string;
+        data: string;
+      }>;
+      assert.deepStrictEqual(drafts.map(row => [row.epoch, row.actor]), [
+        [1, 'Alice'],
+        [2, 'Bob'],
+      ]);
+      assert.notStrictEqual(drafts[0].actor_agent_id, drafts[1].actor_agent_id);
+      assert.strictEqual(JSON.parse(drafts[0].data).path, alicePath);
+      assert.strictEqual(JSON.parse(drafts[1].data).path, bobPath);
+      db.close();
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  test('draft generation binding rejects a delayed prior-owner overwrite after takeover', async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'swarm-wi3-draft-race-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    fs.mkdirSync(path.join(home, '.swarm'), { recursive: true });
+    const db = getDbAt(path.join(home, '.swarm', 'swarm.db'));
+    const originalWrite = fs.writeFileSync;
+    let takeoverPromise: ReturnType<typeof startTask> | undefined;
+    let bobDraft: ReturnType<typeof checkpointTask> | undefined;
+    let briefPath: string | undefined;
+    try {
+      joinHeadlessAgent(db, 'default', 'Alice');
+      joinHeadlessAgent(db, 'default', 'Bob');
+      joinHeadlessAgent(db, 'default', 'Recipient');
+      assignSwarmAuthority(db, 'default', 'Alice', 'lead', 'Bob');
+      await startTask(db, 'default', 'Alice', 'draft-race', {
+        title: 'Fence delayed checkpoint writes',
+        noWorktree: true,
+      });
+
+      let armed = true;
+      fs.writeFileSync = function patchedWriteFileSync(
+        file: fs.PathOrFileDescriptor,
+        data: string | NodeJS.ArrayBufferView,
+        options?: fs.WriteFileOptions
+      ): void {
+        if (armed && String(file).endsWith('/001.md')) {
+          armed = false;
+          // startTask commits the takeover synchronously before its first await.
+          takeoverPromise = startTask(db, 'default', 'Bob', 'draft-race', {
+            takeover: true,
+            noWorktree: true,
+          });
+          bobDraft = checkpointTask(db, 'default', 'Bob', 'draft-race');
+        }
+        originalWrite.call(fs, file, data, options);
+      } as typeof fs.writeFileSync;
+
+      assert.throws(
+        () => checkpointTask(
+          db,
+          'default',
+          'Alice',
+          'draft-race',
+          'STALE ALICE DECISION'
+        ),
+        /Refused stale task authority/
+      );
+      fs.writeFileSync = originalWrite;
+      await takeoverPromise;
+      assert.ok(bobDraft);
+      assert.match(fs.readFileSync(bobDraft.path, 'utf-8'), /STALE ALICE DECISION/);
+
+      const recovered = checkpointTask(db, 'default', 'Bob', 'draft-race');
+      assert.strictEqual(recovered.recorded, false);
+      assert.notStrictEqual(recovered.path, bobDraft.path);
+      assert.doesNotMatch(fs.readFileSync(recovered.path, 'utf-8'), /STALE ALICE DECISION/);
+
+      const fresh = checkpointTask(
+        db,
+        'default',
+        'Bob',
+        'draft-race',
+        'FRESH BOB DECISION'
+      );
+      assert.strictEqual(fresh.recorded, true);
+      assert.strictEqual(fresh.path, recovered.path);
+      const freshBody = fs.readFileSync(fresh.path, 'utf-8');
+      fs.writeFileSync(fresh.path, `${freshBody}\nSTALE ALICE DECISION AFTER RECORD\n`);
+      await assert.rejects(
+        offerTaskHandoff(
+          db,
+          'default',
+          'Bob',
+          'draft-race',
+          'Recipient'
+        ),
+        /checkpoint bytes no longer match the recorded owner\/epoch generation and digest/
+      );
+      fs.writeFileSync(fresh.path, freshBody);
+      const offered = await offerTaskHandoff(
+        db,
+        'default',
+        'Bob',
+        'draft-race',
+        'Recipient'
+      );
+      briefPath = offered.briefPath;
+      const charter = fs.readFileSync(offered.briefPath, 'utf-8');
+      assert.match(charter, /FRESH BOB DECISION/);
+      assert.doesNotMatch(charter, /STALE ALICE DECISION/);
+    } finally {
+      fs.writeFileSync = originalWrite;
+      if (briefPath) fs.rmSync(briefPath, { force: true });
+      db.close();
+      process.env.HOME = previousHome;
       fs.rmSync(home, { recursive: true, force: true });
     }
   });

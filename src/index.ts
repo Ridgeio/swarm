@@ -154,22 +154,29 @@ const args = parsed.args;
 const command = args[0];
 const explicitSwarmName = parsed.swarmName;
 
+function optionBoundary(): number {
+  const boundary = args.indexOf('--');
+  return boundary === -1 ? args.length : boundary;
+}
+
 function getFlag(flag: string): string | undefined {
-  const idx = args.indexOf(flag);
-  if (idx === -1 || idx + 1 >= args.length) return undefined;
+  const boundary = optionBoundary();
+  const idx = args.slice(0, boundary).indexOf(flag);
+  if (idx === -1 || idx + 1 >= boundary) return undefined;
   return args[idx + 1];
 }
 
 function getRepeatedFlags(flag: string): string[] {
   const values: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === flag && index + 1 < args.length) values.push(args[index + 1]);
+  const boundary = optionBoundary();
+  for (let index = 0; index < boundary; index += 1) {
+    if (args[index] === flag && index + 1 < boundary) values.push(args[index + 1]);
   }
   return values;
 }
 
 function hasFlag(flag: string): boolean {
-  return args.includes(flag);
+  return args.slice(0, optionBoundary()).includes(flag);
 }
 
 // Resolve and validate the optional --kind flag. Unknown kinds are a usage error:
@@ -213,7 +220,9 @@ function requireReplyDeadline(usage: string): string | undefined {
   if (!hasFlag('--require-reply')) return undefined;
   const values = getRepeatedFlags('--require-reply');
   const raw = getFlag('--require-reply');
-  const occurrences = args.filter(token => token === '--require-reply').length;
+  const occurrences = args
+    .slice(0, optionBoundary())
+    .filter(token => token === '--require-reply').length;
   if (occurrences !== 1 || values.length !== 1 || !raw || raw.startsWith('-')) {
     console.error('--require-reply needs exactly one positive duration such as 15m, 2h, or 1d.');
     console.error(usage);
@@ -245,6 +254,49 @@ function requirePositiveIdFlag(flag: string, label: string, usage: string): numb
     process.exit(1);
   }
   return Number(raw);
+}
+
+function optionEditDistance(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + (
+          left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
+        )
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+function refuseUnknownCoordinationOptions(
+  commandName: 'send' | 'broadcast',
+  allowed: ReadonlySet<string>,
+  usage: string
+): void {
+  const coordinationShaped = /^--(?:require|reply|supersed|interject|kind|now)/;
+  const unknown = args.slice(1, optionBoundary()).find(token => {
+    // A shell-quoted complete message remains one argv token. Its whitespace
+    // proves that it is message text rather than an option spelling.
+    if (/\s/.test(token)) return false;
+    if (!token.startsWith('--') || allowed.has(token)) return false;
+    const normalized = token.split('=', 1)[0].toLowerCase();
+    return coordinationShaped.test(normalized) ||
+      [...allowed].some(option => optionEditDistance(normalized, option) <= 2);
+  });
+  if (!unknown) return;
+  console.error(
+    `Unknown ${commandName} coordination option "${unknown}". ` +
+    'Refused before writing; correct the spelling, quote the complete message as one argument, ' +
+    'or place -- immediately before literal option-like text.'
+  );
+  console.error(usage);
+  process.exit(1);
 }
 
 function shellQuote(value: string): string {
@@ -947,15 +999,31 @@ async function main() {
       }
 
       case 'send': {
-        const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>] [--require-reply <ttl>|--reply-to <msg-id>]';
+        refuseUnknownCoordinationOptions(
+          'send',
+          new Set([
+            '--interject',
+            '--now',
+            '--kind',
+            '--supersedes',
+            '--require-reply',
+            '--reply-to',
+          ]),
+          usage
+        );
+        const { db, self } = requireSelf(true);
         // Flags may appear anywhere before/among free-text; strip them from the body.
         const interject = hasFlag('--interject') || hasFlag('--now');
         const kind = requireSendKind(usage);
         const supersedes = requireSupersedes(usage);
         const requiredBy = requireReplyDeadline(usage);
         const replyTo = requirePositiveIdFlag('--reply-to', 'Required message ID', usage);
-        if (args.filter(token => token === '--reply-to').length > 1) {
+        if (
+          args
+            .slice(0, optionBoundary())
+            .filter(token => token === '--reply-to').length > 1
+        ) {
           console.error('--reply-to may be specified only once.');
           console.error(usage);
           process.exit(1);
@@ -972,14 +1040,21 @@ async function main() {
         }
         const rest = args.slice(1);
         const tokens: string[] = [];
+        let literal = false;
         for (let i = 0; i < rest.length; i++) {
-          if (rest[i] === '--interject' || rest[i] === '--now') continue;
-          if (
-            rest[i] === '--kind' ||
-            rest[i] === '--supersedes' ||
-            rest[i] === '--require-reply' ||
-            rest[i] === '--reply-to'
-          ) { i++; continue; }
+          if (!literal && rest[i] === '--') {
+            literal = true;
+            continue;
+          }
+          if (!literal) {
+            if (rest[i] === '--interject' || rest[i] === '--now') continue;
+            if (
+              rest[i] === '--kind' ||
+              rest[i] === '--supersedes' ||
+              rest[i] === '--require-reply' ||
+              rest[i] === '--reply-to'
+            ) { i++; continue; }
+          }
           tokens.push(rest[i]);
         }
         const targetName = tokens[0];
@@ -1044,8 +1119,20 @@ async function main() {
       }
 
       case 'broadcast': {
-        const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm broadcast <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
+        refuseUnknownCoordinationOptions(
+          'broadcast',
+          new Set([
+            '--interject',
+            '--now',
+            '--kind',
+            '--supersedes',
+            '--require-reply',
+            '--reply-to',
+          ]),
+          usage
+        );
+        const { db, self } = requireSelf(true);
         if (hasFlag('--require-reply') || hasFlag('--reply-to')) {
           console.error(
             'Required replies are exact-registration obligations and cannot be broadcast. ' +
@@ -1059,9 +1146,16 @@ async function main() {
         const supersedes = requireSupersedes(usage);
         const rest = args.slice(1);
         const tokens: string[] = [];
+        let literal = false;
         for (let i = 0; i < rest.length; i++) {
-          if (rest[i] === '--interject' || rest[i] === '--now') continue;
-          if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          if (!literal && rest[i] === '--') {
+            literal = true;
+            continue;
+          }
+          if (!literal) {
+            if (rest[i] === '--interject' || rest[i] === '--now') continue;
+            if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          }
           tokens.push(rest[i]);
         }
         const message = tokens.join(' ');

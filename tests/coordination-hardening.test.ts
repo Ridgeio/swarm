@@ -1,6 +1,7 @@
 import { afterEach, describe, test } from 'node:test';
 import assert from 'node:assert';
 import { execFileSync } from 'node:child_process';
+import { createHash, randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -66,8 +67,10 @@ function insertCurrentCheckpoint(
   const task = getTask(value.db, swarmId, slug);
   assert.ok(task);
   const checkpointPath = path.join(value.root, `${swarmId}-${slug}-checkpoint.md`);
-  fs.writeFileSync(checkpointPath, [
+  const draftId = randomUUID();
+  const contents = [
     `# checkpoint ${slug}`,
+    `<!-- swarm-checkpoint-draft:${draftId} -->`,
     '## decisions (+why, +rejected alternatives)',
     'Bound to the exact current owner and epoch.',
     '## failed approaches (do-not-repeat)',
@@ -77,7 +80,8 @@ function insertCurrentCheckpoint(
     '## blockers / landmines',
     '- none',
     '',
-  ].join('\n'));
+  ].join('\n');
+  fs.writeFileSync(checkpointPath, contents);
   value.db.prepare(`
     INSERT INTO task_events (
       swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
@@ -88,7 +92,12 @@ function insertCurrentCheckpoint(
     task.lease_epoch,
     actor.name,
     actor.id,
-    JSON.stringify({ path: checkpointPath, sequence: 1 }),
+    JSON.stringify({
+      path: checkpointPath,
+      sequence: 1,
+      draft_id: draftId,
+      content_sha256: createHash('sha256').update(contents, 'utf-8').digest('hex'),
+    }),
     new Date(now).toISOString()
   );
   return checkpointPath;

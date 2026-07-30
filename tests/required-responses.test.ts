@@ -322,13 +322,34 @@ test('CLI prints persistent reply instructions and rejects malformed coordinatio
     assert.strictEqual((inspect.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n, 0);
     inspect.close();
 
+    for (const typoArgs of [
+      ['send', 'Bob', 'question', '--require-replly', '15m'],
+      ['send', 'Bob', 'question', '--requre-reply', '15m'],
+      ['send', 'Bob', 'answer', '--replly-to', '1'],
+      ['send', 'Bob', 'question', '--Require-reply', '15m'],
+      ['send', 'Bob', 'question', '--supersdes', '1'],
+    ]) {
+      const typo = runCli(home, typoArgs, 'Alice');
+      assert.notStrictEqual(typo.status, 0);
+      assert.match(typo.stderr, /Unknown send coordination option/);
+    }
+    inspect = new DatabaseSync(dbPath, { readOnly: true });
+    const typoCounts = inspect.prepare(`
+      SELECT
+        (SELECT COUNT(*) FROM messages) AS messages,
+        (SELECT COUNT(*) FROM required_message_responses) AS required_responses
+    `).get() as { messages: number; required_responses: number };
+    assert.deepStrictEqual({ ...typoCounts }, { messages: 0, required_responses: 0 });
+    inspect.close();
+
     for (const forbidden of [
       ['broadcast', 'question', '--require-reply', '15m'],
       ['broadcast', 'answer', '--reply-to', '1'],
+      ['broadcast', 'question', '--require-replly', '15m'],
     ]) {
       const rejected = runCli(home, forbidden, 'Alice');
       assert.notStrictEqual(rejected.status, 0);
-      assert.match(rejected.stderr, /cannot be broadcast/);
+      assert.match(rejected.stderr, /cannot be broadcast|Unknown broadcast coordination option/);
     }
     inspect = new DatabaseSync(dbPath, { readOnly: true });
     assert.strictEqual(
@@ -336,9 +357,61 @@ test('CLI prints persistent reply instructions and rejects malformed coordinatio
       0,
       'forbidden broadcast coordination flags must fail before any message write'
     );
+    assert.strictEqual(
+      (inspect.prepare('SELECT COUNT(*) AS n FROM required_message_responses').get() as { n: number }).n,
+      0,
+      'forbidden broadcast coordination flags must fail before any required-response write'
+    );
     inspect.close();
 
-    const sent = runCli(home, ['send', 'Bob', 'question', '--require-reply', '15m'], 'Alice');
+    const quotedLiteral = runCli(
+      home,
+      ['send', 'Bob', '--require-replly is invalid syntax'],
+      'Alice'
+    );
+    assert.strictEqual(quotedLiteral.status, 0, quotedLiteral.stderr || quotedLiteral.stdout);
+    const delimitedLiteral = runCli(
+      home,
+      ['send', 'Bob', '--', '--requre-reply', 'is', 'literal text'],
+      'Alice'
+    );
+    assert.strictEqual(delimitedLiteral.status, 0, delimitedLiteral.stderr || delimitedLiteral.stdout);
+    const repeatedLiteral = runCli(
+      home,
+      ['send', 'Bob', '--', '--reply-to', 'one', '--reply-to', 'two'],
+      'Alice'
+    );
+    assert.strictEqual(repeatedLiteral.status, 0, repeatedLiteral.stderr || repeatedLiteral.stdout);
+    inspect = new DatabaseSync(dbPath, { readOnly: true });
+    assert.deepStrictEqual(
+      (inspect.prepare('SELECT body FROM messages ORDER BY id').all() as Array<{ body: string }>)
+        .map(row => row.body),
+      [
+        '--require-replly is invalid syntax',
+        '--requre-reply is literal text',
+        '--reply-to one --reply-to two',
+      ]
+    );
+    assert.strictEqual(
+      (inspect.prepare('SELECT COUNT(*) AS n FROM required_message_responses').get() as { n: number }).n,
+      0
+    );
+    inspect.close();
+
+    const sent = runCli(
+      home,
+      [
+        'send',
+        'Bob',
+        'question',
+        '--require-reply',
+        '15m',
+        '--',
+        '--require-reply',
+        'is literal text',
+      ],
+      'Alice'
+    );
     assert.strictEqual(sent.status, 0, sent.stderr || sent.stdout);
     assert.match(sent.stdout, /reply required by/);
     inspect = new DatabaseSync(dbPath, { readOnly: true });

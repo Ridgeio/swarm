@@ -981,11 +981,26 @@ function checkpointDir(task: Task): string {
   return path.join(swarmHome(), 'briefs', 'checkpoints', task.swarm_id, task.id);
 }
 
-function checkpointSkeleton(task: Task, sequence: number, facts: GitFacts, notes?: string): string {
+function checkpointDraftMarker(draftId: string): string {
+  return `<!-- swarm-checkpoint-draft:${draftId} -->`;
+}
+
+function checkpointHasDraftId(contents: string, draftId: string): boolean {
+  return contents.includes(checkpointDraftMarker(draftId));
+}
+
+function checkpointSkeleton(
+  task: Task,
+  sequence: number,
+  facts: GitFacts,
+  draftId: string,
+  notes?: string
+): string {
   const number = String(sequence).padStart(3, '0');
   const decisions = notes ?? '<FILL>';
   const other = notes === undefined ? '<FILL>' : '- none noted';
   return `# checkpoint ${task.id} #${number}
+${checkpointDraftMarker(draftId)}
 - state: ${task.state}; owner ${task.owner_agent ?? 'unowned'}; lease epoch ${task.lease_epoch}
 - head: ${facts.head} on ${facts.branch} (dirty: ${facts.dirtyTracked}, untracked: ${facts.untracked})
 ## decisions (+why, +rejected alternatives)
@@ -1015,6 +1030,31 @@ function recordedCheckpointPaths(db: SwarmDb, task: Task): Set<string> {
   return paths;
 }
 
+function currentOwnerCheckpointDrafts(db: SwarmDb, task: Task): Map<string, string> {
+  if (task.owner_agent_id === null) return new Map();
+  const rows = db.prepare(`
+    SELECT data FROM task_events
+    WHERE swarm_id = ? AND task_id = ?
+      AND kind = 'checkpoint_draft_created'
+      AND epoch = ?
+      AND actor_agent_id = ?
+  `).all(
+    task.swarm_id,
+    task.id,
+    task.lease_epoch,
+    task.owner_agent_id
+  ) as Array<{ data: string | null }>;
+  const drafts = new Map<string, string>();
+  for (const row of rows) {
+    if (!row.data) continue;
+    try {
+      const parsed = JSON.parse(row.data) as { path?: string; draft_id?: string };
+      if (parsed.path && parsed.draft_id) drafts.set(parsed.path, parsed.draft_id);
+    } catch { /* malformed draft provenance is never reusable */ }
+  }
+  return drafts;
+}
+
 function existingCheckpointFiles(dir: string): Array<{ sequence: number; path: string }> {
   if (!fs.existsSync(dir)) return [];
   return fs.readdirSync(dir)
@@ -1041,17 +1081,71 @@ export function checkpointTask(
 
   const files = existingCheckpointFiles(dir);
   const recorded = recordedCheckpointPaths(db, task);
-  const pending = [...files].reverse().find(entry => !recorded.has(entry.path));
+  const currentOwnerDrafts = currentOwnerCheckpointDrafts(db, task);
+  const pending = [...files].reverse().find(
+    entry => {
+      const draftId = currentOwnerDrafts.get(entry.path);
+      if (recorded.has(entry.path) || !draftId) return false;
+      try {
+        return checkpointHasDraftId(fs.readFileSync(entry.path, 'utf-8'), draftId);
+      } catch {
+        return false;
+      }
+    }
+  );
   const sequence = pending?.sequence ?? ((files.at(-1)?.sequence ?? 0) + 1);
   const checkpointPath = pending?.path ?? path.join(dir, `${String(sequence).padStart(3, '0')}.md`);
+  const draftId = pending
+    ? currentOwnerDrafts.get(pending.path)!
+    : randomUUID();
 
   if (notes !== undefined) {
-    fs.writeFileSync(checkpointPath, checkpointSkeleton(task, sequence, taskGitFacts(task), notes), 'utf-8');
+    fs.writeFileSync(
+      checkpointPath,
+      checkpointSkeleton(task, sequence, taskGitFacts(task), draftId, notes),
+      'utf-8'
+    );
   } else if (!fs.existsSync(checkpointPath)) {
-    fs.writeFileSync(checkpointPath, checkpointSkeleton(task, sequence, taskGitFacts(task)), 'utf-8');
+    fs.writeFileSync(
+      checkpointPath,
+      checkpointSkeleton(task, sequence, taskGitFacts(task), draftId),
+      'utf-8'
+    );
+    const draft = withImmediateTransaction(db, () => {
+      const currentActor = requireActiveAgent(db, swarmId, actor, 'checkpoint draft');
+      const checked = getTask(db, swarmId, slug);
+      if (
+        !checked ||
+        checked.owner_agent_id !== currentActor.id ||
+        checked.lease_epoch !== authority.epoch
+      ) {
+        return {
+          error: checked
+            ? staleAuthorityMessage(checked, actor, 'checkpoint', authority.epoch)
+            : `Task "${slug}" not found in this swarm.`,
+        };
+      }
+      insertEvent(
+        db,
+        checked,
+        'checkpoint_draft_created',
+        actor,
+        { path: checkpointPath, sequence, draft_id: draftId }
+      );
+      return { task: checked };
+    }) as { task?: Task; error?: string };
+    if (draft.error || !draft.task) {
+      throw new Error(draft.error ?? `Failed to bind checkpoint draft for "${slug}".`);
+    }
   }
 
   const contents = fs.readFileSync(checkpointPath, 'utf-8');
+  if (!checkpointHasDraftId(contents, draftId)) {
+    throw new Error(
+      `Checkpoint draft ${checkpointPath} no longer matches its owner/epoch generation. ` +
+      'The file was preserved; rerun the checkpoint command to create a fresh draft.'
+    );
+  }
   if (contents.includes('<FILL>')) {
     return { task, path: checkpointPath, sequence, recorded: false, exitCode: 2 };
   }
@@ -1082,7 +1176,12 @@ export function checkpointTask(
     }
     db.prepare('UPDATE tasks SET lease_expires_at = ?, updated_at = ? WHERE swarm_id = ? AND id = ?')
       .run(leaseExpiry(), timestamp, swarmId, slug);
-    insertEvent(db, checked, 'checkpoint', actor, { path: checkpointPath, sequence }, timestamp);
+    insertEvent(db, checked, 'checkpoint', actor, {
+      path: checkpointPath,
+      sequence,
+      draft_id: draftId,
+      content_sha256: sha256(contents),
+    }, timestamp);
     return { task: getTask(db, swarmId, slug) };
   }) as { task?: Task | null; error?: string };
   if (updatedTask.error || !updatedTask.task) throw new Error(updatedTask.error ?? `Failed to record checkpoint for "${slug}".`);
@@ -1665,7 +1764,18 @@ export function runTaskCommand(
   return { task, exitCode, logPath, durationMs, summary };
 }
 
-function latestCheckpoint(db: SwarmDb, task: Task): { event: TaskEvent; path: string } | null {
+interface BoundCheckpoint {
+  event: TaskEvent;
+  path: string;
+  draftId: string | null;
+  contentSha256: string | null;
+}
+
+interface VerifiedCheckpoint extends BoundCheckpoint {
+  body: string;
+}
+
+function latestCheckpoint(db: SwarmDb, task: Task): BoundCheckpoint | null {
   const event = db.prepare(`
     SELECT * FROM task_events
     WHERE swarm_id = ? AND task_id = ? AND kind = 'checkpoint'
@@ -1673,17 +1783,28 @@ function latestCheckpoint(db: SwarmDb, task: Task): { event: TaskEvent; path: st
   `).get(task.swarm_id, task.id) as TaskEvent | undefined;
   if (!event?.data) return null;
   try {
-    const data = JSON.parse(event.data) as { path?: string };
-    return data.path ? { event, path: data.path } : null;
+    const data = JSON.parse(event.data) as {
+      path?: string;
+      draft_id?: string;
+      content_sha256?: string;
+    };
+    return data.path
+      ? {
+          event,
+          path: data.path,
+          draftId: data.draft_id ?? null,
+          contentSha256: data.content_sha256 ?? null,
+        }
+      : null;
   } catch {
     return null;
   }
 }
 
 function requireCurrentOwnerCheckpoint(
-  checkpoint: { event: TaskEvent; path: string } | null,
+  checkpoint: BoundCheckpoint | null,
   task: Task
-): { event: TaskEvent; path: string } {
+): VerifiedCheckpoint {
   if (!checkpoint || !fs.existsSync(checkpoint.path)) {
     throw new Error(
       `Task "${task.id}" has no readable checkpoint. ` +
@@ -1701,7 +1822,31 @@ function requireCurrentOwnerCheckpoint(
       `The current owner must create a fresh checkpoint before offering a handoff.`
     );
   }
-  return checkpoint;
+  if (!checkpoint.draftId || !checkpoint.contentSha256) {
+    throw new Error(
+      `Task "${task.id}" latest checkpoint predates generation-bound content verification. ` +
+      `Run "swarm task checkpoint ${task.id}" to create a fresh checkpoint before handoff.`
+    );
+  }
+  let body: string;
+  try {
+    body = fs.readFileSync(checkpoint.path, 'utf-8');
+  } catch {
+    throw new Error(
+      `Task "${task.id}" checkpoint became unreadable. ` +
+      `Run "swarm task checkpoint ${task.id}" before offering a handoff.`
+    );
+  }
+  if (
+    !checkpointHasDraftId(body, checkpoint.draftId) ||
+    sha256(body) !== checkpoint.contentSha256
+  ) {
+    throw new Error(
+      `Task "${task.id}" latest checkpoint bytes no longer match the recorded owner/epoch generation and digest. ` +
+      `The file was preserved; run "swarm task checkpoint ${task.id}" to create a fresh checkpoint before handoff.`
+    );
+  }
+  return { ...checkpoint, body };
 }
 
 function minuteStamp(date: Date): string {
@@ -2040,7 +2185,7 @@ export async function offerTaskHandoff(
 
   const facts = taskGitFacts(task);
   const title = `${stale ? 'STALE ' : ''}${task.title.replace(/[\r\n]+/g, ' ')}`;
-  const checkpointBody = fs.readFileSync(checkpoint.path, 'utf-8');
+  const checkpointBody = checkpoint.body;
   const briefDir = path.join(swarmHome(), 'briefs', 'handoff-offers');
   fs.mkdirSync(briefDir, { recursive: true });
   const briefPath = path.join(

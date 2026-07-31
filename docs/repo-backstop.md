@@ -34,11 +34,12 @@ mechanically where it is installed, but they bind even without it.
    its artifact is an acknowledgment, not a fact. State what you did NOT
    establish alongside what you did.
 4. **Cross-family adversarial review (model inversion).** Gate-critical
-   changes get reviewed by a DIFFERENT model family than the author
-   (Claude-authored → GPT/Codex reviews; Codex-authored → Claude reviews) with
-   fresh context. Priors: hunt missing behavior in Claude-authored code; hunt
-   build breakage in Codex-authored code. "Looks good" is not a review —
-   evidence required: file/line, counterexample, or failing test.
+   changes get reviewed at the exact candidate SHA by a DIFFERENT model family
+   than the author, with fresh context and no reuse of earlier-SHA verdicts.
+   Follow the program's active provider/quota policy (currently Grok plus
+   AGY/Gemini; no Claude review spend while its capacity is red). "Looks good"
+   is not a review — evidence requires file/line, counterexample, failing test,
+   or a causal mutation restored byte-exact.
 5. **No self-merge; the repo's landing authority merges.** PR → green CI →
    cross-family review → the repository's single named **landing authority**
    merges (not just any human or lead), and only when the pre-landing check
@@ -74,6 +75,13 @@ mechanically where it is installed, but they bind even without it.
     goes stale. If your change contradicts the recorded design, FLAG the
     component's owner/landing authority rather than silently diverging — design
     conflicts are cheapest to resolve before the work, not at merge.
+13. **Quiet goals and no acknowledgement noise.** One goal emits one
+    condition-complete final evidence packet or one true blocker. Put progress
+    in status/checkpoints/run logs. Do not send receipt-only acknowledgements;
+    delivery acknowledgement is exact-ID metadata, and ownership pickup is a
+    charter-bound handoff acceptance. A direct question that truly needs an
+    answer uses `--require-reply <ttl>` and the exact recipient's
+    `--reply-to <message-id>`; reading or acking is not an answer.
 
 Repo-specific (edit per repo):
 - Protected branches, required checks, CODEOWNERS paths: see `.github/`.

@@ -2,8 +2,7 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 import { execFileSync } from 'child_process';
-import { DEFAULT_SWARM_ID } from './db.js';
-import { getDb, getDbReadOnly } from './db.js';
+import { DEFAULT_SWARM_ID, getDb, getDbReadOnly, withImmediateTransaction } from './db.js';
 import {
   Agent,
   Swarm,
@@ -12,6 +11,7 @@ import {
   forceReap,
   getAgent,
   getAuthenticatedSelf,
+  getPrivilegedAuthenticatedSelf,
   getOrCreateSwarm,
   getSelf,
   getSurfaceMarkerConflictWarning,
@@ -21,8 +21,6 @@ import {
   joinAgent,
   joinHeadlessAgent,
   leaveA2AAgent,
-  leaveAgent,
-  leaveHeadlessAgent,
   listAgents,
   listAgentsSync,
   listSwarms,
@@ -34,15 +32,18 @@ import {
   updateWorkspace,
 } from './registry.js';
 import {
-  acknowledgeAllMessages,
   acknowledgeMessages,
   broadcastMessage,
   countRecentMessages,
   getInbox,
+  getRequiredResponse,
   getRecentMessages,
+  listPendingRequiredResponsesForRecipient,
+  listRequiredResponsesForAgent,
   MESSAGE_KINDS,
   recordHookInjections,
   sendMessage,
+  sweepRequiredResponses,
   waitForInbox,
 } from './mailbox.js';
 import { getFleetStats, formatFleetStats } from './stats.js';
@@ -71,21 +72,33 @@ import { parseGlobalFlags } from './args.js';
 import { assertNameNotReserved, assertNotModelName } from './reserved-names.js';
 import { detectAdvertiseHost, startA2AServer } from './a2a-server.js';
 import {
+  acceptTaskHandoff,
+  cancelTaskHandoff,
   checkpointTask,
   claimCloseRequirements,
   closeTask,
+  declineTaskHandoff,
   effectiveClaimKind,
+  getHandoffOfferHookLines,
   getTask,
   getActiveTaskHookLines,
-  handoffTask,
+  listHandoffOffers,
+  offerTaskHandoff,
+  rebindLegacyTask,
   reopenTask,
   recordDecision,
   runTaskCommand,
   startTask,
+  sweepHandoffOffers,
   type ClaimKind,
   type TaskDisposition,
 } from './tasks.js';
-import { listRescueArtifacts, rescueTargets, verifyRescueArtifact } from './rescue.js';
+import {
+  deliverRescueArtifacts,
+  listRescueArtifacts,
+  rescueTargets,
+  verifyRescueArtifact,
+} from './rescue.js';
 import {
   addJanitorRoot,
   formatJanitorHookLine,
@@ -121,11 +134,27 @@ import {
   startBoardServer,
   waitForBoardServerStop,
 } from './board-server.js';
-import { createGrant, listGrants, revokeGrant } from './grants.js';
+import { createGrant, listGrants, parseGrantTtl, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
-import { requestTaskReview } from './reviews.js';
+import { requestTaskReview, submitReviewVerdict } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
 import { renderAgentHelp } from './agent-help.js';
+import {
+  assignSwarmAuthority,
+  listSwarmAuthorities,
+  type SwarmAuthorityRole,
+} from './authority.js';
+import {
+  listReviewerQualifications,
+  recordReviewerQualification,
+  revokeReviewerQualification,
+} from './qualifications.js';
+import {
+  listMigrationResources,
+  releaseMigrationResource,
+  reserveMigrationResource,
+} from './migration-leases.js';
+import { standDownAgent } from './stand-down.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -134,22 +163,29 @@ const args = parsed.args;
 const command = args[0];
 const explicitSwarmName = parsed.swarmName;
 
+function optionBoundary(): number {
+  const boundary = args.indexOf('--');
+  return boundary === -1 ? args.length : boundary;
+}
+
 function getFlag(flag: string): string | undefined {
-  const idx = args.indexOf(flag);
-  if (idx === -1 || idx + 1 >= args.length) return undefined;
+  const boundary = optionBoundary();
+  const idx = args.slice(0, boundary).indexOf(flag);
+  if (idx === -1 || idx + 1 >= boundary) return undefined;
   return args[idx + 1];
 }
 
 function getRepeatedFlags(flag: string): string[] {
   const values: string[] = [];
-  for (let index = 0; index < args.length; index += 1) {
-    if (args[index] === flag && index + 1 < args.length) values.push(args[index + 1]);
+  const boundary = optionBoundary();
+  for (let index = 0; index < boundary; index += 1) {
+    if (args[index] === flag && index + 1 < boundary) values.push(args[index + 1]);
   }
   return values;
 }
 
 function hasFlag(flag: string): boolean {
-  return args.includes(flag);
+  return args.slice(0, optionBoundary()).includes(flag);
 }
 
 // Resolve and validate the optional --kind flag. Unknown kinds are a usage error:
@@ -159,6 +195,19 @@ function requireValidKind(usage: string): string | undefined {
   const kind = getFlag('--kind');
   if (!kind || !(MESSAGE_KINDS as readonly string[]).includes(kind)) {
     console.error(`Invalid --kind${kind ? ` "${kind}"` : ''}. Allowed: ${MESSAGE_KINDS.join(', ')}.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return kind;
+}
+
+function requireSendKind(usage: string): string | undefined {
+  const kind = requireValidKind(usage);
+  if (kind === 'ack') {
+    console.error(
+      'Refused conversational acknowledgement: delivery acknowledgement is transport metadata, not a swarm message. ' +
+      'Handle one message, then run "swarm ack <msg-id>" for that exact ID; send only a result or a true blocker.'
+    );
     console.error(usage);
     process.exit(1);
   }
@@ -176,6 +225,35 @@ function requireSupersedes(usage: string): number | undefined {
   return Number(raw);
 }
 
+function requireReplyDeadline(usage: string): string | undefined {
+  if (!hasFlag('--require-reply')) return undefined;
+  const values = getRepeatedFlags('--require-reply');
+  const raw = getFlag('--require-reply');
+  const occurrences = args
+    .slice(0, optionBoundary())
+    .filter(token => token === '--require-reply').length;
+  if (occurrences !== 1 || values.length !== 1 || !raw || raw.startsWith('-')) {
+    console.error('--require-reply needs exactly one positive duration such as 15m, 2h, or 1d.');
+    console.error(usage);
+    process.exit(1);
+  }
+  let durationMs: number;
+  try {
+    durationMs = parseGrantTtl(raw);
+  } catch {
+    console.error(`Invalid --require-reply "${raw}". Use a positive duration such as 15m, 2h, or 1d.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  const expiryMs = Date.now() + durationMs;
+  if (!Number.isSafeInteger(expiryMs) || Math.abs(expiryMs) > 8.64e15) {
+    console.error(`Invalid --require-reply "${raw}": deadline is outside the supported date range.`);
+    console.error(usage);
+    process.exit(1);
+  }
+  return new Date(expiryMs).toISOString();
+}
+
 function requirePositiveIdFlag(flag: string, label: string, usage: string): number | undefined {
   if (!hasFlag(flag)) return undefined;
   const raw = getFlag(flag);
@@ -185,6 +263,49 @@ function requirePositiveIdFlag(flag: string, label: string, usage: string): numb
     process.exit(1);
   }
   return Number(raw);
+}
+
+function optionEditDistance(left: string, right: string): number {
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  for (let leftIndex = 1; leftIndex <= left.length; leftIndex += 1) {
+    const current = [leftIndex];
+    for (let rightIndex = 1; rightIndex <= right.length; rightIndex += 1) {
+      current[rightIndex] = Math.min(
+        current[rightIndex - 1] + 1,
+        previous[rightIndex] + 1,
+        previous[rightIndex - 1] + (
+          left[leftIndex - 1] === right[rightIndex - 1] ? 0 : 1
+        )
+      );
+    }
+    previous.splice(0, previous.length, ...current);
+  }
+  return previous[right.length];
+}
+
+function refuseUnknownCoordinationOptions(
+  commandName: 'send' | 'broadcast',
+  allowed: ReadonlySet<string>,
+  usage: string
+): void {
+  const coordinationShaped = /^--(?:require|reply|supersed|interject|kind|now)/;
+  const unknown = args.slice(1, optionBoundary()).find(token => {
+    // A shell-quoted complete message remains one argv token. Its whitespace
+    // proves that it is message text rather than an option spelling.
+    if (/\s/.test(token)) return false;
+    if (!token.startsWith('--') || allowed.has(token)) return false;
+    const normalized = token.split('=', 1)[0].toLowerCase();
+    return coordinationShaped.test(normalized) ||
+      [...allowed].some(option => optionEditDistance(normalized, option) <= 2);
+  });
+  if (!unknown) return;
+  console.error(
+    `Unknown ${commandName} coordination option "${unknown}". ` +
+    'Refused before writing; correct the spelling, quote the complete message as one argument, ' +
+    'or place -- immediately before literal option-like text.'
+  );
+  console.error(usage);
+  process.exit(1);
 }
 
 function shellQuote(value: string): string {
@@ -200,6 +321,26 @@ function shellToken(value: string): string {
 function oneLineForCli(value: string, limit: number = 160): string {
   const flattened = value.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim();
   return flattened.length <= limit ? flattened : `${flattened.slice(0, limit - 1)}\u2026`;
+}
+
+function requiredResponseHint(
+  db: ReturnType<typeof getDb>,
+  swarmId: string,
+  messageId: number,
+  fromAgent: string,
+  includeTerminal: boolean = false
+): string {
+  const request = getRequiredResponse(db, swarmId, messageId);
+  if (!request) return '';
+  if (request.status === 'pending') {
+    return ` [REPLY REQUIRED by ${request.required_by}; answer with: ` +
+      `swarm send ${shellToken(fromAgent)} "<answer>" --reply-to ${messageId}]`;
+  }
+  if (!includeTerminal) return '';
+  if (request.status === 'resolved') {
+    return ` [required reply resolved by message #${request.reply_message_id ?? 'deleted'}]`;
+  }
+  return ` [required reply expired: ${request.expiry_reason ?? 'unresolved'}]`;
 }
 
 function resolveSelectedSwarm(db: ReturnType<typeof getDb>, create: boolean = false): Swarm {
@@ -259,7 +400,9 @@ function resolveSelectedSwarmReadOnly(db: NonNullable<ReturnType<typeof getDbRea
   throw new Error('No swarm database state found. Run "swarm create <name>" first.');
 }
 
-function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
+function requireSelf(
+  authenticate: boolean | 'privileged' = false
+): { db: ReturnType<typeof getDb>; self: Agent; swarm: Swarm; surfaceId: string } {
   const db = getDb();
   const explicitSwarm = explicitSwarmName ? getSwarm(db, explicitSwarmName) : null;
   if (explicitSwarmName && !explicitSwarm) {
@@ -267,9 +410,11 @@ function requireSelf(authenticate: boolean = false): { db: ReturnType<typeof get
     process.exit(1);
   }
 
-  const self = authenticate
-    ? getAuthenticatedSelf(db, explicitSwarm?.id)
-    : getSelf(db, explicitSwarm?.id);
+  const self = authenticate === 'privileged'
+    ? getPrivilegedAuthenticatedSelf(db, explicitSwarm?.id)
+    : authenticate
+      ? getAuthenticatedSelf(db, explicitSwarm?.id)
+      : getSelf(db, explicitSwarm?.id);
   if (!self) {
     const surfaceId = process.env.CMUX_SURFACE_ID;
     const agentName = process.env.SWARM_AGENT_NAME;
@@ -319,7 +464,9 @@ Agent Management:
     [--headless] [--push] [--force] [--force-surface]
     [--root <path>]                                  Force headless / Warp push / reclaim name /
                                                      take surface / set root
-  swarm leave                                      Deregister from the current swarm
+  swarm leave                                      Refuse unverified process-only deregistration
+  swarm stand-down <agent>                         Owner/Lead: terminate and verify one exact
+                                                     captured local process tree, then unregister
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>] [--force]
   swarm unregister-a2a <name>                      Remove an A2A agent
@@ -332,17 +479,21 @@ Agent Management:
 Communication:
   swarm send <agent>[,<agent>...] <message>        Send message within the current swarm
     [--interject|--now]                              (comma-separated list sends to each);
-    [--kind <kind>] [--supersedes <msg-id>]           Grok: force send-now (double Enter);
-                                                     default single Enter queues mid-turn
+    [--kind <kind>] [--supersedes <msg-id>]           --require-reply creates a durable deadline;
+    [--require-reply <ttl>] [--reply-to <msg-id>]      --reply-to resolves that exact request;
+                                                       Grok: force send-now (double Enter);
+                                                     default single Enter queues mid-turn;
+                                                     --kind ack is read-only/system-reserved
   swarm broadcast <message>                        Send to all agents in the current swarm
     [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
-    [--supersedes <msg-id>]                           escalation, ack, gate, handoff)
-  swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
+    [--supersedes <msg-id>]                           escalation, gate, handoff;
+                                                     ack is read-only/system-reserved)
+  swarm inbox [--peek|--unread|--recent [N]]       Display pending messages without acknowledging
     [--wait <seconds>]
-    [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
-                                                      --recent N replays last N regardless of cursor;
-                                                      --kind filters and never advances the cursor)
-  swarm ack <msg-id...> | --all                    Acknowledge messages explicitly
+    [--kind <kind>]                                  (--unread/--peek are display aliases;
+                                                      --recent N replays history; --kind filters)
+  swarm ack <msg-id>                               Acknowledge exactly one handled message
+  swarm replies [--history]                        Inspect required-answer state for this exact ID
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
 Task Ledger:
@@ -356,23 +507,50 @@ Task Ledger:
     [--force-discard] [--override --reason <text>]
   swarm task reopen <slug> --reason <text>         Reactivate done/abandoned work
     [--takeover]
+  swarm task rebind <slug> --to <agent>            Explicitly upgrade legacy name-only ownership
+    --reason <text>
   swarm run [--task <slug>] -- <cmd> [args...]     Capture full output as task evidence
   swarm grant create --op <op> --resource <r>      Create a scoped, expiring grant
     --ttl <30m|2h|1d> [--to <agent>] [--note <t>]
   swarm grant list [--live]                        List grants
   swarm grant revoke <id>                          Revoke a grant
+  swarm authority show                             Show immutable Owner/Lead bindings
+  swarm authority assign <owner|lead> --to <agent> Assign a role (Owner/Lead only)
   swarm escalate <slug> [--question <text>]        Write and send a decision-ready packet
     [--to <agent>]
   swarm review <slug> [--to <agent>]               Route an inverted-family review request
     [--same-family-ok --reason <text>]
+  swarm review verdict <slug> --request <id>       Submit PASS/BLOCK for the exact request head/tree
+    --qualification <id> --verdict pass|block
+    --head <sha> --tree <sha> --report <path>
+    --model-id <id> --harness-sha <sha256>
+    --prompt-sha <sha256> --tools-sha <sha256>
+  swarm qualification record <agent>               Owner/Lead: bind reviewer epoch to immutable
+    --binary-sha <sha256> --model-id <id>             binary/model/harness/prompt/tool identities
+    --harness-sha <sha256> --prompt-sha <sha256>
+    --tools-sha <sha256> --ttl <duration>
+  swarm qualification list [--live]                List reviewer qualification epochs
+  swarm qualification revoke <id>                  Owner/Lead: revoke one qualification
+  swarm migration reserve <resource>               Owner/Lead: exclusively lease migration resource
+    --task <slug> --ttl <duration>
+  swarm migration release <resource>               Owner/Lead: release an exact resource lease
+    --reason <text>
+  swarm migration list [--live]                    List migration resource leases
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
-  swarm handoff <slug> --to <agent> [--stale-ok]   Transfer authority with a checkpoint pointer
+  swarm handoff offer <slug> --to <agent>          Offer a checkpoint-bound lease transfer
+    [--ttl <15m|2h|1d>] [--stale-ok]                 (source retains authority until acceptance)
+  swarm handoff accept <slug> [--offer <id>]       Accept the exact charter and transfer the lease
+  swarm handoff decline <slug> [--offer <id>]      Decline without transferring the lease
+    [--reason <text>]
+  swarm handoff cancel <slug> [--offer <id>]       Cancel your pending offer
+    [--reason <text>]
+  swarm handoff status [slug]                      Show pickup/dead-letter/acceptance state
   swarm decision <text> [--task <slug>]            Record a durable decision
     [--supersedes <decision-id>]
   swarm harness-review <slug>                      Review the full task handoff timeline
   swarm rescue --worktree <path> | --task <slug>   Create and verify preservation artifacts
-    | --agent <name>
+    | --agent <name> [--to <successor>]               and optionally deliver exact-ID pointers
   swarm rescue --list                              List rescue manifests and verification state
                                                      (plain files under ~/.swarm/archive/rescue/;
                                                      existing rsync may copy them off-host)
@@ -500,6 +678,7 @@ function reclaimHeadlessNameOrExit(
 
 function printHookContext(): void {
   const { db, self, swarm } = requireSelf();
+  sweepRequiredResponses(db, self.swarm_id);
 
   // Re-emit the Warp OSC tab title so that agents like Claude Code,
   // which set their own title on startup/activity, can't permanently
@@ -519,16 +698,26 @@ function printHookContext(): void {
   const injected = recordHookInjections(db, self.swarm_id, self.name, inbox);
   const inboxSection = injected.length === 0
     ? ''
-    : `\nNEW MESSAGES (respond to these):\n${injected.map(entry => {
+    : `\nNEW MESSAGES (review and act as needed; do not send receipt-only acknowledgements):\n${injected.map(entry => {
       const { message: msg } = entry;
       if (entry.collapsed) {
-        return `(#${msg.id} from ${msg.from_agent}, unacked for ${entry.unackedMinutes}m — swarm inbox --recent to review, swarm ack ${msg.id} to clear)`;
+        return `(#${msg.id} from ${msg.from_agent}, unacked for ${entry.unackedMinutes}m — swarm inbox --recent to review, swarm ack ${msg.id} to clear)${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)}`;
       }
       const time = new Date(msg.created_at).toLocaleTimeString();
-      return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}`;
+      return `[#${msg.id} ${time}] ${msg.kind ? `[${msg.kind}] ` : ''}${msg.from_agent}: ${msg.body}${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)}`;
     }).join('\n')}`;
+  const requiredLines = listPendingRequiredResponsesForRecipient(db, self.swarm_id, self.name)
+    .filter(request => !injected.some(entry => entry.message.id === request.request_message_id))
+    .map(request =>
+      `REPLY REQUIRED #${request.request_message_id ?? 'deleted'} from ${request.sender_name} by ${request.required_by} — ` +
+      `swarm send ${shellToken(request.sender_name)} "<answer>" --reply-to ${request.request_message_id ?? '<message-id>'}`
+    );
+  const requiredSection = requiredLines.length === 0 ? '' : `\n${requiredLines.join('\n')}`;
   const taskLines = getActiveTaskHookLines(db, self.swarm_id, self.name);
-  const taskSection = taskLines.length ? `\n${taskLines.join('\n')}` : '';
+  const handoffLines = getHandoffOfferHookLines(db, self.swarm_id, self.name);
+  const taskSection = taskLines.length || handoffLines.length
+    ? `\n${[...taskLines, ...handoffLines].join('\n')}`
+    : '';
   const janitorStatus = getJanitorStatus(db);
   const janitorSection = janitorStatus ? `\n${formatJanitorHookLine(janitorStatus)}` : '';
   const updateBanner = formatSwarmUpdateBanner(getSwarmVersionCache(db));
@@ -537,7 +726,7 @@ function printHookContext(): void {
   const readCommand = self.agent_type === 'a2a' ? '' : ' | read <agent> --lines 20';
   console.log(`You are "${self.name}" in swarm "${swarm.name}". Active agents: ${members || '(none)'}.
 Commands: swarm send <agent> "<msg>" | inbox [--wait N] | members | status --set "<desc>" | task start/checkpoint/close | board --tab${readCommand} | help --agent (full map)
-When you see [SWARM from <name>]: treat it as a message from another agent and respond.${taskSection}${janitorSection}${updateSection}${inboxSection}`);
+When you see [SWARM from <name>]: treat it as a message from another agent and respond only when work, a required reply, or a blocker calls for it.${taskSection}${requiredSection}${janitorSection}${updateSection}${inboxSection}`);
 
   // Opportunistic recovery: if some OTHER agent has a fresh, unseen, push-failed
   // message, kick a detached retry worker. One indexed SELECT when idle, so this
@@ -675,18 +864,28 @@ async function main() {
       }
 
       case 'leave': {
-        const { db, self, swarm } = requireSelf();
-        if (self.agent_type === 'headless') {
-          leaveHeadlessAgent(db, self.swarm_id, self.name, { trackSession: true });
-          removeSurface(self.swarm_id, self.name);
-          const host = detectHost();
-          if (host) {
-            removeHook(host, self.name, self.swarm_id);
-          }
-        } else {
-          leaveAgent(db, self.swarm_id, self.surface_id);
+        const { self } = requireSelf();
+        console.error(
+          `Refused unverified leave for "${self.name}": unregistering a live process is not stand-down. ` +
+          `From an unrelated Owner/Lead session, run "swarm stand-down ${self.name}" so the exact ` +
+          'captured process tree is terminated and verified before the registration is removed.'
+        );
+        process.exit(1);
+        break;
+      }
+
+      case 'stand-down': {
+        const target = args[1];
+        if (!target) {
+          console.error('Usage: swarm stand-down <agent>');
+          process.exit(1);
         }
-        console.log(`Left swarm "${swarm.name}" (was "${self.name}")`);
+        const { db, self } = requireSelf('privileged');
+        const result = await standDownAgent(db, self.swarm_id, self.name, target);
+        console.log(
+          `Verified stand-down for ${result.targetName}: root PID ${result.rootPid}; ` +
+          `tree ${result.treeSha256}; terminated ${result.terminatedPids.join(', ')}.`
+        );
         break;
       }
 
@@ -836,17 +1035,62 @@ async function main() {
       }
 
       case 'send': {
+        const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>] [--require-reply <ttl>|--reply-to <msg-id>]';
+        refuseUnknownCoordinationOptions(
+          'send',
+          new Set([
+            '--interject',
+            '--now',
+            '--kind',
+            '--supersedes',
+            '--require-reply',
+            '--reply-to',
+          ]),
+          usage
+        );
         const { db, self } = requireSelf(true);
-        const usage = 'Usage: swarm send <agent>[,<agent>...] <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
         // Flags may appear anywhere before/among free-text; strip them from the body.
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const kind = requireValidKind(usage);
+        const kind = requireSendKind(usage);
         const supersedes = requireSupersedes(usage);
+        const requiredBy = requireReplyDeadline(usage);
+        const replyTo = requirePositiveIdFlag('--reply-to', 'Required message ID', usage);
+        if (
+          args
+            .slice(0, optionBoundary())
+            .filter(token => token === '--reply-to').length > 1
+        ) {
+          console.error('--reply-to may be specified only once.');
+          console.error(usage);
+          process.exit(1);
+        }
+        if (requiredBy !== undefined && replyTo !== undefined) {
+          console.error('--require-reply and --reply-to are mutually exclusive.');
+          console.error(usage);
+          process.exit(1);
+        }
+        if (supersedes !== undefined && (requiredBy !== undefined || replyTo !== undefined)) {
+          console.error('--supersedes cannot be combined with required-reply coordination.');
+          console.error(usage);
+          process.exit(1);
+        }
         const rest = args.slice(1);
         const tokens: string[] = [];
+        let literal = false;
         for (let i = 0; i < rest.length; i++) {
-          if (rest[i] === '--interject' || rest[i] === '--now') continue;
-          if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          if (!literal && rest[i] === '--') {
+            literal = true;
+            continue;
+          }
+          if (!literal) {
+            if (rest[i] === '--interject' || rest[i] === '--now') continue;
+            if (
+              rest[i] === '--kind' ||
+              rest[i] === '--supersedes' ||
+              rest[i] === '--require-reply' ||
+              rest[i] === '--reply-to'
+            ) { i++; continue; }
+          }
           tokens.push(rest[i]);
         }
         const targetName = tokens[0];
@@ -874,6 +1118,11 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
+        if (replyTo !== undefined && recipients.length !== 1) {
+          console.error('--reply-to requires exactly one recipient: the exact original requester.');
+          console.error(usage);
+          process.exit(1);
+        }
         // Attempt every recipient even after a failure; exit nonzero if ANY failed.
         let anyFailed = false;
         let anyQueued = false;
@@ -883,7 +1132,17 @@ async function main() {
             anyFailed = true;
             continue;
           }
-          const result = await sendMessage(db, self.swarm_id, self.name, recipient, message, { interject }, kind, supersedes);
+          const result = await sendMessage(
+            db,
+            self.swarm_id,
+            self.name,
+            recipient,
+            message,
+            { interject },
+            kind,
+            supersedes,
+            { requiredBy, replyTo }
+          );
           console.log(result.message);
           if (!result.delivered && !result.queued) anyFailed = true;
           if (result.queued) anyQueued = true;
@@ -896,16 +1155,43 @@ async function main() {
       }
 
       case 'broadcast': {
-        const { db, self } = requireSelf(true);
         const usage = 'Usage: swarm broadcast <message> [--interject|--now] [--kind <kind>] [--supersedes <msg-id>]';
+        refuseUnknownCoordinationOptions(
+          'broadcast',
+          new Set([
+            '--interject',
+            '--now',
+            '--kind',
+            '--supersedes',
+            '--require-reply',
+            '--reply-to',
+          ]),
+          usage
+        );
+        const { db, self } = requireSelf(true);
+        if (hasFlag('--require-reply') || hasFlag('--reply-to')) {
+          console.error(
+            'Required replies are exact-registration obligations and cannot be broadcast. ' +
+            'Use "swarm send <agent> <message> --require-reply <ttl>" or reply directly with --reply-to.'
+          );
+          console.error(usage);
+          process.exit(1);
+        }
         const interject = hasFlag('--interject') || hasFlag('--now');
-        const kind = requireValidKind(usage);
+        const kind = requireSendKind(usage);
         const supersedes = requireSupersedes(usage);
         const rest = args.slice(1);
         const tokens: string[] = [];
+        let literal = false;
         for (let i = 0; i < rest.length; i++) {
-          if (rest[i] === '--interject' || rest[i] === '--now') continue;
-          if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          if (!literal && rest[i] === '--') {
+            literal = true;
+            continue;
+          }
+          if (!literal) {
+            if (rest[i] === '--interject' || rest[i] === '--now') continue;
+            if (rest[i] === '--kind' || rest[i] === '--supersedes') { i++; continue; }
+          }
           tokens.push(rest[i]);
         }
         const message = tokens.join(' ');
@@ -929,19 +1215,27 @@ async function main() {
         const { db, self } = requireSelf(true);
         const all = hasFlag('--all');
         const rawIds = args.slice(1).filter(arg => arg !== '--all');
-        if ((all && rawIds.length > 0) || (!all && rawIds.length === 0)) {
-          console.error('Usage: swarm ack <msg-id...> | --all');
+        if (all) {
+          console.error(
+            'Refused unsafe "swarm ack --all": bulk acknowledgement can erase an unseen STOP, gate, question, or handoff. ' +
+            'Run "swarm inbox --peek", then acknowledge the exact IDs you actually handled.'
+          );
+          process.exit(1);
+        }
+        if (rawIds.length !== 1) {
+          console.error(
+            'Refused bulk acknowledgement: acknowledge exactly one handled message ID at a time.\n' +
+            'Usage: swarm ack <msg-id>'
+          );
           process.exit(1);
         }
         const ids = rawIds.map(raw => Number(raw));
         if (ids.some((id, index) => !/^\d+$/.test(rawIds[index]) || id <= 0 || !Number.isSafeInteger(id))) {
           console.error('Message IDs must be positive integers.');
-          console.error('Usage: swarm ack <msg-id...> | --all');
+          console.error('Usage: swarm ack <msg-id>');
           process.exit(1);
         }
-        const acknowledged = all
-          ? acknowledgeAllMessages(db, self.swarm_id, self.name)
-          : acknowledgeMessages(db, self.swarm_id, self.name, ids);
+        const acknowledged = acknowledgeMessages(db, self.swarm_id, self.name, ids);
         if (acknowledged.length === 0) {
           console.log('No messages to acknowledge.');
         } else {
@@ -957,7 +1251,9 @@ async function main() {
           console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf(
+          subcommand === 'list' || subcommand === 'show' ? true : 'privileged'
+        );
         if (subcommand === 'list') {
           const tasks = db.prepare(`
             SELECT id, title, state, owner_agent, lease_epoch, disposition, claim_kind, updated_at
@@ -996,14 +1292,21 @@ async function main() {
             process.exit(1);
           }
           console.log(`${task.id}: ${task.title}`);
-          console.log(`state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; lease epoch: ${task.lease_epoch}`);
+          console.log(
+            `state: ${task.state}; owner: ${task.owner_agent ?? 'unowned'}; ` +
+            `owner registration: ${task.owner_agent_id ?? 'legacy/unrecorded'}; lease epoch: ${task.lease_epoch}`
+          );
           console.log(`claim: ${effectiveClaimKind(task)}`);
           console.log(`lease expires: ${task.lease_expires_at ?? 'none'}; disposition: ${task.disposition ?? 'none'}`);
           console.log(`repo: ${task.repo_path ?? 'none'}`);
           console.log(`branch: ${task.branch ?? 'none'}; worktree: ${task.worktree_path ?? 'none'}`);
+          console.log(
+            `bound head: ${task.head_sha ?? 'none'}; bound tree: ${task.tree_sha ?? 'none'}; ` +
+            `immutable author family: ${task.author_family ?? 'none'}`
+          );
           console.log(`transcript: ${task.transcript_hint ?? 'not available'}`);
           const events = db.prepare(`
-            SELECT id, epoch, kind, actor, data, created_at
+            SELECT id, epoch, kind, actor, actor_agent_id, data, created_at
             FROM task_events
             WHERE swarm_id = ? AND task_id = ?
             ORDER BY id ASC
@@ -1012,6 +1315,7 @@ async function main() {
             epoch: number;
             kind: string;
             actor: string | null;
+            actor_agent_id: string | null;
             data: string | null;
             created_at: string;
           }>;
@@ -1060,10 +1364,14 @@ async function main() {
           if (events.length === 0) console.log('  none');
           for (const event of events) {
             const data = event.data ? ` \u2014 ${oneLineForCli(event.data)}` : '';
-            console.log(`  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} @${event.epoch}${data}`);
+            const actorId = event.actor_agent_id ?? (event.actor ? 'legacy/unrecorded' : 'system');
+            console.log(
+              `  #${event.id} ${event.created_at} ${event.kind} by ${event.actor ?? 'system'} ` +
+              `@${event.epoch} [${actorId}]${data}`
+            );
           }
           const decisions = db.prepare(`
-            SELECT id, body, made_by, supersedes, status, created_at
+            SELECT id, body, made_by, actor_agent_id, task_epoch, supersedes, status, created_at
             FROM decisions
             WHERE swarm_id = ? AND task_id = ?
             ORDER BY id ASC
@@ -1071,6 +1379,8 @@ async function main() {
             id: number;
             body: string;
             made_by: string;
+            actor_agent_id: string | null;
+            task_epoch: number | null;
             supersedes: number | null;
             status: string;
             created_at: string;
@@ -1079,7 +1389,13 @@ async function main() {
           if (decisions.length === 0) console.log('  none');
           for (const decision of decisions) {
             const supersedes = decision.supersedes ? ` supersedes #${decision.supersedes}` : '';
-            console.log(`  #${decision.id} [${decision.status}] ${decision.body} \u2014 ${decision.made_by}${supersedes}`);
+            const provenance =
+              `agent-id ${decision.actor_agent_id ?? 'legacy/unrecorded'}` +
+              `; task epoch ${decision.task_epoch ?? 'legacy/unrecorded'}`;
+            console.log(
+              `  #${decision.id} [${decision.status}] ${decision.body} \u2014 ` +
+              `${decision.made_by} (${provenance})${supersedes}`
+            );
           }
           break;
         }
@@ -1155,6 +1471,23 @@ async function main() {
           );
           break;
         }
+        if (subcommand === 'rebind') {
+          const target = getFlag('--to');
+          const reason = getFlag('--reason');
+          if (!target || !reason) {
+            console.error('Usage: swarm task rebind <slug> --to <agent> --reason <text>');
+            process.exit(1);
+          }
+          const task = await rebindLegacyTask(db, self.swarm_id, self.name, slug, {
+            target,
+            reason,
+          });
+          console.log(
+            `Task "${slug}" explicitly rebound to ${task.owner_agent} registration ` +
+            `${task.owner_agent_id} at lease epoch ${task.lease_epoch}.`
+          );
+          break;
+        }
         console.error(`Unknown task command: ${subcommand}`);
         console.error('Usage: swarm task start|checkpoint|close|reopen|show <slug> [options] | swarm task list');
         process.exit(1);
@@ -1172,7 +1505,7 @@ async function main() {
             console.error(usage);
             process.exit(1);
           }
-          const { db, self } = requireSelf(true);
+          const { db, self } = requireSelf('privileged');
           const grant = createGrant(db, self.swarm_id, self.name, {
             op,
             resource,
@@ -1206,13 +1539,19 @@ async function main() {
           break;
         }
         if (subcommand === 'revoke') {
+          const { db: authenticatedDb, self } = requireSelf('privileged');
           const rawId = args[2];
           const id = Number(rawId);
           if (!rawId || !/^\d+$/.test(rawId) || id <= 0 || !Number.isSafeInteger(id)) {
             console.error(usage);
             process.exit(1);
           }
-          const grant = revokeGrant(db, swarm.id, id);
+          const authenticatedSwarm = getSwarmById(authenticatedDb, self.swarm_id);
+          if (!authenticatedSwarm || authenticatedSwarm.id !== swarm.id) {
+            console.error('Authenticated identity is not a member of the selected swarm.');
+            process.exit(1);
+          }
+          const grant = revokeGrant(authenticatedDb, swarm.id, self.name, id);
           if (!grant) {
             console.error(`Grant #${id} not found in swarm "${swarm.name}".`);
             process.exit(1);
@@ -1225,13 +1564,60 @@ async function main() {
         break;
       }
 
+      case 'authority': {
+        const subcommand = args[1];
+        if (subcommand === 'show') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listSwarmAuthorities(db, swarm.id, false);
+          if (rows.length === 0) {
+            console.log('No Owner/Lead authority has been bootstrapped in this swarm.');
+            break;
+          }
+          for (const row of rows) {
+            const state = row.revoked_at ? `revoked ${row.revoked_at}` : 'active';
+            console.log(
+              `#${row.id} ${row.role}: ${row.agent_name} [${row.agent_id}] ` +
+              `(${state}; ${row.assignment_kind}; by ${row.assigned_by_agent_id})`
+            );
+          }
+          break;
+        }
+        if (subcommand === 'assign') {
+          const role = args[2] as SwarmAuthorityRole | undefined;
+          const target = getFlag('--to');
+          if ((role !== 'owner' && role !== 'lead') || !target) {
+            console.error('Usage: swarm authority assign <owner|lead> --to <agent>');
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const authority = assignSwarmAuthority(
+            db,
+            self.swarm_id,
+            self.name,
+            role,
+            target
+          );
+          console.log(
+            `${role === 'owner' ? 'Owner' : 'Lead'} authority assigned to ` +
+            `${authority.agent_name} registration ${authority.agent_id}.`
+          );
+          break;
+        }
+        console.error(
+          'Usage: swarm authority show | swarm authority assign <owner|lead> --to <agent>'
+        );
+        process.exit(1);
+        break;
+      }
+
       case 'escalate': {
         const slug = args[1];
         if (!slug) {
           console.error('Usage: swarm escalate <slug> [--question <text>] [--to <agent>]');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf('privileged');
         const result = await escalateTask(db, self.swarm_id, self.name, slug, {
           question: getFlag('--question'),
           to: getFlag('--to'),
@@ -1246,12 +1632,55 @@ async function main() {
       }
 
       case 'review': {
+        if (args[1] === 'verdict') {
+          const usage =
+            'Usage: swarm review verdict <slug> --request <id> --qualification <id> ' +
+            '--verdict pass|block --head <sha> --tree <sha> --report <path> --model-id <id> ' +
+            '--harness-sha <sha256> --prompt-sha <sha256> --tools-sha <sha256>';
+          const slug = args[2];
+          const requestId = requirePositiveIdFlag('--request', 'Review request ID', usage);
+          const qualificationId = requirePositiveIdFlag('--qualification', 'Qualification ID', usage);
+          const verdict = getFlag('--verdict');
+          const headSha = getFlag('--head');
+          const treeSha = getFlag('--tree');
+          const reportPath = getFlag('--report');
+          const modelId = getFlag('--model-id');
+          const harnessSha256 = getFlag('--harness-sha');
+          const promptSha256 = getFlag('--prompt-sha');
+          const toolsSha256 = getFlag('--tools-sha');
+          if (
+            !slug || requestId === undefined || qualificationId === undefined ||
+            !verdict || !headSha || !treeSha || !reportPath || !modelId ||
+            !harnessSha256 || !promptSha256 || !toolsSha256
+          ) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const result = submitReviewVerdict(db, self.swarm_id, self.name, slug, {
+            requestId,
+            qualificationId,
+            verdict: verdict as 'pass' | 'block',
+            headSha,
+            treeSha,
+            reportPath,
+            modelId,
+            harnessSha256,
+            promptSha256,
+            toolsSha256,
+          });
+          console.log(
+            `Typed ${result.verdict.toUpperCase()} verdict #${result.id} recorded for request ` +
+            `#${result.requestId} at ${result.headSha}/${result.treeSha}; report ${result.reportSha256}.`
+          );
+          break;
+        }
         const slug = args[1];
         if (!slug) {
           console.error('Usage: swarm review <slug> [--to <agent>] [--same-family-ok --reason <text>]');
           process.exit(1);
         }
-        const { db, self } = requireSelf(true);
+        const { db, self } = requireSelf('privileged');
         const result = await requestTaskReview(db, self.swarm_id, self.name, slug, {
           to: getFlag('--to'),
           sameFamilyOk: hasFlag('--same-family-ok'),
@@ -1260,8 +1689,142 @@ async function main() {
         console.log(`Review brief: ${result.briefPath}`);
         console.log(
           `Pointer sent to ${result.reviewer} (${result.reviewerFamily}); ` +
-          `task "${slug}" is awaiting_review.`
+          `task "${slug}" is awaiting_review; request #${result.requestId}, ` +
+          `qualification #${result.qualificationId}.`
         );
+        break;
+      }
+
+      case 'qualification': {
+        const subcommand = args[1];
+        const usage =
+          'Usage: swarm qualification record <agent> --binary-sha <sha256> --model-id <id> ' +
+          '--harness-sha <sha256> --prompt-sha <sha256> --tools-sha <sha256> --ttl <duration> | ' +
+          'swarm qualification list [--live] | swarm qualification revoke <id>';
+        if (subcommand === 'record') {
+          const agent = args[2];
+          const binarySha256 = getFlag('--binary-sha');
+          const modelId = getFlag('--model-id');
+          const harnessSha256 = getFlag('--harness-sha');
+          const promptSha256 = getFlag('--prompt-sha');
+          const toolsSha256 = getFlag('--tools-sha');
+          const ttl = getFlag('--ttl');
+          if (!agent || !binarySha256 || !modelId || !harnessSha256 || !promptSha256 || !toolsSha256 || !ttl) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = recordReviewerQualification(db, self.swarm_id, self.name, {
+            agent,
+            binarySha256,
+            modelId,
+            harnessSha256,
+            promptSha256,
+            toolsSha256,
+            ttl,
+          });
+          console.log(
+            `Qualification #${row.id} recorded for ${row.agent_name} (${row.family}); ` +
+            `worker ${row.worker_version}, binary ${row.binary_sha256}, expires ${row.expires_at}.`
+          );
+          break;
+        }
+        if (subcommand === 'list') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listReviewerQualifications(db, swarm.id, hasFlag('--live'));
+          if (rows.length === 0) {
+            console.log(hasFlag('--live') ? 'No live reviewer qualifications.' : 'No reviewer qualifications recorded.');
+          } else {
+            for (const row of rows) {
+              const status = row.revoked_at ? `revoked ${row.revoked_at}` : `expires ${row.expires_at}`;
+              console.log(
+                `#${row.id} ${row.agent_name} ${row.family}; worker ${row.worker_version}; ` +
+                `binary ${row.binary_sha256}; model ${row.model_id}; ${status}`
+              );
+            }
+          }
+          break;
+        }
+        if (subcommand === 'revoke') {
+          const rawId = args[2];
+          const id = rawId && /^\d+$/.test(rawId) ? Number(rawId) : 0;
+          if (!Number.isSafeInteger(id) || id <= 0) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = revokeReviewerQualification(db, self.swarm_id, self.name, id);
+          if (!row) {
+            console.error(`Qualification #${id} not found in this swarm.`);
+            process.exit(1);
+          }
+          console.log(`Qualification #${row.id} revoked at ${row.revoked_at}.`);
+          break;
+        }
+        console.error(usage);
+        process.exit(1);
+        break;
+      }
+
+      case 'migration': {
+        const subcommand = args[1];
+        const usage =
+          'Usage: swarm migration reserve <resource> --task <slug> --ttl <duration> | ' +
+          'swarm migration release <resource> --reason <text> | swarm migration list [--live]';
+        if (subcommand === 'reserve') {
+          const resource = args[2];
+          const taskId = getFlag('--task');
+          const ttl = getFlag('--ttl');
+          if (!resource || !taskId || !ttl) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = reserveMigrationResource(db, self.swarm_id, self.name, { resource, taskId, ttl });
+          console.log(
+            `Migration lease #${row.id} reserved ${row.resource} for ${row.task_id} ` +
+            `epoch ${row.task_epoch}; expires ${row.expires_at}.`
+          );
+          break;
+        }
+        if (subcommand === 'release') {
+          const resource = args[2];
+          const reason = getFlag('--reason');
+          if (!resource || !reason) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = releaseMigrationResource(db, self.swarm_id, self.name, resource, reason);
+          if (!row) {
+            console.error(`No live migration lease found for ${resource}.`);
+            process.exit(1);
+          }
+          console.log(`Migration lease #${row.id} released at ${row.released_at}: ${row.release_reason}.`);
+          break;
+        }
+        if (subcommand === 'list') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listMigrationResources(db, swarm.id, hasFlag('--live'));
+          if (rows.length === 0) {
+            console.log(hasFlag('--live') ? 'No live migration leases.' : 'No migration leases recorded.');
+          } else {
+            for (const row of rows) {
+              const status = row.released_at
+                ? `released ${row.released_at} (${row.release_reason})`
+                : `expires ${row.expires_at}`;
+              console.log(
+                `#${row.id} ${row.resource} -> ${row.task_id}@${row.task_epoch} ` +
+                `(${row.holder_name}); ${status}`
+              );
+            }
+          }
+          break;
+        }
+        console.error(usage);
+        process.exit(1);
         break;
       }
 
@@ -1282,7 +1845,7 @@ async function main() {
           taskId = wrapperArgs[index + 1];
           index += 1;
         }
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf('privileged');
         const result = runTaskCommand(db, self.swarm_id, self.name, args.slice(separator + 1), {
           taskId,
           cwd: process.cwd(),
@@ -1323,21 +1886,145 @@ async function main() {
       }
 
       case 'handoff': {
-        const slug = args[1];
-        const target = getFlag('--to');
-        if (!slug || !target) {
-          console.error('Usage: swarm handoff <slug> --to <agent> [--stale-ok]');
-          process.exit(1);
+        const subcommand = args[1];
+        const { db, self } = requireSelf(
+          subcommand === 'status' ? true : 'privileged'
+        );
+        if (subcommand === 'offer') {
+          const slug = args[2];
+          const target = getFlag('--to');
+          if (!slug || !target) {
+            console.error('Usage: swarm handoff offer <slug> --to <agent> [--ttl <15m|2h|1d>] [--stale-ok]');
+            process.exit(1);
+          }
+          const result = await offerTaskHandoff(db, self.swarm_id, self.name, slug, target, {
+            ttl: getFlag('--ttl'),
+            staleOk: hasFlag('--stale-ok'),
+          });
+          console.log(
+            `Handoff offer #${result.offer.id} created for task "${slug}" to ${result.offer.to_agent}; ` +
+            `source owner ${result.offer.from_agent} retains lease epoch ${result.offer.source_epoch} until acceptance.`
+          );
+          console.log(`Pickup deadline: ${result.offer.expires_at}; charter sha256: ${result.offer.charter_sha256}`);
+          console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
+          break;
         }
-        const { db, self } = requireSelf();
-        const result = await handoffTask(db, self.swarm_id, self.name, slug, target, hasFlag('--stale-ok'));
-        console.log(`Task "${slug}" handed off to ${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`);
-        console.log(`Brief: ${result.briefPath}${result.stale ? ' (STALE)' : ''}`);
+        if (subcommand === 'accept') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff accept <slug> [--offer <id>]');
+            process.exit(1);
+          }
+          const result = await acceptTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff accept <slug> [--offer <id>]'
+            ),
+          });
+          console.log(
+            `Accepted handoff offer #${result.offer.id}; task "${slug}" is owned by ${result.task.owner_agent} ` +
+            `at lease epoch ${result.task.lease_epoch}.`
+          );
+          console.log(`Charter sha256: ${result.offer.charter_sha256}`);
+          break;
+        }
+        if (subcommand === 'decline') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff decline <slug> [--offer <id>] [--reason <text>]');
+            process.exit(1);
+          }
+          const result = await declineTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff decline <slug> [--offer <id>] [--reason <text>]'
+            ),
+            reason: getFlag('--reason'),
+          });
+          console.log(
+            `Declined handoff offer #${result.offer.id}; task "${slug}" remains owned by ` +
+            `${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`
+          );
+          break;
+        }
+        if (subcommand === 'cancel') {
+          const slug = args[2];
+          if (!slug) {
+            console.error('Usage: swarm handoff cancel <slug> [--offer <id>] [--reason <text>]');
+            process.exit(1);
+          }
+          const result = cancelTaskHandoff(db, self.swarm_id, self.name, slug, {
+            offerId: requirePositiveIdFlag(
+              '--offer',
+              'Handoff offer ID',
+              'Usage: swarm handoff cancel <slug> [--offer <id>] [--reason <text>]'
+            ),
+            reason: getFlag('--reason'),
+          });
+          console.log(
+            `Cancelled handoff offer #${result.offer.id}; task "${slug}" remains owned by ` +
+            `${result.task.owner_agent} at lease epoch ${result.task.lease_epoch}.`
+          );
+          break;
+        }
+        if (subcommand === 'status') {
+          const slug = args[2];
+          sweepHandoffOffers(db, self.swarm_id);
+          const offers = listHandoffOffers(db, self.swarm_id, self.name, slug);
+          if (offers.length === 0) {
+            console.log(slug ? `No handoff offers recorded for task "${slug}".` : 'No handoff offers recorded for you.');
+            break;
+          }
+          for (const offer of offers) {
+            const resolution = offer.resolved_at
+              ? `; resolved ${offer.resolved_at}${offer.resolved_by ? ` by ${offer.resolved_by}` : ''}`
+              : '';
+            const accepted = offer.accepted_epoch === null ? '' : `; accepted epoch ${offer.accepted_epoch}`;
+            console.log(
+              `#${offer.id} ${offer.task_id} [${offer.status}] ${offer.from_agent} -> ${offer.to_agent}; ` +
+              `source epoch ${offer.source_epoch}; pickup ${offer.pickup_status}; deadline ${offer.expires_at}` +
+              `${accepted}${resolution}; charter sha256 ${offer.charter_sha256}`
+            );
+          }
+          console.log(`\n${offers.length} handoff offer(s)`);
+          break;
+        }
+
+        console.error(
+          'Immediate handoff is not supported. Use "swarm handoff offer <slug> --to <agent>", ' +
+          'then have that exact recipient registration accept the offer.'
+        );
+        console.error('Usage: swarm handoff offer|accept|decline|cancel|status ...');
+        process.exit(1);
         break;
       }
 
       case 'decision': {
         const usage = 'Usage: swarm decision <text> [--task <slug>] [--supersedes <decision-id>]';
+        if (args[1] === '--help' || args[1] === '-h') {
+          console.log(usage);
+          break;
+        }
+        for (let index = 1; index < args.length; index += 1) {
+          const token = args[index];
+          if (token === '--task' || token === '--supersedes') {
+            const value = args[index + 1];
+            if (!value || value.startsWith('-')) {
+              console.error(`${token} requires a value.`);
+              console.error(usage);
+              process.exit(1);
+            }
+            index += 1;
+            continue;
+          }
+          if (token.startsWith('-')) {
+            console.error(`Unknown decision option "${token}".`);
+            console.error(usage);
+            process.exit(1);
+          }
+        }
         const supersedes = requirePositiveIdFlag('--supersedes', 'Decision ID', usage);
         const tokens: string[] = [];
         for (let index = 1; index < args.length; index += 1) {
@@ -1349,7 +2036,7 @@ async function main() {
           console.error(usage);
           process.exit(1);
         }
-        const { db, self } = requireSelf();
+        const { db, self } = requireSelf('privileged');
         const result = recordDecision(db, self.swarm_id, self.name, body, getFlag('--task'), supersedes);
         console.log(`Decision #${result.id} recorded.`);
         break;
@@ -1384,6 +2071,10 @@ async function main() {
           console.log(`Rescue verified: ${artifactDir} (${manifest.head_sha})`);
           break;
         }
+        if (hasFlag('--to') && !getFlag('--to')) {
+          console.error('Usage: swarm rescue --worktree <path> | --task <slug> | --agent <name> [--to <successor>]');
+          process.exit(1);
+        }
         const { db, self } = requireSelf();
         const results = rescueTargets(db, self.swarm_id, {
           worktree: getFlag('--worktree'),
@@ -1393,6 +2084,23 @@ async function main() {
         for (const result of results) {
           console.log(`Rescue verified: ${result.artifactDir}`);
           console.log(`Manifest: ${path.join(result.artifactDir, 'manifest.json')}`);
+        }
+        const recipient = getFlag('--to');
+        if (recipient) {
+          const delivered = await deliverRescueArtifacts(
+            db,
+            self.swarm_id,
+            self.name,
+            recipient,
+            results
+          );
+          console.log(
+            `Rescue pointer delivery committed for ${recipient}: ` +
+            `${delivered.pushed} pushed, ${delivered.queued} queued; ` +
+            `message${delivered.messageIds.length === 1 ? '' : 's'} ` +
+            delivered.messageIds.map(id => `#${id}`).join(', ')
+          );
+          if (delivered.queued > 0) spawnRedeliverWorker();
         }
         break;
       }
@@ -1404,7 +2112,8 @@ async function main() {
             console.error('only --observe is implemented; destructive phases are deliberately unbuilt — see docs/design/SWARM-NEXT-V1.md');
             process.exit(1);
           }
-          const result = runJanitorTick(getDb());
+          const db = getDb();
+          const result = runJanitorTick(db);
           if (result.lockedOut) {
             console.log('Janitor tick already running; no-op.');
           } else {
@@ -1414,6 +2123,7 @@ async function main() {
               `${counters.reposScanned} repos, ${counters.worktrees} worktrees, ` +
               `${result.findings} findings.`
             );
+            if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
           }
           break;
         }
@@ -1604,8 +2314,8 @@ async function main() {
       case 'inbox': {
         const { db, self } = requireSelf();
         const usage = 'Usage: swarm inbox [--peek|--unread|--recent [N]] [--kind <kind>] [--wait <seconds>]';
-        // --unread: common agent habit; same as default (show unread, advance cursor).
-        // --peek: show without advancing.
+        // All inbox displays are non-acknowledging. --unread and --peek are
+        // retained as display aliases for compatibility.
         // --recent [N]: replay last N messages (default 10) IGNORING the read
         // cursor and delivery state, never advancing or acknowledging them.
         // --kind <k>: show only messages of that kind. Filtered reads NEVER advance
@@ -1621,6 +2331,7 @@ async function main() {
           console.error(`${usage}\n--wait cannot be combined with --recent because recent is a historical replay.`);
           process.exit(1);
         }
+        sweepRequiredResponses(db, self.swarm_id);
         if (hasFlag('--recent')) {
           const limitRaw = getFlag('--recent');
           const limit = limitRaw && /^\d+$/.test(limitRaw) ? parseInt(limitRaw, 10) : 10;
@@ -1631,7 +2342,10 @@ async function main() {
             for (const msg of recent) {
               const time = new Date(msg.created_at).toLocaleTimeString();
               const superseded = msg.superseded_by === null ? '' : ` [superseded by #${msg.superseded_by}]`;
-              console.log(`[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}${superseded}`);
+              console.log(
+                `[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}` +
+                `${superseded}${requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent, true)}`
+              );
             }
             console.log(`\n${recent.length} recent message(s) (replay — cursor unchanged)`);
           }
@@ -1666,14 +2380,78 @@ async function main() {
         } else {
           for (const msg of messages) {
             const time = new Date(msg.created_at).toLocaleTimeString();
-            console.log(`[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}`);
+            console.log(
+              `[#${msg.id} ${time}] ${kindPrefix(msg.kind)}${msg.from_agent}: ${msg.body}` +
+              requiredResponseHint(db, self.swarm_id, msg.id, msg.from_agent)
+            );
           }
           const suffix = kind
-            ? ` (kind filter — cursor not advanced)`
-            : peek ? ' (peek mode, not marked as read)' : '';
+            ? ` (kind filter — pending until exact ack)`
+            : ' (display only — pending until exact ack)';
           console.log(`\n${messages.length} message(s)${suffix}`);
         }
+        const shownIds = new Set(messages.map(message => message.id));
+        const pendingRequired = listPendingRequiredResponsesForRecipient(db, self.swarm_id, self.name)
+          .filter(request => request.request_message_id === null || !shownIds.has(request.request_message_id));
+        if (pendingRequired.length > 0) {
+          console.log('\nPending required replies (reading or acking does not resolve them):');
+          for (const request of pendingRequired) {
+            console.log(
+              `  #${request.request_message_id ?? 'deleted'} from ${request.sender_name}, due ${request.required_by} — ` +
+              `swarm send ${shellToken(request.sender_name)} "<answer>" --reply-to ${request.request_message_id ?? '<message-id>'}`
+            );
+          }
+        }
         if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
+        break;
+      }
+
+      case 'replies': {
+        const usage = 'Usage: swarm replies [--history]';
+        const unknown = args.slice(1).find(token => token !== '--history');
+        if (unknown) {
+          console.error(`Unknown replies option "${unknown}".`);
+          console.error(usage);
+          process.exit(1);
+        }
+        const { db, self } = requireSelf();
+        sweepRequiredResponses(db, self.swarm_id);
+        if (hasPendingRedeliveries(db)) spawnRedeliverWorker();
+        const rows = listRequiredResponsesForAgent(
+          db,
+          self.swarm_id,
+          self.name,
+          hasFlag('--history')
+        );
+        if (rows.length === 0) {
+          console.log(
+            hasFlag('--history')
+              ? 'No required replies on record for this registration.'
+              : 'No pending required replies for this registration.'
+          );
+          break;
+        }
+        for (const row of rows) {
+          const id = row.request_message_id ?? 'deleted';
+          if (row.status === 'pending' && row.recipient_agent_id === self.id) {
+            console.log(
+              `#${id} pending — from ${row.sender_name}; due ${row.required_by}; ` +
+              `swarm send ${shellToken(row.sender_name)} "<answer>" --reply-to ${id}`
+            );
+          } else if (row.status === 'pending') {
+            console.log(`#${id} pending — awaiting ${row.recipient_name}; due ${row.required_by}`);
+          } else if (row.status === 'resolved') {
+            console.log(
+              `#${id} resolved — ${row.sender_name} -> ${row.recipient_name}; ` +
+              `reply #${row.reply_message_id ?? 'deleted'} at ${row.resolved_at ?? 'unknown'}`
+            );
+          } else {
+            console.log(
+              `#${id} expired — ${row.sender_name} -> ${row.recipient_name}; ` +
+              `${row.expiry_reason ?? 'unresolved'}`
+            );
+          }
+        }
         break;
       }
 
@@ -2198,19 +2976,50 @@ async function main() {
           if (host) removeHook(host, a.name, a.swarm_id);
         }
 
+        const resetAt = new Date().toISOString();
         if (all) {
-          db.exec('DELETE FROM agents');
-          db.exec('DELETE FROM message_deliveries');
-          db.exec('DELETE FROM messages');
-          db.exec('DELETE FROM inbox_cursors');
-          db.prepare('DELETE FROM swarms WHERE id != ?').run(DEFAULT_SWARM_ID);
+          withImmediateTransaction(db, () => {
+            // A fleet reset deliberately closes the old registration epoch.
+            // Preserve grant rows as audit, but no wildcard or recipient-less
+            // grant may survive into the next fleet generation.
+            db.prepare(`
+              UPDATE grants SET revoked_at = ?
+              WHERE revoked_at IS NULL
+            `).run(resetAt);
+            db.prepare(`
+              UPDATE required_message_responses
+              SET status = 'expired', resolved_at = ?, expiry_reason = 'swarm reset ended registration generation'
+              WHERE status = 'pending'
+            `).run(resetAt);
+            db.exec('DELETE FROM swarm_authorities');
+            db.exec('DELETE FROM agents');
+            db.exec('DELETE FROM message_deliveries');
+            db.exec('DELETE FROM messages');
+            db.exec('DELETE FROM inbox_cursors');
+            db.prepare('DELETE FROM swarms WHERE id != ?').run(DEFAULT_SWARM_ID);
+          });
           console.log(`Swarm reset. Cleared ${agents.length} agent(s), all messages, and all non-default swarms.`);
         } else {
           const swarm = resolveSelectedSwarm(db);
-          db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
-          db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
+          withImmediateTransaction(db, () => {
+            db.prepare(`
+              UPDATE grants SET revoked_at = ?
+              WHERE swarm_id = ? AND revoked_at IS NULL
+            `).run(resetAt, swarm.id);
+            db.prepare(`
+              UPDATE required_message_responses
+              SET status = 'expired', resolved_at = ?, expiry_reason = 'swarm reset ended registration generation'
+              WHERE swarm_id = ? AND status = 'pending'
+            `).run(resetAt, swarm.id);
+            // Clearing the role rows is the explicit recovery ceremony: the
+            // next token-bound local join can bootstrap a fresh Owner/Lead ID,
+            // while task leases remain fenced until authorized takeover/rebind.
+            db.prepare('DELETE FROM swarm_authorities WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM agents WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM message_deliveries WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM messages WHERE swarm_id = ?').run(swarm.id);
+            db.prepare('DELETE FROM inbox_cursors WHERE swarm_id = ?').run(swarm.id);
+          });
           console.log(`Swarm "${swarm.name}" reset. Cleared ${agents.length} agent(s) and its messages.`);
         }
         break;

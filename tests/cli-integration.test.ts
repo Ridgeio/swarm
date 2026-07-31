@@ -367,11 +367,11 @@ describe('cli messaging (multi-send, kinds, cursor clarity)', () => {
     const s = runCli(home, ['send', 'Carol', 'merge ready', '--kind', 'gate'], { SWARM_AGENT_NAME: 'Bob' });
     assert.strictEqual(s.status, 0, s.stderr || s.stdout);
 
-    // Filtered read: shows only the gate message, flags that the cursor is untouched.
+    // Filtered read: shows only the gate message and remains pending.
     const filtered = runCli(home, ['inbox', '--kind', 'gate'], { SWARM_AGENT_NAME: 'Carol' });
     assert.strictEqual(filtered.status, 0, filtered.stderr || filtered.stdout);
     assert.match(filtered.stdout, /\[gate\] Bob: merge ready/);
-    assert.match(filtered.stdout, /cursor not advanced/);
+    assert.match(filtered.stdout, /pending until exact ack/);
     assert.doesNotMatch(filtered.stdout, /contract frozen/, 'other kinds must be filtered out');
 
     // Plain read afterwards: every message is still unread — the filtered read must
@@ -381,6 +381,12 @@ describe('cli messaging (multi-send, kinds, cursor clarity)', () => {
     assert.match(plain.stdout, /contract frozen/);
     assert.match(plain.stdout, /dedupe test/);
     assert.match(plain.stdout, /\[gate\] Bob: merge ready/);
+    const ids = [...plain.stdout.matchAll(/\[#(\d+)/g)].map(match => match[1]);
+    assert.strictEqual(ids.length, 3);
+    for (const id of ids) {
+      const ack = runCli(home, ['ack', id], { SWARM_AGENT_NAME: 'Carol' });
+      assert.strictEqual(ack.status, 0, ack.stderr || ack.stdout);
+    }
   });
 
   test('zero-unread inbox points at --recent when recent traffic exists', () => {
@@ -543,6 +549,36 @@ describe('cli supersession and pull/ack delivery', () => {
     }
   });
 
+  test('conversational --kind ack is refused without writing a message', () => {
+    const home = mkdtempSync(join(tmpdir(), 'swarm-cli-no-ack-noise-'));
+    try {
+      joinHeadless(home, 'Alice');
+      joinHeadless(home, 'Bob');
+      const before = openDb(home);
+      const countBefore = (before.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      before.close();
+
+      for (const args of [
+        ['send', 'Bob', 'received', '--kind', 'ack'],
+        ['broadcast', 'acknowledged', '--kind', 'ack'],
+      ]) {
+        const refused = runCli(home, args, { SWARM_AGENT_NAME: 'Alice' });
+        assert.notStrictEqual(refused.status, 0);
+        assert.match(
+          refused.stderr,
+          /Refused conversational acknowledgement: delivery acknowledgement is transport metadata.*send only a result or a true blocker/s
+        );
+      }
+
+      const after = openDb(home);
+      const countAfter = (after.prepare('SELECT COUNT(*) AS n FROM messages').get() as { n: number }).n;
+      after.close();
+      assert.strictEqual(countAfter, countBefore);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   test('hook turn loss keeps a message pending, third injection collapses, and ack clears it', () => {
     const home = mkdtempSync(join(tmpdir(), 'swarm-cli-hook-'));
     try {
@@ -583,7 +619,7 @@ describe('cli supersession and pull/ack delivery', () => {
     }
   });
 
-  test('peek/recent/kind reads do not ack, while plain inbox acks every printed row', () => {
+  test('peek/recent/kind/plain reads never ack; bulk ack refuses and exact ack clears one row', () => {
     const home = mkdtempSync(join(tmpdir(), 'swarm-cli-read-'));
     try {
       joinHeadless(home, 'Alice');
@@ -613,10 +649,9 @@ describe('cli supersession and pull/ack delivery', () => {
       assert.match(plain.stdout, /3 message\(s\)/);
       const after = openDb(home);
       const afterAck = after.prepare("SELECT COUNT(*) AS n FROM message_deliveries WHERE status = 'acked'").get() as { n: number };
-      const maxMessage = after.prepare('SELECT MAX(id) AS id FROM messages').get() as { id: number };
       const afterCursor = after.prepare("SELECT last_read_id FROM inbox_cursors WHERE agent_name = 'Bob'").get() as { last_read_id: number };
-      assert.strictEqual(afterAck.n, 3);
-      assert.strictEqual(afterCursor.last_read_id, maxMessage.id);
+      assert.strictEqual(afterAck.n, 0);
+      assert.strictEqual(afterCursor.last_read_id, 0);
       after.close();
 
       for (const body of ['ack one', 'ack two']) {
@@ -628,14 +663,24 @@ describe('cli supersession and pull/ack delivery', () => {
         .all() as Array<{ id: number }>;
       idsDb.close();
       const ackMany = runCli(home, ['ack', ...ids.map(row => String(row.id))], { SWARM_AGENT_NAME: 'Bob' });
-      assert.strictEqual(ackMany.status, 0, ackMany.stderr || ackMany.stdout);
-      assert.match(ackMany.stdout, /Acknowledged 2 message\(s\)/);
+      assert.notStrictEqual(ackMany.status, 0);
+      assert.match(ackMany.stderr, /Refused bulk acknowledgement/);
+      for (const row of ids) {
+        const exact = runCli(home, ['ack', String(row.id)], { SWARM_AGENT_NAME: 'Bob' });
+        assert.strictEqual(exact.status, 0, exact.stderr || exact.stdout);
+      }
 
       const finalSend = runCli(home, ['send', 'Bob', 'ack all'], { SWARM_AGENT_NAME: 'Alice' });
       assert.strictEqual(finalSend.status, 0, finalSend.stderr || finalSend.stdout);
       const ackAll = runCli(home, ['ack', '--all'], { SWARM_AGENT_NAME: 'Bob' });
-      assert.strictEqual(ackAll.status, 0, ackAll.stderr || ackAll.stdout);
-      assert.match(ackAll.stdout, /Acknowledged 1 message\(s\)/);
+      assert.notStrictEqual(ackAll.status, 0);
+      assert.match(ackAll.stderr, /Refused unsafe "swarm ack --all"/);
+      const finalDb = openDb(home);
+      const finalId = finalDb.prepare("SELECT id FROM messages WHERE body = 'ack all'").get() as { id: number };
+      finalDb.close();
+      const exactAck = runCli(home, ['ack', String(finalId.id)], { SWARM_AGENT_NAME: 'Bob' });
+      assert.strictEqual(exactAck.status, 0, exactAck.stderr || exactAck.stdout);
+      assert.match(exactAck.stdout, /Acknowledged 1 message\(s\)/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

@@ -5,10 +5,13 @@ description: Leave the local swarm and disconnect this Codex agent from swarm co
 
 # Leave Swarm
 
-Leave the swarm:
+Direct deregistration is intentionally refused because it does not prove that the
+agent's process tree stopped. First emit the final evidence packet or blocker.
+Then an unrelated Owner/Lead session must run:
 
 ```bash
-swarm leave
+swarm stand-down <agent-name>
 ```
 
-After leaving, other agents should no longer see this agent in `swarm members`.
+The operator verifies the exact captured process tree is gone before the
+registration is removed. `swarm leave` only prints this refusal and guidance.

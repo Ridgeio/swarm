@@ -1,7 +1,9 @@
-import type { SwarmDb } from './db.js';
+import { withImmediateTransaction, type SwarmDb } from './db.js';
 import { getAgent } from './registry.js';
+import { requireActiveAgent, requireSwarmAuthority } from './authority.js';
+import { observeMonotonicClock } from './clock.js';
 
-export const GRANT_OPS = ['merge', 'prod', 'spend', 'override'] as const;
+export const GRANT_OPS = ['merge', 'prod', 'release', 'spend', 'migration', 'override'] as const;
 export type BuiltinGrantOp = typeof GRANT_OPS[number];
 export type GrantOp = BuiltinGrantOp | `custom:${string}`;
 
@@ -11,7 +13,9 @@ export interface Grant {
   op: GrantOp;
   resource: string;
   granted_to: string | null;
+  granted_to_agent_id: string | null;
   granted_by: string;
+  granted_by_agent_id: string | null;
   note: string | null;
   created_at: string;
   expires_at: string;
@@ -44,7 +48,9 @@ export const GRANT_TTL_PATTERN = /^(\d+)(m|h|d)$/;
 export function validateGrantOp(value: string): GrantOp {
   if ((GRANT_OPS as readonly string[]).includes(value)) return value as BuiltinGrantOp;
   if (/^custom:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return value as unknown as GrantOp;
-  throw new Error(`Invalid grant op "${value}". Use merge, prod, spend, override, or custom:<name>.`);
+  throw new Error(
+    `Invalid grant op "${value}". Use merge, prod, release, spend, migration, override, or custom:<name>.`
+  );
 }
 
 export function parseGrantTtl(value: string): number {
@@ -88,35 +94,47 @@ export function createGrant(
   const durationMs = parseGrantTtl(options.ttl);
   const now = options.now ?? Date.now();
   const expiresAtMs = now + durationMs;
-  if (!Number.isFinite(now) || !Number.isFinite(expiresAtMs) || Math.abs(expiresAtMs) > 8.64e15) {
+  if (
+    !Number.isFinite(now) ||
+    !Number.isSafeInteger(now) ||
+    !Number.isFinite(expiresAtMs) ||
+    Math.abs(expiresAtMs) > 8.64e15
+  ) {
     throw new Error(`Invalid --ttl "${options.ttl}": expiry is outside the supported date range.`);
   }
   const createdAt = new Date(now).toISOString();
   const expiresAt = new Date(expiresAtMs).toISOString();
   const requestedRecipient = options.grantedTo?.trim();
-  let grantedTo: string | null = null;
-  if (requestedRecipient) {
-    const agent = getAgent(db, swarmId, requestedRecipient);
-    if (!agent) {
-      throw new Error(`Agent "${requestedRecipient}" not found in this swarm. Run "swarm members" and retry --to with an active agent.`);
+  return withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'grant', now);
+    const issuer = requireSwarmAuthority(db, swarmId, actor, 'create grant');
+    const recipient = requestedRecipient ? getAgent(db, swarmId, requestedRecipient) : null;
+    if (requestedRecipient && !recipient) {
+      throw new Error(
+        `Agent "${requestedRecipient}" not found in this swarm. ` +
+        'Run "swarm members" and retry --to with an active agent.'
+      );
     }
-    grantedTo = agent.name;
-  }
-  const result = db.prepare(`
-    INSERT INTO grants (
-      swarm_id, op, resource, granted_to, granted_by, note, created_at, expires_at, revoked_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
-  `).run(
-    swarmId,
-    op,
-    resource,
-    grantedTo,
-    actor,
-    options.note?.trim() || null,
-    createdAt,
-    expiresAt
-  );
-  return db.prepare('SELECT * FROM grants WHERE id = ?').get(Number(result.lastInsertRowid)) as unknown as Grant;
+    const result = db.prepare(`
+      INSERT INTO grants (
+        swarm_id, op, resource, granted_to, granted_to_agent_id,
+        granted_by, granted_by_agent_id, note, created_at, expires_at, revoked_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      swarmId,
+      op,
+      resource,
+      recipient?.name ?? null,
+      recipient?.id ?? null,
+      issuer.agent.name,
+      issuer.agent.id,
+      options.note?.trim() || null,
+      createdAt,
+      expiresAt
+    );
+    return db.prepare('SELECT * FROM grants WHERE id = ?')
+      .get(Number(result.lastInsertRowid)) as unknown as Grant;
+  }) as Grant;
 }
 
 export function listGrants(
@@ -138,18 +156,26 @@ export function listGrants(
 export function revokeGrant(
   db: SwarmDb,
   swarmId: string,
+  actor: string,
   id: number,
   now: number = Date.now()
 ): Grant | null {
-  const existing = db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
-    .get(swarmId, id) as unknown as Grant | undefined;
-  if (!existing) return null;
-  if (existing.revoked_at === null) {
-    db.prepare('UPDATE grants SET revoked_at = ? WHERE swarm_id = ? AND id = ? AND revoked_at IS NULL')
-      .run(new Date(now).toISOString(), swarmId, id);
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Grant revocation time must be a finite integer millisecond timestamp.');
   }
-  return db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
-    .get(swarmId, id) as unknown as Grant;
+  return withImmediateTransaction(db, () => {
+    observeMonotonicClock(db, swarmId, 'grant', now);
+    requireSwarmAuthority(db, swarmId, actor, 'revoke grant');
+    const existing = db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
+      .get(swarmId, id) as unknown as Grant | undefined;
+    if (!existing) return null;
+    if (existing.revoked_at === null) {
+      db.prepare('UPDATE grants SET revoked_at = ? WHERE swarm_id = ? AND id = ? AND revoked_at IS NULL')
+        .run(new Date(now).toISOString(), swarmId, id);
+    }
+    return db.prepare('SELECT * FROM grants WHERE swarm_id = ? AND id = ?')
+      .get(swarmId, id) as unknown as Grant;
+  }) as Grant;
 }
 
 export function findLiveGrant(
@@ -158,21 +184,34 @@ export function findLiveGrant(
   options: FindLiveGrantOptions
 ): GrantMatch | null {
   const op = validateGrantOp(options.op);
-  const at = new Date(options.now ?? Date.now()).toISOString();
-  const candidates = db.prepare(`
-    SELECT * FROM grants
-    WHERE swarm_id = ? AND op = ? AND revoked_at IS NULL AND expires_at > ?
-      AND (granted_to IS NULL OR granted_to = ? COLLATE NOCASE)
-    ORDER BY id ASC
-  `).all(swarmId, op, at, options.actor) as unknown as Grant[];
-  for (const grant of candidates) {
-    for (const resource of options.resources) {
-      if (grantResourceMatches(grant.resource, resource)) {
-        return { grant, matchedResource: resource };
+  const now = options.now ?? Date.now();
+  if (!Number.isFinite(now) || !Number.isSafeInteger(now)) {
+    throw new Error('Grant validation time must be a finite integer millisecond timestamp.');
+  }
+  const find = (): GrantMatch | null => {
+    observeMonotonicClock(db, swarmId, 'grant', now);
+    const actorAgent = requireActiveAgent(db, swarmId, options.actor, `use ${op} grant`);
+    const at = new Date(now).toISOString();
+    const candidates = db.prepare(`
+      SELECT * FROM grants
+      WHERE swarm_id = ? AND op = ? AND revoked_at IS NULL AND expires_at > ?
+        AND granted_by_agent_id IS NOT NULL
+        AND (
+          (granted_to IS NULL AND granted_to_agent_id IS NULL)
+          OR granted_to_agent_id = ?
+        )
+      ORDER BY id ASC
+    `).all(swarmId, op, at, actorAgent.id) as unknown as Grant[];
+    for (const grant of candidates) {
+      for (const requestedResource of options.resources) {
+        if (grantResourceMatches(grant.resource, requestedResource)) {
+          return { grant, matchedResource: requestedResource };
+        }
       }
     }
-  }
-  return null;
+    return null;
+  };
+  return db.isTransaction ? find() : withImmediateTransaction(db, find);
 }
 
 export function recordGrantUsed(
@@ -182,15 +221,26 @@ export function recordGrantUsed(
   actor: string,
   createdAt: string = new Date().toISOString()
 ): number {
+  const actorAgent = requireActiveAgent(db, task.swarm_id, actor, `record use of grant #${grant.id}`);
   const result = db.prepare(`
-    INSERT INTO task_events (swarm_id, task_id, epoch, kind, actor, data, created_at)
-    VALUES (?, ?, ?, 'grant_used', ?, ?, ?)
+    INSERT INTO task_events (
+      swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+    ) VALUES (?, ?, ?, 'grant_used', ?, ?, ?, ?)
   `).run(
     task.swarm_id,
     task.id,
     task.lease_epoch,
     actor,
-    JSON.stringify({ grant_id: grant.id, op: grant.op, resource: grant.resource, actor }),
+    actorAgent.id,
+    JSON.stringify({
+      grant_id: grant.id,
+      op: grant.op,
+      resource: grant.resource,
+      actor,
+      actor_agent_id: actorAgent.id,
+      granted_by_agent_id: grant.granted_by_agent_id,
+      granted_to_agent_id: grant.granted_to_agent_id,
+    }),
     createdAt
   );
   return Number(result.lastInsertRowid);

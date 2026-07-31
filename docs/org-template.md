@@ -54,19 +54,26 @@ A headless child never owns a task, never joins the bus as a peer, and never res
   `MERGE-REQ #<PR> @<exact-sha> — CI green (run <id>), review PASS @<same-sha>, mergeable clean.`
 - **Prod gate:** migrations, env, promotions, data mutations — lead executes, owner-visible.
 - **Task gate (⚙ WI-3, T1):** `swarm task close` refuses while unpushed/dirty/untracked work exists, and refuses evidence that doesn't match the task's claim kind; every close states its evidence ceiling (`--not-established`). A completion claim without its artifact is an ack, not a fact.
+- **Handoff gate:** ownership changes use `swarm handoff offer` → exact named-registration `accept`. The source keeps the ID+epoch-fenced lease until acceptance of the exact charter digest and source epoch. Expiry dead-letters the offer, durably notifies the source plus active Owner/Lead registrations, and never guesses that a push meant pickup. There is no immediate-transfer compatibility path.
 - **Grant gate (⚙ T2):** closing as *merged* and any `--override` require a live, expiring grant (`swarm grant create --op merge|override --resource <task|branch> --ttl <t>`); every use is audited. Approvals are records with scope and expiry, not chat memories. Request one with `swarm escalate <task>` — the packet carries the state, evidence, and the one question, so the operator decides without reconstructing your trajectory.
+
+## Quiet goal contract
+
+- **One goal, one owner, one final packet.** A lane sends no receipt, start, waiting, per-test, or progress messages. Status lives in `swarm status`; durable progress and failed approaches live in checkpoints/run logs. The bus receives exactly one condition-complete final evidence packet, or one true blocker that names the decision needed.
+- **A final packet is mechanically bindable.** For code it names base and exact head, branch/worktree, clean-tree state, commands and results, review qualifications and artifact paths, evidence ceilings, and every external action not taken. A later byte change invalidates that packet and every exact-head review.
+- **Reviews are independent gates, not endorsements.** Start from a fresh exact candidate without prior verdicts, disclose author/reviewer family, attack the stated negatives, require causal RED→byte-restore→GREEN evidence where practical, and bind PASS/BLOCK to the final SHA. Apply the active provider/quota policy; an unavailable provider is replaced, never silently reused through an old report.
 
 ## Messaging rules (the bus is small — P4)
 
 1. **Status goes to the ledger, not the bus.** `swarm task checkpoint` / `swarm decision` — the PM and lead read state on demand. One message per program EVENT (contract agreed, PR open, gate passed, blocker), not per activity.
 2. **Direct send to the single agent who owns the next action.** Multi-send for 2–4 recipients. Broadcast: lead/PM only, and only for content that changes most agents' behavior.
-3. **No acks as messages.** Delivery state is transport metadata (⚙ WI-2 `swarm ack`). Ack your assigner one line ONLY when assignment acceptance itself is the information.
-4. **No receipt checks.** `swarm inbox --recent N` first; escalate only when a REQUIRED response is >30 min overdue.
+3. **No acks as messages.** Delivery state is transport metadata (⚙ WI-2 `swarm ack`). Acknowledge exact IDs only; `ack --all` is refused because it can erase an unseen STOP, gate, question, or handoff. Assignment acceptance is `swarm handoff accept`, not chat.
+4. **No receipt-check chatter.** For an ordinary required answer, send one direct `--require-reply <ttl>` request and require the exact recipient's `--reply-to <message-id>`; reading/acking is not an answer, `swarm replies [--history]` exposes state, and the janitor escalates expiry/inactive identity. For required ownership pickup, use a handoff offer with a deadline and inspect `swarm handoff status`; expiry is the deterministic dead letter. For a quiet recipient, wait with `swarm inbox --wait 60`, inspect status, then `swarm read` the local surface once. Never duplicate an order to provoke a receipt; use `--supersedes` only when its content changed.
 5. **Supersede, don't correct-by-append** (⚙ WI-1): a corrected SHA/order replaces the stale message via `--supersedes`; never leave both live.
 6. **Messages carry pointers, not content.** Specs, checkpoints, handoffs live in files; the message says what changed, where it lives, what the recipient must do.
 7. **Terminal reads are context, never decisions.** A decision exists when its owner sends it (or journals it via `swarm decision`).
 8. **Escalation ladder:** blocked >30 min → PM. Needs spend/prod/owner → lead. Emergencies → lead immediately, any format.
-9. **Zombie protocol** (orchestration.md): detect via progress-evidence, quiet-zone the agent, `swarm rescue` the work (⚙ WI-4), reassign on a named clock. Nudging a looped agent makes it worse.
+9. **Inactive/zombie protocol** (orchestration.md): an ordinary push is only a nudge and a same-name replacement is a different identity. Required questions expire against exact party IDs. For owned work, the source lease remains authoritative until exact-recipient handoff acceptance. Detect stalls from progress evidence, quiet-zone the agent, create and verify `swarm rescue --task <slug> --to <successor>` artifacts before reap/takeover/rebind, then deliver the digest-bound rescue pointer and new charter to the exact successor. Nudging a looped agent makes it worse.
 
 ## Onboarding a new agent (mid-program)
 

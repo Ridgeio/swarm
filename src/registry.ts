@@ -11,6 +11,7 @@ import {
 } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
+import { captureProcessFingerprint } from './stand-down.js';
 
 const SWARM_DIR = path.join(os.homedir(), '.swarm');
 
@@ -54,6 +55,8 @@ export interface Agent {
   /** Host harness that owns this terminal. */
   host_agent: HostAgentKind | null;
   worker_version: string | null;
+  worker_binary_sha256: string | null;
+  process_fingerprint: string | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -86,6 +89,8 @@ export interface HeadlessSessionOptions {
 
 export interface JoinAgentOptions {
   forceSurface?: boolean;
+  workerBinarySha256?: string | null;
+  processFingerprint?: string | null;
 }
 
 export interface JoinedAgent extends Agent {
@@ -108,6 +113,21 @@ export function captureWorkerVersion(
     });
     const firstLine = String(output).split(/\r?\n/, 1)[0];
     return firstLine.length > 0 ? firstLine : null;
+  } catch {
+    return null;
+  }
+}
+
+export function captureWorkerBinarySha256(host: HostAgentKind | null): string | null {
+  if (!host) return null;
+  try {
+    const binaryPath = execFileSync('which', [WORKER_BINARIES[host]], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (!binaryPath) return null;
+    return createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex');
   } catch {
     return null;
   }
@@ -318,6 +338,16 @@ export function joinAgent(
   const workerVersion = agentType === 'a2a'
     ? null
     : captureWorkerVersion(host, versionRunner);
+  const workerBinarySha256 = agentType === 'a2a'
+    ? null
+    : options.workerBinarySha256 === undefined
+      ? captureWorkerBinarySha256(host)
+      : options.workerBinarySha256;
+  const processFingerprint = agentType === 'a2a'
+    ? null
+    : options.processFingerprint === undefined
+      ? captureProcessFingerprint(ppid)
+      : options.processFingerprint;
 
   let surfaceTakeover: JoinedAgent['surface_takeover'];
   withImmediateTransaction(db, () => {
@@ -360,13 +390,34 @@ export function joinAgent(
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
         joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
-        worker_version
+        worker_version, worker_binary_sha256, process_fingerprint
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid,
-      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion
+      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion,
+      workerBinarySha256,
+      processFingerprint
     );
+
+    // Bootstrap is a one-time provenance event, never a name convention. The
+    // immutable registration ID is what owns both initial roles; a same-name
+    // rejoin receives a new ID and therefore inherits neither role.
+    if (agentType !== 'a2a' && sessionToken !== null) {
+      const authorityHistory = db.prepare(
+        'SELECT id FROM swarm_authorities WHERE swarm_id = ? LIMIT 1'
+      ).get(swarmId);
+      if (!authorityHistory) {
+        const insertAuthority = db.prepare(`
+          INSERT INTO swarm_authorities (
+            swarm_id, role, agent_id, agent_name, assigned_by_agent_id,
+            assignment_kind, created_at, revoked_at
+          ) VALUES (?, ?, ?, ?, ?, 'bootstrap', ?, NULL)
+        `);
+        insertAuthority.run(swarmId, 'owner', id, name, id, now);
+        insertAuthority.run(swarmId, 'lead', id, name, id, now);
+      }
+    }
 
     db.prepare(`
       INSERT OR IGNORE INTO inbox_cursors (swarm_id, agent_name, last_read_id)
@@ -387,6 +438,8 @@ export function joinAgent(
     endpoint_url: endpointUrl ?? null,
     host_agent: host,
     worker_version: workerVersion,
+    worker_binary_sha256: workerBinarySha256,
+    process_fingerprint: processFingerprint,
     surface_id: surfaceId,
     workspace_id: workspaceId ?? null,
     ppid,
@@ -435,6 +488,8 @@ export function joinHeadlessAgent(
   options: HeadlessSessionOptions & {
     hostAgent?: HostAgentKind | null;
     versionRunner?: WorkerVersionRunner;
+    workerBinarySha256?: string | null;
+    processFingerprint?: string | null;
   } = {}
 ): Agent {
   if (options.trackSession) {
@@ -454,7 +509,11 @@ export function joinHeadlessAgent(
   const syntheticSurfaceId = `headless:${swarmId}:${name}`;
   const agent = joinAgent(
     db, swarmId, name, syntheticSurfaceId, undefined, process.ppid,
-    description, 'headless', undefined, options.hostAgent, options.versionRunner
+    description, 'headless', undefined, options.hostAgent, options.versionRunner,
+    {
+      workerBinarySha256: options.workerBinarySha256,
+      processFingerprint: options.processFingerprint,
+    }
   );
   if (options.trackSession) {
     if (!agent.session_token) throw new Error(`Failed to mint a session token for headless agent "${name}".`);
@@ -578,6 +637,34 @@ export function getAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | nul
   // Existing A2A endpoint identity remains unchanged. Legacy local rows with a
   // NULL token are grandfathered until their next join mints one.
   if (agent.agent_type === 'a2a' || agent.session_token === null) return agent;
+  if (!tokensMatch(agent.session_token, presentedToken)) {
+    throw new Error(`identity could not be authenticated for ${agent.name} — rejoin with swarm join ${agent.name}`);
+  }
+  return agent;
+}
+
+/**
+ * High-impact mutations require a locally token-bound registration. Legacy
+ * NULL-token rows and A2A name/endpoint identity remain readable and may use
+ * non-privileged messaging, but they cannot mutate leases, grants, decisions,
+ * or authority until they rejoin through a token-minting local session.
+ */
+export function getPrivilegedAuthenticatedSelf(db: SwarmDb, swarmId?: string): Agent | null {
+  const resolved = resolveSelf(db, swarmId);
+  if (!resolved) return null;
+  const { agent, presentedToken } = resolved;
+  if (agent.agent_type === 'a2a') {
+    throw new Error(
+      `privileged identity is unavailable for A2A agent ${agent.name}; ` +
+      'use a token-bound local Owner/Lead or task-owner registration'
+    );
+  }
+  if (agent.session_token === null) {
+    throw new Error(
+      `legacy identity ${agent.name} has no session token and cannot perform privileged mutations; ` +
+      `rejoin with swarm join ${agent.name}`
+    );
+  }
   if (!tokensMatch(agent.session_token, presentedToken)) {
     throw new Error(`identity could not be authenticated for ${agent.name} — rejoin with swarm join ${agent.name}`);
   }

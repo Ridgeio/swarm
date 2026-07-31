@@ -21,6 +21,7 @@ import {
 } from '../src/registry.js';
 import {
   broadcastMessage as broadcastMessageRaw,
+  acknowledgeMessages as acknowledgeMessagesRaw,
   countRecentMessages as countRecentMessagesRaw,
   getInbox as getInboxRaw,
   getRecentMessages as getRecentMessagesRaw,
@@ -447,7 +448,7 @@ describe('mailbox', () => {
     assert.strictEqual(messages.length, 0);
   });
 
-  test('cursor advances after reading', () => {
+  test('reading never advances the cursor; only exact acknowledgement clears a message', () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
 
     db.prepare(
@@ -457,9 +458,11 @@ describe('mailbox', () => {
     const first = getInbox(db, 'Alice');
     assert.strictEqual(first.length, 1);
 
-    // Second read should return nothing
+    // Second read returns the same pending message.
     const second = getInbox(db, 'Alice');
-    assert.strictEqual(second.length, 0);
+    assert.strictEqual(second.length, 1);
+    acknowledgeMessagesRaw(db, SWARM_ID, 'Alice', [first[0].id]);
+    assert.strictEqual(getInbox(db, 'Alice').length, 0);
 
     // New message should appear
     db.prepare(
@@ -534,8 +537,8 @@ describe('mailbox', () => {
     const all = getInbox(db, 'Alice');
     assert.strictEqual(all.length, 3, 'filtered read must not have advanced the cursor');
 
-    // The unfiltered read above DID advance the cursor as usual.
-    assert.strictEqual(getInbox(db, 'Alice').length, 0);
+    // The unfiltered read above is also display-only.
+    assert.strictEqual(getInbox(db, 'Alice').length, 3);
   });
 
   test('getRecentMessages honors the kind filter', () => {
@@ -722,6 +725,14 @@ describe('migration', () => {
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'message_deliveries'"
       ).get() as { name: string } | undefined;
       assert.strictEqual(deliveryTable?.name, 'message_deliveries');
+      const handoffTable = migrated.prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'handoff_offers'"
+      ).get() as { name: string } | undefined;
+      assert.strictEqual(handoffTable?.name, 'handoff_offers');
+      const decisionColumns = (migrated.prepare('PRAGMA table_info(decisions)').all() as any[])
+        .map(column => column.name);
+      assert.ok(decisionColumns.includes('actor_agent_id'));
+      assert.ok(decisionColumns.includes('task_epoch'));
 
       // Old row reads back with kind NULL.
       const inbox = getInboxRaw(migrated, DEFAULT_SWARM_ID, 'Alice');
@@ -783,7 +794,7 @@ describe('migration', () => {
     }
   });
 
-  test('a pre-T1 tasks table gains one nullable claim_kind column additively', () => {
+  test('a pre-hardening coordination schema gains nullable provenance columns additively', () => {
     const oldPath = path.join(os.tmpdir(), `swarm-preclaim-${Date.now()}-${Math.random().toString(36).slice(2)}.db`);
     const old = new DatabaseSync(oldPath);
     old.exec(`
@@ -804,6 +815,38 @@ describe('migration', () => {
         updated_at TEXT NOT NULL,
         PRIMARY KEY (swarm_id, id)
       );
+      CREATE TABLE task_events (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        epoch INTEGER NOT NULL,
+        kind TEXT NOT NULL,
+        actor TEXT,
+        data TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE TABLE message_deliveries (
+        message_id INTEGER NOT NULL,
+        swarm_id TEXT NOT NULL,
+        recipient TEXT NOT NULL COLLATE NOCASE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        first_injected_at TEXT,
+        inject_count INTEGER NOT NULL DEFAULT 0,
+        acked_at TEXT,
+        PRIMARY KEY (message_id, recipient)
+      );
+      CREATE TABLE grants (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        swarm_id TEXT NOT NULL,
+        op TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        granted_to TEXT COLLATE NOCASE,
+        granted_by TEXT NOT NULL,
+        note TEXT,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT
+      );
     `);
     const now = new Date().toISOString();
     old.prepare(`
@@ -818,12 +861,36 @@ describe('migration', () => {
       let claimColumns = (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
         .filter(column => column.name === 'claim_kind');
       assert.strictEqual(claimColumns.length, 1);
+      const ownerIdColumns = (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
+        .filter(column => column.name === 'owner_agent_id');
+      assert.strictEqual(ownerIdColumns.length, 1);
+      assert.strictEqual(
+        (migrated.prepare('PRAGMA table_info(task_events)').all() as any[])
+          .filter(column => column.name === 'actor_agent_id').length,
+        1
+      );
+      assert.strictEqual(
+        (migrated.prepare('PRAGMA table_info(message_deliveries)').all() as any[])
+          .filter(column => column.name === 'recipient_agent_id').length,
+        1
+      );
+      const grantColumns = (migrated.prepare('PRAGMA table_info(grants)').all() as any[])
+        .map(column => column.name);
+      assert.ok(grantColumns.includes('granted_to_agent_id'));
+      assert.ok(grantColumns.includes('granted_by_agent_id'));
       assert.strictEqual((migrated.prepare("SELECT claim_kind FROM tasks WHERE id = 'legacy-task'").get() as any).claim_kind, null);
+      assert.strictEqual((migrated.prepare("SELECT owner_agent_id FROM tasks WHERE id = 'legacy-task'").get() as any).owner_agent_id, null);
       migrated.close();
       migrated = getDbAt(oldPath);
       claimColumns = (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
         .filter(column => column.name === 'claim_kind');
       assert.strictEqual(claimColumns.length, 1, 'the additive guard is idempotent');
+      assert.strictEqual(
+        (migrated.prepare('PRAGMA table_info(tasks)').all() as any[])
+          .filter(column => column.name === 'owner_agent_id').length,
+        1,
+        'the provenance guard is idempotent'
+      );
     } finally {
       migrated.close();
       try { fs.unlinkSync(oldPath); } catch {}

@@ -6,7 +6,6 @@ import path from 'node:path';
 import type { SwarmDb } from '../src/db.js';
 import { DEFAULT_SWARM_ID, getDbAt } from '../src/db.js';
 import {
-  acknowledgeAllMessages,
   acknowledgeMessages,
   broadcastMessage,
   getInbox,
@@ -88,6 +87,22 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
 
     assert.strictEqual(cursor('Returner'), historicalId);
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Returner', true).map(message => message.id), [missedId]);
+  });
+
+  test('same-name replacement does not inherit a durable broadcast delivery bound to the prior registration', async () => {
+    joinHeadlessAgent(db, SWARM_ID, 'Alice');
+    const prior = joinHeadlessAgent(db, SWARM_ID, 'Bob');
+    const sent = await broadcastMessage(db, SWARM_ID, 'Alice', 'exact audience');
+    assert.ok(sent.messageId);
+
+    assert.strictEqual(leaveHeadlessAgent(db, SWARM_ID, 'Bob'), true);
+    const replacement = joinHeadlessAgent(db, SWARM_ID, 'Bob');
+    assert.notStrictEqual(replacement.id, prior.id);
+    assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob', true), []);
+    assert.throws(
+      () => acknowledgeMessages(db, SWARM_ID, 'Bob', [sent.messageId!]),
+      /not addressed to you/
+    );
   });
 
   test('only the owner may supersede and a replacement hides its target for every recipient', async () => {
@@ -173,7 +188,7 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
     assert.ok(entries[0].unackedMinutes >= HOOK_INJECT_BACKOFF_MINUTES + 1);
   });
 
-  test('ack is idempotent, advances the legacy watermark, and preserves lower pending deliveries', () => {
+  test('exact ack is idempotent, never advances the legacy watermark, and preserves lower pending deliveries', () => {
     joinHeadlessAgent(db, SWARM_ID, 'Bob');
     const low = insertMessage('Alice', 'Bob', 'low');
     const high = insertMessage('Alice', 'Bob', 'high');
@@ -186,15 +201,15 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
     `).get(high, 'Bob') as any;
     assert.strictEqual(highDelivery.status, 'acked');
     assert.strictEqual(highDelivery.acked_at, new Date(1_000).toISOString());
-    assert.strictEqual(cursor('Bob'), high);
+    assert.strictEqual(cursor('Bob'), 0);
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob', true).map(message => message.id), [low]);
 
     acknowledgeMessages(db, SWARM_ID, 'Bob', [low]);
-    assert.strictEqual(cursor('Bob'), high, 'acknowledging a lower ID must never move the cursor backwards');
+    assert.strictEqual(cursor('Bob'), 0, 'exact acknowledgement must never move the legacy cursor');
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob', true), []);
   });
 
-  test('plain inbox acknowledges exactly what it returns, ordered by id with a max-id watermark', () => {
+  test('plain inbox is ordered by id and remains non-acknowledging', () => {
     joinHeadlessAgent(db, SWARM_ID, 'Bob');
     const newerTimestamp = new Date(Date.now() + 60_000).toISOString();
     const olderTimestamp = new Date(Date.now() - 60_000).toISOString();
@@ -203,16 +218,16 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
 
     const printed = getInbox(db, SWARM_ID, 'Bob');
     assert.deepStrictEqual(printed.map(message => message.id), [firstId, secondId]);
-    assert.strictEqual(cursor('Bob'), Math.max(firstId, secondId));
+    assert.strictEqual(cursor('Bob'), 0);
     const deliveries = db.prepare(`
       SELECT message_id, status FROM message_deliveries
       WHERE recipient = ? COLLATE NOCASE ORDER BY message_id
     `).all('Bob') as Array<{ message_id: number; status: string }>;
     assert.deepStrictEqual(deliveries.map(delivery => ({ ...delivery })), [
-      { message_id: firstId, status: 'acked' },
-      { message_id: secondId, status: 'acked' },
+      { message_id: firstId, status: 'pending' },
+      { message_id: secondId, status: 'pending' },
     ]);
-    assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob'), []);
+    assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob').map(message => message.id), [firstId, secondId]);
   });
 
   test('inbox wait polls with an injected clock until a message arrives and reports timeout distinctly', async () => {
@@ -232,11 +247,12 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
     assert.strictEqual(arrived.timedOut, false);
     assert.deepStrictEqual(arrived.messages.map(message => message.id), arrivals);
     assert.deepStrictEqual(sleeps, [2_000, 2_000]);
-    assert.strictEqual(cursor('Bob'), arrivals[0], 'the normal wait path acknowledges what it returns');
+    assert.strictEqual(cursor('Bob'), 0, 'the normal wait path only displays what it returns');
     assert.strictEqual(
       (db.prepare('SELECT status FROM message_deliveries WHERE message_id = ?').get(arrivals[0]) as any).status,
-      'acked'
+      'pending'
     );
+    acknowledgeMessages(db, SWARM_ID, 'Bob', [arrivals[0]]);
 
     now = 0;
     sleeps.length = 0;
@@ -272,16 +288,16 @@ describe('SWARM-NEXT mailbox delivery and supersession', () => {
     `).get('Bob') as { n: number };
     assert.strictEqual(acked.n, 0);
     assert.strictEqual(cursor('Bob'), 0);
-    assert.deepStrictEqual(acknowledgeAllMessages(db, SWARM_ID, 'Bob'), [gate, status]);
+    assert.deepStrictEqual(acknowledgeMessages(db, SWARM_ID, 'Bob', [gate, status]), [gate, status]);
   });
 
-  test('delivery rows are lazy and absent rows interoperate with the legacy cursor', async () => {
+  test('new durable-outbox messages eagerly bind delivery rows while legacy rows still use the cursor', async () => {
     const historical = insertMessage('Alice', null, 'pre-join history');
     joinHeadlessAgent(db, SWARM_ID, 'Bob');
     joinHeadlessAgent(db, SWARM_ID, 'Alice');
     const sent = await sendMessage(db, SWARM_ID, 'Alice', 'Bob', 'post-join message');
     assert.ok(sent.messageId);
-    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM message_deliveries').get() as { n: number }).n, 0);
+    assert.strictEqual((db.prepare('SELECT COUNT(*) AS n FROM message_deliveries').get() as { n: number }).n, 1);
 
     const visible = getInbox(db, SWARM_ID, 'Bob', true);
     assert.deepStrictEqual(visible.map(message => message.id), [sent.messageId]);

@@ -86,6 +86,8 @@ function createCurrentTables(db: SwarmDb): void {
       host_agent TEXT,
       session_token TEXT,
       worker_version TEXT,
+      worker_binary_sha256 TEXT,
+      process_fingerprint TEXT,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
       UNIQUE (swarm_id, name)
     );
@@ -94,7 +96,9 @@ function createCurrentTables(db: SwarmDb): void {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       swarm_id TEXT NOT NULL,
       from_agent TEXT NOT NULL,
+      from_agent_id TEXT,
       to_agent TEXT,
+      to_agent_id TEXT,
       body TEXT NOT NULL,
       delivered INTEGER NOT NULL DEFAULT 0,
       created_at TEXT NOT NULL,
@@ -115,6 +119,7 @@ function createCurrentTables(db: SwarmDb): void {
       message_id INTEGER NOT NULL,
       swarm_id TEXT NOT NULL,
       recipient TEXT NOT NULL COLLATE NOCASE,
+      recipient_agent_id TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       first_injected_at TEXT,
       inject_count INTEGER NOT NULL DEFAULT 0,
@@ -128,6 +133,7 @@ function createCurrentTables(db: SwarmDb): void {
       title TEXT NOT NULL,
       state TEXT NOT NULL DEFAULT 'open',
       owner_agent TEXT COLLATE NOCASE,
+      owner_agent_id TEXT,
       lease_epoch INTEGER NOT NULL DEFAULT 0,
       lease_expires_at TEXT,
       repo_path TEXT,
@@ -136,6 +142,9 @@ function createCurrentTables(db: SwarmDb): void {
       transcript_hint TEXT,
       disposition TEXT,
       claim_kind TEXT,
+      head_sha TEXT,
+      tree_sha TEXT,
+      author_family TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       PRIMARY KEY (swarm_id, id)
@@ -148,8 +157,33 @@ function createCurrentTables(db: SwarmDb): void {
       epoch INTEGER NOT NULL,
       kind TEXT NOT NULL,
       actor TEXT,
+      actor_agent_id TEXT,
       data TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS handoff_offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      from_agent TEXT NOT NULL COLLATE NOCASE,
+      to_agent TEXT NOT NULL COLLATE NOCASE,
+      from_agent_id TEXT,
+      to_agent_id TEXT,
+      source_epoch INTEGER NOT NULL,
+      brief_path TEXT NOT NULL,
+      charter_sha256 TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'accepted', 'declined', 'cancelled', 'expired', 'invalidated')),
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      resolved_at TEXT,
+      resolved_by TEXT COLLATE NOCASE,
+      message_id INTEGER,
+      accepted_epoch INTEGER,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+      FOREIGN KEY (swarm_id, task_id) REFERENCES tasks(swarm_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
     );
 
     CREATE TABLE IF NOT EXISTS decisions (
@@ -158,6 +192,8 @@ function createCurrentTables(db: SwarmDb): void {
       task_id TEXT,
       body TEXT NOT NULL,
       made_by TEXT NOT NULL,
+      actor_agent_id TEXT,
+      task_epoch INTEGER,
       supersedes INTEGER,
       status TEXT NOT NULL DEFAULT 'active',
       created_at TEXT NOT NULL
@@ -169,11 +205,182 @@ function createCurrentTables(db: SwarmDb): void {
       op TEXT NOT NULL,
       resource TEXT NOT NULL,
       granted_to TEXT COLLATE NOCASE,
+      granted_to_agent_id TEXT,
       granted_by TEXT NOT NULL,
+      granted_by_agent_id TEXT,
       note TEXT,
       created_at TEXT NOT NULL,
       expires_at TEXT NOT NULL,
       revoked_at TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS swarm_authorities (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      role TEXT NOT NULL CHECK (role IN ('owner', 'lead')),
+      agent_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL COLLATE NOCASE,
+      assigned_by_agent_id TEXT NOT NULL,
+      assignment_kind TEXT NOT NULL CHECK (assignment_kind IN ('bootstrap', 'assigned')),
+      created_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS coordination_clocks (
+      swarm_id TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      last_wall_ms INTEGER NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (swarm_id, scope),
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS message_outbox (
+      message_id INTEGER NOT NULL,
+      swarm_id TEXT NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      state TEXT NOT NULL DEFAULT 'pending'
+        CHECK (state IN ('pending', 'pushed')),
+      attempts INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT,
+      created_at TEXT NOT NULL,
+      pushed_at TEXT,
+      PRIMARY KEY (message_id, recipient_agent_id),
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS required_message_responses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      request_message_id INTEGER UNIQUE,
+      sender_agent_id TEXT NOT NULL,
+      sender_name TEXT NOT NULL COLLATE NOCASE,
+      recipient_agent_id TEXT NOT NULL,
+      recipient_name TEXT NOT NULL COLLATE NOCASE,
+      required_by TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'resolved', 'expired')),
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      reply_message_id INTEGER,
+      expiry_reason TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE,
+      FOREIGN KEY (request_message_id) REFERENCES messages(id) ON DELETE SET NULL,
+      FOREIGN KEY (reply_message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS required_response_expiry_notifications (
+      request_id INTEGER NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      audience TEXT NOT NULL CHECK (audience IN ('sender', 'authority')),
+      message_id INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (request_id, recipient_agent_id, audience),
+      FOREIGN KEY (request_id) REFERENCES required_message_responses(id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS handoff_expiry_notifications (
+      offer_id INTEGER NOT NULL,
+      recipient_agent_id TEXT NOT NULL,
+      audience TEXT NOT NULL CHECK (audience IN ('sender', 'authority')),
+      message_id INTEGER,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (offer_id, recipient_agent_id, audience),
+      FOREIGN KEY (offer_id) REFERENCES handoff_offers(id) ON DELETE CASCADE,
+      FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE SET NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS reviewer_qualifications (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      agent_id TEXT NOT NULL,
+      agent_name TEXT NOT NULL COLLATE NOCASE,
+      family TEXT NOT NULL,
+      worker_version TEXT NOT NULL,
+      binary_sha256 TEXT NOT NULL,
+      model_id TEXT NOT NULL,
+      harness_sha256 TEXT NOT NULL,
+      prompt_sha256 TEXT NOT NULL,
+      tools_sha256 TEXT NOT NULL,
+      qualified_by_agent_id TEXT NOT NULL,
+      qualified_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      revoked_at TEXT,
+      FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS review_requests (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      task_epoch INTEGER NOT NULL,
+      requester_agent_id TEXT NOT NULL,
+      reviewer_agent_id TEXT NOT NULL,
+      reviewer_name TEXT NOT NULL COLLATE NOCASE,
+      author_family TEXT NOT NULL,
+      reviewer_family TEXT NOT NULL,
+      head_sha TEXT NOT NULL,
+      tree_sha TEXT NOT NULL,
+      qualification_id INTEGER NOT NULL,
+      brief_path TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'passed', 'blocked', 'invalidated')),
+      created_at TEXT NOT NULL,
+      resolved_at TEXT,
+      FOREIGN KEY (swarm_id, task_id) REFERENCES tasks(swarm_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (qualification_id) REFERENCES reviewer_qualifications(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS review_verdicts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      request_id INTEGER NOT NULL UNIQUE,
+      task_epoch INTEGER NOT NULL,
+      reviewer_agent_id TEXT NOT NULL,
+      qualification_id INTEGER NOT NULL,
+      verdict TEXT NOT NULL CHECK (verdict IN ('pass', 'block')),
+      head_sha TEXT NOT NULL,
+      tree_sha TEXT NOT NULL,
+      report_path TEXT NOT NULL,
+      report_sha256 TEXT NOT NULL,
+      submitted_at TEXT NOT NULL,
+      FOREIGN KEY (swarm_id, task_id) REFERENCES tasks(swarm_id, id) ON DELETE CASCADE,
+      FOREIGN KEY (request_id) REFERENCES review_requests(id) ON DELETE CASCADE,
+      FOREIGN KEY (qualification_id) REFERENCES reviewer_qualifications(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS migration_resource_leases (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      resource TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      task_epoch INTEGER NOT NULL,
+      holder_agent_id TEXT NOT NULL,
+      holder_name TEXT NOT NULL COLLATE NOCASE,
+      created_by_agent_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      released_at TEXT,
+      release_reason TEXT,
+      FOREIGN KEY (swarm_id, task_id) REFERENCES tasks(swarm_id, id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS stand_down_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      swarm_id TEXT NOT NULL,
+      target_agent_id TEXT NOT NULL,
+      target_name TEXT NOT NULL COLLATE NOCASE,
+      requested_by_agent_id TEXT NOT NULL,
+      root_pid INTEGER NOT NULL,
+      root_fingerprint TEXT NOT NULL,
+      tree_sha256 TEXT NOT NULL,
+      terminated_pids TEXT NOT NULL,
+      verified_at TEXT NOT NULL,
       FOREIGN KEY (swarm_id) REFERENCES swarms(id) ON DELETE CASCADE
     );
 
@@ -379,6 +586,67 @@ function ensureTaskClaimKindColumn(db: SwarmDb): void {
   }
 }
 
+function ensureDecisionProvenanceColumns(db: SwarmDb): void {
+  if (!tableExists(db, 'decisions')) return;
+  const columns = tableColumns(db, 'decisions');
+  if (!columns.has('actor_agent_id')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN actor_agent_id TEXT');
+  }
+  if (!columns.has('task_epoch')) {
+    db.exec('ALTER TABLE decisions ADD COLUMN task_epoch INTEGER');
+  }
+}
+
+function ensureHandoffOfferProvenanceColumns(db: SwarmDb): void {
+  if (!tableExists(db, 'handoff_offers')) return;
+  const columns = tableColumns(db, 'handoff_offers');
+  if (!columns.has('from_agent_id')) {
+    db.exec('ALTER TABLE handoff_offers ADD COLUMN from_agent_id TEXT');
+  }
+  if (!columns.has('to_agent_id')) {
+    db.exec('ALTER TABLE handoff_offers ADD COLUMN to_agent_id TEXT');
+  }
+}
+
+function ensureCoordinationProvenanceColumns(db: SwarmDb): void {
+  if (tableExists(db, 'tasks')) {
+    const columns = tableColumns(db, 'tasks');
+    if (!columns.has('owner_agent_id')) {
+      db.exec('ALTER TABLE tasks ADD COLUMN owner_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'task_events')) {
+    const columns = tableColumns(db, 'task_events');
+    if (!columns.has('actor_agent_id')) {
+      db.exec('ALTER TABLE task_events ADD COLUMN actor_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'messages')) {
+    const columns = tableColumns(db, 'messages');
+    if (!columns.has('from_agent_id')) {
+      db.exec('ALTER TABLE messages ADD COLUMN from_agent_id TEXT');
+    }
+    if (!columns.has('to_agent_id')) {
+      db.exec('ALTER TABLE messages ADD COLUMN to_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'message_deliveries')) {
+    const columns = tableColumns(db, 'message_deliveries');
+    if (!columns.has('recipient_agent_id')) {
+      db.exec('ALTER TABLE message_deliveries ADD COLUMN recipient_agent_id TEXT');
+    }
+  }
+  if (tableExists(db, 'grants')) {
+    const columns = tableColumns(db, 'grants');
+    if (!columns.has('granted_to_agent_id')) {
+      db.exec('ALTER TABLE grants ADD COLUMN granted_to_agent_id TEXT');
+    }
+    if (!columns.has('granted_by_agent_id')) {
+      db.exec('ALTER TABLE grants ADD COLUMN granted_by_agent_id TEXT');
+    }
+  }
+}
+
 function ensureAgentSessionTokenColumn(db: SwarmDb): void {
   if (!tableExists(db, 'agents')) return;
   const columns = tableColumns(db, 'agents');
@@ -395,6 +663,50 @@ function ensureAgentWorkerVersionColumn(db: SwarmDb): void {
   }
 }
 
+function ensureAgentWorkerBinaryColumn(db: SwarmDb): void {
+  if (!tableExists(db, 'agents')) return;
+  const columns = tableColumns(db, 'agents');
+  if (!columns.has('worker_binary_sha256')) {
+    db.exec('ALTER TABLE agents ADD COLUMN worker_binary_sha256 TEXT');
+  }
+}
+
+function ensureAgentProcessFingerprintColumn(db: SwarmDb): void {
+  if (!tableColumns(db, 'agents').has('process_fingerprint')) {
+    db.exec('ALTER TABLE agents ADD COLUMN process_fingerprint TEXT');
+  }
+}
+
+function ensureTaskSourceIdentityColumns(db: SwarmDb): void {
+  if (!tableExists(db, 'tasks')) return;
+  const columns = tableColumns(db, 'tasks');
+  if (!columns.has('head_sha')) db.exec('ALTER TABLE tasks ADD COLUMN head_sha TEXT');
+  if (!columns.has('tree_sha')) db.exec('ALTER TABLE tasks ADD COLUMN tree_sha TEXT');
+  if (!columns.has('author_family')) db.exec('ALTER TABLE tasks ADD COLUMN author_family TEXT');
+}
+
+function ensureDecisionSingleSuccessorIndex(db: SwarmDb): void {
+  if (!tableExists(db, 'decisions')) return;
+  const duplicate = db.prepare(`
+    SELECT swarm_id, supersedes
+    FROM decisions
+    WHERE supersedes IS NOT NULL
+    GROUP BY swarm_id, supersedes
+    HAVING COUNT(*) > 1
+    LIMIT 1
+  `).get();
+  // Preserve legacy audit rows rather than silently rewriting them. New
+  // databases and clean upgrades get the physical uniqueness fence; dirty
+  // legacy databases still fail closed in the IMMEDIATE mutation transaction.
+  if (!duplicate) {
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_decisions_single_successor
+      ON decisions(swarm_id, supersedes)
+      WHERE supersedes IS NOT NULL
+    `);
+  }
+}
+
 function migrate(db: SwarmDb): void {
   createSwarmsTable(db);
   createCurrentTables(db);
@@ -404,8 +716,15 @@ function migrate(db: SwarmDb): void {
   ensureMessageKindColumn(db);
   ensureMessageSupersededByColumn(db);
   ensureTaskClaimKindColumn(db);
+  ensureHandoffOfferProvenanceColumns(db);
+  ensureDecisionProvenanceColumns(db);
+  ensureCoordinationProvenanceColumns(db);
   ensureAgentSessionTokenColumn(db);
   ensureAgentWorkerVersionColumn(db);
+  ensureAgentWorkerBinaryColumn(db);
+  ensureAgentProcessFingerprintColumn(db);
+  ensureTaskSourceIdentityColumns(db);
+  ensureDecisionSingleSuccessorIndex(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_swarm_joined ON agents(swarm_id, joined_at);
@@ -414,9 +733,39 @@ function migrate(db: SwarmDb): void {
     CREATE INDEX IF NOT EXISTS idx_messages_broadcast ON messages(swarm_id, id);
     CREATE INDEX IF NOT EXISTS idx_message_deliveries_recipient ON message_deliveries(swarm_id, recipient, status, message_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_owner_state ON tasks(swarm_id, owner_agent, state);
+    CREATE INDEX IF NOT EXISTS idx_tasks_owner_id_state ON tasks(swarm_id, owner_agent_id, state);
     CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(swarm_id, task_id, id);
+    CREATE INDEX IF NOT EXISTS idx_handoff_offers_parties ON handoff_offers(swarm_id, from_agent, to_agent, status, id);
+    CREATE INDEX IF NOT EXISTS idx_handoff_offers_deadline ON handoff_offers(swarm_id, status, expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_handoff_offers_one_pending
+      ON handoff_offers(swarm_id, task_id)
+      WHERE status = 'pending';
     CREATE INDEX IF NOT EXISTS idx_decisions_swarm_task ON decisions(swarm_id, task_id, id);
     CREATE INDEX IF NOT EXISTS idx_grants_swarm_live ON grants(swarm_id, op, revoked_at, expires_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_swarm_authorities_active_role
+      ON swarm_authorities(swarm_id, role)
+      WHERE revoked_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_swarm_authorities_agent
+      ON swarm_authorities(swarm_id, agent_id, revoked_at);
+    CREATE INDEX IF NOT EXISTS idx_message_outbox_pending
+      ON message_outbox(state, message_id);
+    CREATE INDEX IF NOT EXISTS idx_required_responses_deadline
+      ON required_message_responses(swarm_id, status, required_by);
+    CREATE INDEX IF NOT EXISTS idx_required_responses_recipient
+      ON required_message_responses(swarm_id, recipient_agent_id, status);
+    CREATE INDEX IF NOT EXISTS idx_reviewer_qualifications_live
+      ON reviewer_qualifications(swarm_id, agent_id, revoked_at, expires_at);
+    CREATE INDEX IF NOT EXISTS idx_review_requests_task
+      ON review_requests(swarm_id, task_id, status, id);
+    CREATE INDEX IF NOT EXISTS idx_review_verdicts_task
+      ON review_verdicts(swarm_id, task_id, verdict, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_migration_resource_active
+      ON migration_resource_leases(swarm_id, resource)
+      WHERE released_at IS NULL;
+    CREATE INDEX IF NOT EXISTS idx_migration_resource_task
+      ON migration_resource_leases(swarm_id, task_id, released_at);
+    CREATE INDEX IF NOT EXISTS idx_stand_down_target
+      ON stand_down_events(swarm_id, target_agent_id, id);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_janitor_findings_kind_path ON janitor_findings(kind, path);
     CREATE INDEX IF NOT EXISTS idx_janitor_findings_state ON janitor_findings(state, kind);
     CREATE INDEX IF NOT EXISTS idx_janitor_snapshots_tick ON janitor_snapshots(tick_at);

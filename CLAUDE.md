@@ -16,9 +16,9 @@ Swarm supports three registration/delivery modes:
 - **Headless/Warp agents** register with terminal metadata. Warp push is optional; otherwise messages wait in the durable inbox.
 - **A2A agents** (OpenClaw, Hermes, etc.) register via `swarm register-a2a <name> --endpoint <url>`. Messages are delivered via the A2A protocol over HTTP. This enables cross-user and cross-machine coordination.
 
-SQLite is authoritative for delivery. The prompt hook peeks at pending rows without consuming them; explicit `swarm ack` or a normal inbox read marks per-recipient delivery rows acknowledged, cancels that exact queued push, and advances the legacy cursor. Acknowledgement is transport state, not a conversational message or completion claim. `send --require-reply <ttl>` creates an ID-bound response deadline; only `send <requester> ... --reply-to <request-id>` from the exact recipient registration resolves it, and `swarm replies [--history]` exposes its state. Superseded and expired messages remain historical but are excluded from live reads.
+SQLite is authoritative for delivery. The prompt hook and every `swarm inbox` mode display pending rows without consuming them. Only `swarm ack <exact-id>` acknowledges one per-recipient delivery and cancels that exact queued push; bulk acknowledgement is refused. Acknowledgement is transport state, not a conversational message or completion claim. `send --require-reply <ttl>` creates an ID-bound response deadline; only `send <requester> ... --reply-to <request-id>` from the exact recipient registration resolves it, and `swarm replies [--history]` exposes its state. Superseded and expired messages remain historical but are excluded from live reads.
 
-Tasks are durable, fenced leases bound to immutable registration IDs plus epochs and backed by append-only task events and checkpoint files. Asynchronous ownership changes use digest-bound handoff offers: the source keeps the lease until the exact named registration accepts, while expiry/tamper dead-letters without transfer. Offer/accept state and durable notifications commit before push. `swarm rescue ... --to <successor>` re-verifies the artifact, journals task provenance, and queues a manifest-digest pointer to that exact registration; it never transfers authority. Stale agents are cleaned up by liveness plus heartbeat checks; headless agents are never auto-pruned. The janitor keeps filesystem/repository inspection observe-only while sweeping handoff and required-response deadlines across every swarm and durably escalating expiry to the requester plus active Owner/Lead registrations.
+Tasks are durable, fenced leases bound to immutable registration IDs plus epochs and backed by append-only task events and checkpoint files. Code tasks also bind the isolated worktree, branch, exact head/tree, and immutable author model family. Closing code requires a fresh typed exact-head verdict from a live-qualified reviewer plus a final live source/qualification recheck; reports, overrides, and handoffs cannot launder those bindings. Asynchronous ownership changes use digest-bound handoff offers: the source keeps the lease until the exact named registration accepts, while expiry/tamper dead-letters without transfer. Offer/accept state and durable notifications commit before push. Owner/Lead registrations exclusively issue privileged grants and decisions, qualify reviewers, reserve migration resources, and perform verified exact-process-tree stand-down. `swarm rescue ... --to <successor>` re-verifies the artifact, journals task provenance, and queues a manifest-digest pointer to that exact registration; it never transfers authority. Stale agents are cleaned up by liveness plus heartbeat checks; headless agents are never auto-pruned. The janitor keeps filesystem/repository inspection observe-only while sweeping handoff and required-response deadlines across every swarm and durably escalating expiry to the requester plus active Owner/Lead registrations.
 
 ## Architecture
 
@@ -32,7 +32,12 @@ Tasks are durable, fenced leases bound to immutable registration IDs plus epochs
 - `src/authority.ts` — Immutable Owner/Lead registration roles and privileged authorization
 - `src/clock.ts` — Persisted monotonic wall-clock fences for deadline-sensitive mutations
 - `src/mailbox.ts` — Exact-recipient delivery rows, durable push outbox, required-response deadlines, supersession, inbox reads, and cursor compatibility
-- `src/tasks.ts` — Fenced task epochs, checkpoints, evidence-gated close, two-phase handoff offers, and decisions
+- `src/model-family.ts` — Canonical host/model-family identity derivation
+- `src/qualifications.ts` — Bounded reviewer qualifications tied to immutable binary/model/harness/prompt/tool identity
+- `src/reviews.ts` — Exact-head review requests, typed verdicts, and live source/qualification gates
+- `src/tasks.ts` — Fenced task epochs, immutable code identity, checkpoints, typed-verdict close, two-phase handoff offers, and decisions
+- `src/migration-leases.ts` — Exclusive, task-epoch-bound migration resource reservations
+- `src/stand-down.ts` — Exact process-tree identity capture, termination, verification, and audit events
 - `src/harness-review.ts` — Gated task-timeline review briefs for harness interventions
 - `src/rescue.ts` — Verified preservation artifacts, manifests, and digest-bound exact-successor pointers
 - `src/janitor.ts` — Observe-only debris census plus fleet-wide durable coordination-deadline enforcement
@@ -41,7 +46,7 @@ Tasks are durable, fenced leases bound to immutable registration IDs plus epochs
 - `src/board-server.ts` + `web/` — Token/Host-guarded loopback graph, dashboard, timeline, inspector, and registry-resolved cmux focus action
 - `src/index.ts` — CLI entry point (async main)
 
-Core tables are `swarms`, `agents`, `swarm_authorities`, `messages`, `message_deliveries`, `message_outbox`, `required_message_responses`, `required_response_expiry_notifications`, `inbox_cursors`, `tasks`, `task_events`, `handoff_offers`, `handoff_expiry_notifications`, `decisions`, `grants`, `coordination_clocks`, `janitor_status`, `janitor_findings`, `janitor_snapshots`, and `janitor_kv`.
+Core tables are `swarms`, `agents`, `swarm_authorities`, `messages`, `message_deliveries`, `message_outbox`, `required_message_responses`, `required_response_expiry_notifications`, `inbox_cursors`, `tasks`, `task_events`, `handoff_offers`, `handoff_expiry_notifications`, `decisions`, `grants`, `reviewer_qualifications`, `review_requests`, `review_verdicts`, `migration_resource_leases`, `stand_down_events`, `coordination_clocks`, `janitor_status`, `janitor_findings`, `janitor_snapshots`, and `janitor_kv`.
 
 ## Security Notes
 

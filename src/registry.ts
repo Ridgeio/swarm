@@ -11,6 +11,7 @@ import {
 } from './transport.js';
 import { isAgentAlive } from './transport-router.js';
 import type { AgentType } from './transport-interface.js';
+import { captureProcessFingerprint } from './stand-down.js';
 
 const SWARM_DIR = path.join(os.homedir(), '.swarm');
 
@@ -54,6 +55,8 @@ export interface Agent {
   /** Host harness that owns this terminal. */
   host_agent: HostAgentKind | null;
   worker_version: string | null;
+  worker_binary_sha256: string | null;
+  process_fingerprint: string | null;
   surface_id: string;
   workspace_id: string | null;
   ppid: number;
@@ -86,6 +89,8 @@ export interface HeadlessSessionOptions {
 
 export interface JoinAgentOptions {
   forceSurface?: boolean;
+  workerBinarySha256?: string | null;
+  processFingerprint?: string | null;
 }
 
 export interface JoinedAgent extends Agent {
@@ -108,6 +113,21 @@ export function captureWorkerVersion(
     });
     const firstLine = String(output).split(/\r?\n/, 1)[0];
     return firstLine.length > 0 ? firstLine : null;
+  } catch {
+    return null;
+  }
+}
+
+export function captureWorkerBinarySha256(host: HostAgentKind | null): string | null {
+  if (!host) return null;
+  try {
+    const binaryPath = execFileSync('which', [WORKER_BINARIES[host]], {
+      encoding: 'utf-8',
+      timeout: 2_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).trim();
+    if (!binaryPath) return null;
+    return createHash('sha256').update(fs.readFileSync(binaryPath)).digest('hex');
   } catch {
     return null;
   }
@@ -318,6 +338,16 @@ export function joinAgent(
   const workerVersion = agentType === 'a2a'
     ? null
     : captureWorkerVersion(host, versionRunner);
+  const workerBinarySha256 = agentType === 'a2a'
+    ? null
+    : options.workerBinarySha256 === undefined
+      ? captureWorkerBinarySha256(host)
+      : options.workerBinarySha256;
+  const processFingerprint = agentType === 'a2a'
+    ? null
+    : options.processFingerprint === undefined
+      ? captureProcessFingerprint(ppid)
+      : options.processFingerprint;
 
   let surfaceTakeover: JoinedAgent['surface_takeover'];
   withImmediateTransaction(db, () => {
@@ -360,12 +390,14 @@ export function joinAgent(
       INSERT OR REPLACE INTO agents (
         id, swarm_id, name, description, surface_id, workspace_id, ppid,
         joined_at, last_heartbeat, agent_type, endpoint_url, host_agent, session_token,
-        worker_version
+        worker_version, worker_binary_sha256, process_fingerprint
       )
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       id, swarmId, name, description ?? null, surfaceId, workspaceId ?? null, ppid,
-      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion
+      now, now, agentType, endpointUrl ?? null, host, sessionToken, workerVersion,
+      workerBinarySha256,
+      processFingerprint
     );
 
     // Bootstrap is a one-time provenance event, never a name convention. The
@@ -406,6 +438,8 @@ export function joinAgent(
     endpoint_url: endpointUrl ?? null,
     host_agent: host,
     worker_version: workerVersion,
+    worker_binary_sha256: workerBinarySha256,
+    process_fingerprint: processFingerprint,
     surface_id: surfaceId,
     workspace_id: workspaceId ?? null,
     ppid,
@@ -454,6 +488,8 @@ export function joinHeadlessAgent(
   options: HeadlessSessionOptions & {
     hostAgent?: HostAgentKind | null;
     versionRunner?: WorkerVersionRunner;
+    workerBinarySha256?: string | null;
+    processFingerprint?: string | null;
   } = {}
 ): Agent {
   if (options.trackSession) {
@@ -473,7 +509,11 @@ export function joinHeadlessAgent(
   const syntheticSurfaceId = `headless:${swarmId}:${name}`;
   const agent = joinAgent(
     db, swarmId, name, syntheticSurfaceId, undefined, process.ppid,
-    description, 'headless', undefined, options.hostAgent, options.versionRunner
+    description, 'headless', undefined, options.hostAgent, options.versionRunner,
+    {
+      workerBinarySha256: options.workerBinarySha256,
+      processFingerprint: options.processFingerprint,
+    }
   );
   if (options.trackSession) {
     if (!agent.session_token) throw new Error(`Failed to mint a session token for headless agent "${name}".`);

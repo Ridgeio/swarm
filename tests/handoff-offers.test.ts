@@ -148,6 +148,8 @@ describe('two-phase asynchronous task handoff', () => {
     const pickedUp = runCli(home, ['inbox'], 'Bob');
     assert.strictEqual(pickedUp.status, 0, pickedUp.stderr || pickedUp.stdout);
     assert.match(pickedUp.stdout, new RegExp(`Handoff offer #${offerId}`));
+    const pickupAck = runCli(home, ['ack', String(offer.message_id)], 'Bob');
+    assert.strictEqual(pickupAck.status, 0, pickupAck.stderr || pickupAck.stdout);
     const senderStatus = runCli(home, ['handoff', 'status', 'async-handoff'], 'Alice');
     assert.strictEqual(senderStatus.status, 0, senderStatus.stderr || senderStatus.stdout);
     assert.match(senderStatus.stdout, new RegExp(`#${offerId} async-handoff \\[pending\\].*pickup acked`));
@@ -381,7 +383,7 @@ describe('coordination authority hardening', () => {
     db.close();
   });
 
-  test('task decisions require the current fenced owner and record authenticated agent-id + epoch provenance', () => {
+  test('task decisions require Owner/Lead authority and record authenticated agent-id + epoch provenance', () => {
     const home = tempHome('swarm-decision-provenance-');
     join(home, 'Alice');
     join(home, 'Bob');
@@ -398,7 +400,7 @@ describe('coordination authority hardening', () => {
       'decision', 'DECISION: spoofed', '--task', 'decision-provenance',
     ], 'Bob');
     assert.notStrictEqual(unauthorized.status, 0);
-    assert.match(unauthorized.stderr, /Refused stale task authority.*owner is "Alice"/s);
+    assert.match(unauthorized.stderr, /not an active Owner\/Lead authority/);
 
     const db = openDb(home);
     const alice = db.prepare("SELECT id FROM agents WHERE name = 'Alice'").get() as { id: string };

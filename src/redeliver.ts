@@ -180,6 +180,9 @@ export async function runRedeliverWorker(db: SwarmDb): Promise<void> {
 
 /** Fire-and-forget a detached retry worker (no-op if spawn fails). */
 export function spawnRedeliverWorker(): void {
+  // CLI integration suites set this explicitly so a detached retry cannot
+  // race fixture teardown after the foreground command has exited.
+  if (process.env.NODE_TEST_CONTEXT || process.env.SWARM_TEST_DISABLE_BACKGROUND === '1') return;
   try {
     const child = spawn(
       process.execPath,

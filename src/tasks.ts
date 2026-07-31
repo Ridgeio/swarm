@@ -17,6 +17,7 @@ import {
   requireSwarmAuthority,
 } from './authority.js';
 import { observeMonotonicClock } from './clock.js';
+import { deriveModelFamily, type ModelFamily } from './model-family.js';
 
 export const TASK_LEASE_HOURS = 24;
 export const HANDOFF_FRESH_MINUTES = 60;
@@ -38,7 +39,7 @@ export const CLAIM_KINDS = [
   'probe',
 ] as const;
 export type ClaimKind = typeof CLAIM_KINDS[number];
-export const EVIDENCE_KINDS = ['journey', 'deploy-health', 'report', 'decision'] as const;
+export const EVIDENCE_KINDS = ['journey', 'deploy-health', 'report', 'decision', 'verdict'] as const;
 export type EvidenceKind = typeof EVIDENCE_KINDS[number];
 export type EvidenceVerification = boolean | number | 'unverified';
 
@@ -63,6 +64,9 @@ export interface Task {
   transcript_hint: string | null;
   disposition: TaskDisposition | null;
   claim_kind: ClaimKind | null;
+  head_sha: string | null;
+  tree_sha: string | null;
+  author_family: ModelFamily | null;
   created_at: string;
   updated_at: string;
 }
@@ -81,6 +85,7 @@ interface TaskEvent {
 
 export interface GitFacts {
   head: string;
+  tree: string;
   branch: string;
   dirtyTracked: number;
   untracked: number;
@@ -591,10 +596,22 @@ export async function startTask(
   }
 
   const requestedRepo = options.repoPath ?? prior?.repo_path ?? undefined;
+  const prospectiveClaim = explicitClaimKind
+    ?? prior?.claim_kind
+    ?? (requestedRepo && !options.noWorktree ? 'code-merged' : 'analysis');
+  if (prospectiveClaim === 'code-merged' && (!requestedRepo || options.noWorktree)) {
+    throw new Error(
+      `Code task "${slug}" requires --repo and an isolated named worktree; ` +
+      '--no-worktree cannot provide mandatory repository/branch/head/tree identity.'
+    );
+  }
   let worktree: { repoPath: string; branch: string; worktreePath: string } | null = null;
   if (requestedRepo && !options.noWorktree) {
     worktree = prepareTaskWorktree(db, actor, slug, requestedRepo);
   }
+  const boundHead = worktree ? runGit(worktree.worktreePath, ['rev-parse', 'HEAD']) : null;
+  const boundTree = worktree ? runGit(worktree.worktreePath, ['rev-parse', 'HEAD^{tree}']) : null;
+  const immutableAuthorFamily = prior?.author_family ?? deriveModelFamily(actorAgent.host_agent);
 
   const result = withImmediateTransaction(db, () => {
     observeMonotonicClock(db, swarmId, 'task', mutationNow);
@@ -644,7 +661,8 @@ export async function startTask(
         SET title = ?, state = 'active', owner_agent = ?, owner_agent_id = ?,
             lease_epoch = ?, lease_expires_at = ?,
             repo_path = ?, branch = ?, worktree_path = ?, transcript_hint = ?, disposition = NULL,
-            claim_kind = ?, updated_at = ?
+            claim_kind = ?, head_sha = COALESCE(?, head_sha), tree_sha = COALESCE(?, tree_sha),
+            author_family = COALESCE(author_family, ?), updated_at = ?
         WHERE swarm_id = ? AND id = ?
       `).run(
         title,
@@ -657,6 +675,9 @@ export async function startTask(
         worktree?.worktreePath ?? current.worktree_path,
         transcriptHint(),
         claimKind,
+        boundHead,
+        boundTree,
+        immutableAuthorFamily,
         timestamp,
         swarmId,
         slug
@@ -667,7 +688,8 @@ export async function startTask(
           id, swarm_id, title, state, owner_agent, owner_agent_id,
           lease_epoch, lease_expires_at,
           repo_path, branch, worktree_path, transcript_hint, disposition, claim_kind, created_at, updated_at
-        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+          , head_sha, tree_sha, author_family
+        ) VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
       `).run(
         slug,
         swarmId,
@@ -682,7 +704,10 @@ export async function startTask(
         transcriptHint(),
         claimKind,
         timestamp,
-        timestamp
+        timestamp,
+        boundHead,
+        boundTree,
+        immutableAuthorFamily
       );
     }
 
@@ -696,6 +721,9 @@ export async function startTask(
       branch: task.branch,
       worktree_path: task.worktree_path,
       claim_kind: effectiveClaimKind(task),
+      head_sha: task.head_sha,
+      tree_sha: task.tree_sha,
+      author_family: task.author_family,
     }, timestamp);
     let notificationId: number | null = null;
     if (claimed && previousOwner && previousOwnerId) {
@@ -955,7 +983,7 @@ export async function rebindLegacyTask(
 
 export function taskGitFacts(task: Task): GitFacts {
   if (!task.repo_path) {
-    return { head: 'unknown', branch: task.branch ?? 'unknown', dirtyTracked: 0, untracked: 0, unpushed: [] };
+    return { head: 'unknown', tree: 'unknown', branch: task.branch ?? 'unknown', dirtyTracked: 0, untracked: 0, unpushed: [] };
   }
   const hasTaskWorktree = !!task.worktree_path && fs.existsSync(task.worktree_path);
   const cwd = hasTaskWorktree ? task.worktree_path! : task.repo_path;
@@ -965,6 +993,9 @@ export function taskGitFacts(task: Task): GitFacts {
   // branch commit as the task commit.
   const headRef = hasTaskWorktree ? 'HEAD' : task.branch ?? 'HEAD';
   const head = tryGit(cwd, ['rev-parse', headRef]) ?? 'unknown';
+  const tree = head === 'unknown'
+    ? 'unknown'
+    : tryGit(cwd, ['rev-parse', `${head}^{tree}`]) ?? 'unknown';
   const branch = hasTaskWorktree
     ? tryGit(cwd, ['branch', '--show-current']) || task.branch || 'detached'
     : task.branch || tryGit(cwd, ['branch', '--show-current']) || 'detached';
@@ -974,7 +1005,7 @@ export function taskGitFacts(task: Task): GitFacts {
   const dirtyTracked = lines.length - untracked;
   const log = task.branch ? tryGit(task.repo_path, ['log', task.branch, '--not', '--remotes', '--oneline']) : '';
   const unpushed = log ? log.split('\n').filter(Boolean) : [];
-  return { head, branch, dirtyTracked, untracked, unpushed };
+  return { head, tree, branch, dirtyTracked, untracked, unpushed };
 }
 
 function checkpointDir(task: Task): string {
@@ -1002,7 +1033,8 @@ function checkpointSkeleton(
   return `# checkpoint ${task.id} #${number}
 ${checkpointDraftMarker(draftId)}
 - state: ${task.state}; owner ${task.owner_agent ?? 'unowned'}; lease epoch ${task.lease_epoch}
-- head: ${facts.head} on ${facts.branch} (dirty: ${facts.dirtyTracked}, untracked: ${facts.untracked})
+- head: ${facts.head}; tree: ${facts.tree}; branch: ${facts.branch} (dirty: ${facts.dirtyTracked}, untracked: ${facts.untracked})
+- immutable author family: ${task.author_family ?? 'unknown'}
 ## decisions (+why, +rejected alternatives)
 ${decisions}
 ## failed approaches (do-not-repeat)
@@ -1209,7 +1241,7 @@ function hasVerifiedRescue(task: Task): boolean {
 }
 
 export const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = {
-  'code-merged': EVIDENCE_KINDS,
+  'code-merged': ['verdict'],
   'journey-works': ['journey'],
   'deploy-healthy': ['deploy-health'],
   analysis: ['report'],
@@ -1218,11 +1250,8 @@ export const CLAIM_EVIDENCE_KINDS: Record<ClaimKind, readonly EvidenceKind[]> = 
 };
 
 export function claimCloseRequirements(claimKind: ClaimKind): string {
-  // code-merged accepts optional typed evidence, but its required close proof is
-  // the Git gate set. Every evidence-bearing claim renders from the same map the
-  // close validator consumes, so help/output cannot drift from enforcement.
   return claimKind === 'code-merged'
-    ? 'git gates only'
+    ? 'typed PASS verdict + git gates'
     : CLAIM_EVIDENCE_KINDS[claimKind].join(', ');
 }
 
@@ -1291,6 +1320,7 @@ async function reviewCloseEvidence(
   db: SwarmDb,
   task: Task,
   claimKind: ClaimKind,
+  disposition: TaskDisposition,
   rawEvidence: string[],
   outcome: string | undefined,
   deployHealthCheck: DeployHealthCheck
@@ -1392,10 +1422,61 @@ async function reviewCloseEvidence(
             `Record it with "swarm decision <text> --task ${task.id}", then retry with --evidence decision:<id>.`,
         });
       }
+    } else if (kind === 'verdict') {
+      const verdictId = /^\d+$/.test(parsed.ref) ? Number(parsed.ref) : 0;
+      const at = new Date().toISOString();
+      const row = verdictId > 0 && Number.isSafeInteger(verdictId)
+        ? db.prepare(`
+          SELECT
+            v.id, v.task_epoch, v.verdict, v.head_sha, v.tree_sha,
+            q.expires_at, q.revoked_at,
+            q.worker_version AS qualified_worker_version,
+            q.binary_sha256 AS qualified_binary_sha256,
+            a.worker_version AS live_worker_version,
+            a.worker_binary_sha256 AS live_binary_sha256
+          FROM review_verdicts v
+          JOIN reviewer_qualifications q ON q.id = v.qualification_id
+          JOIN agents a ON a.swarm_id = v.swarm_id AND a.id = v.reviewer_agent_id
+          WHERE v.id = ? AND v.swarm_id = ? AND v.task_id = ?
+        `).get(verdictId, task.swarm_id, task.id) as {
+          id: number;
+          task_epoch: number;
+          verdict: string;
+          head_sha: string;
+          tree_sha: string;
+          expires_at: string;
+          revoked_at: string | null;
+          qualified_worker_version: string;
+          qualified_binary_sha256: string;
+          live_worker_version: string | null;
+          live_binary_sha256: string | null;
+        } | undefined
+        : undefined;
+      if (
+        row &&
+        row.task_epoch === task.lease_epoch &&
+        row.verdict === 'pass' &&
+        row.head_sha === task.head_sha &&
+        row.tree_sha === task.tree_sha &&
+        row.revoked_at === null &&
+        row.expires_at > at &&
+        row.qualified_worker_version === row.live_worker_version &&
+        row.qualified_binary_sha256 === row.live_binary_sha256
+      ) {
+        item.verified = true;
+      } else {
+        failures.push({
+          gate: 'evidence-verdict',
+          message: `Cannot close code task "${task.id}": verdict "${parsed.ref}" is missing, BLOCK, stale, ` +
+            'head/tree-mismatched, or no longer backed by a live reviewer qualification.',
+        });
+      }
     }
   }
 
-  const evidenceOptional = claimKind === 'code-merged' || (claimKind === 'probe' && outcome === 'inconclusive');
+  const evidenceOptional =
+    (claimKind === 'code-merged' && !['pr', 'merged'].includes(disposition)) ||
+    (claimKind === 'probe' && outcome === 'inconclusive');
   if (rawEvidence.length === 0 && !evidenceOptional) {
     failures.unshift({
       gate: 'evidence-required',
@@ -1413,9 +1494,37 @@ function reviewGitGates(
   preservedArchive: boolean,
   forcedDiscard: boolean
 ): GitGateReview {
-  if (!task.repo_path) return { failures: [] };
   const failures: GateFailure[] = [];
   let mergedVerification: MergedVerification | undefined;
+  if (!task.repo_path) {
+    if (claimKind === 'code-merged' && ['pr', 'merged'].includes(disposition)) {
+      failures.push({
+        gate: 'git-exact-source-binding',
+        message: `Cannot close code task "${task.id}": repository/branch/head/tree/author-family binding is incomplete. ` +
+          'Start a repository-backed isolated task and pass a fresh exact-head review.',
+      });
+    }
+    return { failures };
+  }
+  if (claimKind === 'code-merged' && ['pr', 'merged'].includes(disposition)) {
+    if (
+      !task.branch ||
+      !task.head_sha ||
+      !task.tree_sha ||
+      !task.author_family ||
+      facts.head === 'unknown' ||
+      facts.tree === 'unknown' ||
+      facts.branch !== task.branch ||
+      facts.head !== task.head_sha ||
+      facts.tree !== task.tree_sha
+    ) {
+      failures.push({
+        gate: 'git-exact-source-binding',
+        message: `Cannot close code task "${task.id}": repository/branch/head/tree/author-family binding moved or is incomplete. ` +
+          'Request and pass a fresh exact-head review before closing.',
+      });
+    }
+  }
   if (!preservedArchive && !forcedDiscard &&
       (facts.unpushed.length > 0 || facts.dirtyTracked > 0 || facts.untracked > 0)) {
     if (facts.unpushed.length > 0) failures.push({ gate: 'git-unpushed', message: '' });
@@ -1549,6 +1658,7 @@ export async function closeTask(
       db,
       task,
       claimKind,
+      options.disposition,
       options.evidence ?? [],
       options.outcome,
       options.deployHealthCheck ?? defaultDeployHealthCheck
@@ -1567,10 +1677,24 @@ export async function closeTask(
   const defaultBranchFailure = gitReview.failures.find(
     failure => failure.gate === 'git-default-branch-reachability'
   );
+  const protectedReviewFailure =
+    claimKind === 'code-merged' && ['pr', 'merged'].includes(options.disposition)
+      ? failures.find(failure =>
+        failure.gate === 'git-exact-source-binding' || failure.gate.startsWith('evidence-')
+      )
+      : undefined;
   // A merged disposition is a statement about the default branch, not a
   // preservation convenience. Even an override must not remove the worktree
   // or record merged until that concrete source→target comparison passes.
   if (defaultBranchFailure) throw new Error(defaultBranchFailure.message);
+  // A code PR/merge is a protected state write. Operator override authority
+  // cannot manufacture or bypass an exact-head, live-qualified PASS verdict.
+  if (protectedReviewFailure) {
+    throw new Error(
+      protectedReviewFailure.message ||
+      `Cannot close code task "${slug}": an exact-head, live-qualified PASS verdict is mandatory.`
+    );
+  }
   if (!options.override && failures.length > 0) {
     throw new Error(failures.find(failure => failure.message)?.message ?? `Cannot close task "${slug}": a close gate failed.`);
   }
@@ -1605,6 +1729,71 @@ export async function closeTask(
       }
     } catch (error: unknown) {
       return { error: error instanceof Error ? error.message : String(error) };
+    }
+
+    if (effectiveClaimKind(current) === 'code-merged' && ['pr', 'merged'].includes(options.disposition)) {
+      const liveFacts = taskGitFacts(current);
+      if (
+        current.branch !== task.branch ||
+        current.head_sha !== task.head_sha ||
+        current.tree_sha !== task.tree_sha ||
+        current.author_family !== task.author_family ||
+        liveFacts.branch !== facts.branch ||
+        liveFacts.head !== facts.head ||
+        liveFacts.tree !== facts.tree
+      ) {
+        return {
+          error: `Cannot close code task "${slug}": repository/branch/head/tree/author-family identity moved after gate evaluation.`,
+        };
+      }
+      const verdictEvidence = evidenceReview.evidence.find(
+        item => item.kind === 'verdict' && item.verified === true
+      );
+      const verdictId = verdictEvidence && /^\d+$/.test(verdictEvidence.ref)
+        ? Number(verdictEvidence.ref)
+        : 0;
+      const at = nowIso();
+      const verdict = verdictId > 0
+        ? db.prepare(`
+          SELECT
+            v.task_epoch, v.verdict, v.head_sha, v.tree_sha,
+            q.expires_at, q.revoked_at,
+            q.worker_version AS qualified_worker_version,
+            q.binary_sha256 AS qualified_binary_sha256,
+            a.worker_version AS live_worker_version,
+            a.worker_binary_sha256 AS live_binary_sha256
+          FROM review_verdicts v
+          JOIN reviewer_qualifications q ON q.id = v.qualification_id
+          JOIN agents a ON a.swarm_id = v.swarm_id AND a.id = v.reviewer_agent_id
+          WHERE v.id = ? AND v.swarm_id = ? AND v.task_id = ?
+        `).get(verdictId, swarmId, slug) as {
+          task_epoch: number;
+          verdict: string;
+          head_sha: string;
+          tree_sha: string;
+          expires_at: string;
+          revoked_at: string | null;
+          qualified_worker_version: string;
+          qualified_binary_sha256: string;
+          live_worker_version: string | null;
+          live_binary_sha256: string | null;
+        } | undefined
+        : undefined;
+      if (
+        !verdict ||
+        verdict.task_epoch !== current.lease_epoch ||
+        verdict.verdict !== 'pass' ||
+        verdict.head_sha !== current.head_sha ||
+        verdict.tree_sha !== current.tree_sha ||
+        verdict.revoked_at !== null ||
+        verdict.expires_at <= at ||
+        verdict.qualified_worker_version !== verdict.live_worker_version ||
+        verdict.qualified_binary_sha256 !== verdict.live_binary_sha256
+      ) {
+        return {
+          error: `Cannot close code task "${slug}": its typed PASS verdict expired, drifted, or became stale before commit.`,
+        };
+      }
     }
 
     if (current.worktree_path && fs.existsSync(current.worktree_path) && current.repo_path) {
@@ -2665,45 +2854,21 @@ export function recordDecision(
     throw new Error('Decision time must be a finite integer millisecond timestamp.');
   }
   const actorAgent = requireActiveAgent(db, swarmId, actor, 'record decision');
-  const authority = taskId
-    ? requireTaskAuthority(db, swarmId, taskId, actor, 'record decision')
-    : null;
-  if (!taskId) {
-    requireSwarmAuthority(db, swarmId, actor, 'record program decision');
-  }
+  const issuer = requireSwarmAuthority(db, swarmId, actor, 'record protected decision');
   return withImmediateTransaction(db, () => {
     observeMonotonicClock(db, swarmId, 'decision', now);
     const currentActor = requireActiveAgent(db, swarmId, actor, 'record decision');
     if (currentActor.id !== actorAgent.id) {
       throw new Error(`Refused decision: ${actor}'s registration changed before commit.`);
     }
+    const currentIssuer = requireSwarmAuthority(db, swarmId, actor, 'record protected decision');
+    if (currentIssuer.agent.id !== issuer.agent.id) {
+      throw new Error(`Refused decision: ${actor}'s authority registration changed before commit.`);
+    }
     let task: Task | null = null;
-    if (taskId && authority) {
+    if (taskId) {
       task = getTask(db, swarmId, taskId);
-      if (
-        !task ||
-        currentActor.id !== actorAgent.id ||
-        task.owner_agent_id !== actorAgent.id ||
-        task.lease_epoch !== authority.epoch
-      ) {
-        if (task) {
-          insertEvent(db, task, 'refused_stale_epoch', actor, {
-            verb: 'record decision',
-            owner_agent: task.owner_agent,
-            owner_agent_id: task.owner_agent_id,
-            actor_agent_id: currentActor.id,
-            current_epoch: task.lease_epoch,
-            presented_epoch: authority.epoch,
-          });
-        }
-        throw new Error(
-          task
-            ? staleAuthorityMessage(task, actor, 'record decision', authority.epoch)
-            : `Task "${taskId}" not found in this swarm.`
-        );
-      }
-    } else {
-      requireSwarmAuthority(db, swarmId, actor, 'record program decision');
+      if (!task) throw new Error(`Task "${taskId}" not found in this swarm.`);
     }
     if (supersedes !== undefined) {
       const previous = db.prepare(`
@@ -2720,13 +2885,6 @@ export function recordDecision(
       if (previous.status !== 'active') {
         throw new Error(
           `Decision #${supersedes} is ${previous.status}; only an active decision may be superseded.`
-        );
-      }
-      if (previous.actor_agent_id === null || previous.actor_agent_id !== actorAgent.id) {
-        throw new Error(
-          `Decision #${supersedes} belongs to registration ` +
-          `${previous.actor_agent_id ?? 'legacy/unrecorded'} (${previous.made_by}); ` +
-          'only that exact active author registration may supersede it.'
         );
       }
       if ((previous.task_id ?? null) !== (taskId ?? null)) {
@@ -2761,7 +2919,7 @@ export function recordDecision(
       text,
       actorAgent.name,
       actorAgent.id,
-      authority?.epoch ?? null,
+      task?.lease_epoch ?? null,
       supersedes ?? null,
       createdAt
     );
@@ -2779,7 +2937,7 @@ export function recordDecision(
       insertEvent(db, task, 'decision_recorded', actor, {
         decision_id: decisionId,
         actor_agent_id: actorAgent.id,
-        task_epoch: authority!.epoch,
+        task_epoch: task.lease_epoch,
         supersedes: supersedes ?? null,
       }, createdAt);
     }

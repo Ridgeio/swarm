@@ -25,6 +25,7 @@ import {
   REVIEW_PRIORS,
 } from '../src/reviews.js';
 import { startTask } from '../src/tasks.js';
+import { recordReviewerQualification } from '../src/qualifications.js';
 import { REPO_DIR } from '../src/version.js';
 
 const INDEX = path.resolve(fileURLToPath(new URL('../src/index.ts', import.meta.url)));
@@ -93,6 +94,20 @@ function join(
   joinHeadlessAgent(db, 'default', name, undefined, {
     hostAgent,
     versionRunner: () => 'fixture version\n',
+    workerBinarySha256: 'a'.repeat(64),
+  });
+}
+
+function qualify(db: SwarmDb, operator: string, agent: string, now: number = NOW - 60_000): void {
+  recordReviewerQualification(db, 'default', operator, {
+    agent,
+    binarySha256: 'a'.repeat(64),
+    modelId: 'fixture-model',
+    harnessSha256: 'b'.repeat(64),
+    promptSha256: 'c'.repeat(64),
+    toolsSha256: 'd'.repeat(64),
+    ttl: '1d',
+    now,
   });
 }
 
@@ -134,6 +149,8 @@ describe('T6 model-inversion review routing', () => {
       join(value.db, 'Author', 'claude-code');
       join(value.db, 'Same', 'claude-code');
       join(value.db, 'Alternative', 'codex');
+      qualify(value.db, 'Author', 'Same');
+      qualify(value.db, 'Author', 'Alternative');
       await startAnalysis(value.db, 'Author', 'same-family');
 
       await assert.rejects(
@@ -177,6 +194,8 @@ describe('T6 model-inversion review routing', () => {
       join(value.db, 'Author', 'claude-code');
       join(value.db, 'Busy', 'codex');
       join(value.db, 'Free', 'gemini');
+      qualify(value.db, 'Author', 'Busy', NOW - 120_000);
+      qualify(value.db, 'Author', 'Free', NOW - 120_000);
       await startAnalysis(value.db, 'Author', 'existing-review');
       await requestTaskReview(value.db, 'default', 'Author', 'existing-review', {
         to: 'Busy', now: new Date(NOW - 60_000), homeDir: value.home,
@@ -198,6 +217,8 @@ describe('T6 model-inversion review routing', () => {
     try {
       join(value.db, 'ClaudeAuthor', 'claude-code');
       join(value.db, 'OpenAIAuthor', 'codex');
+      qualify(value.db, 'ClaudeAuthor', 'ClaudeAuthor');
+      qualify(value.db, 'ClaudeAuthor', 'OpenAIAuthor');
       await startAnalysis(value.db, 'ClaudeAuthor', 'claude-authored');
       await startAnalysis(value.db, 'OpenAIAuthor', 'openai-authored');
 
@@ -233,6 +254,10 @@ describe('T6 model-inversion review routing', () => {
         ).get() as { id: string }).id,
         reviewer_family: 'openai',
         brief_path: claude.briefPath,
+        request_id: claude.requestId,
+        qualification_id: claude.qualificationId,
+        head_sha: 'unknown',
+        tree_sha: 'unknown',
       });
     } finally {
       cleanup(value);
@@ -250,7 +275,7 @@ describe('T6 model-inversion review routing', () => {
         requestTaskReview(value.db, 'default', 'Author', 'no-reviewer', {
           now: new Date(NOW), homeDir: value.home,
         }),
-        /No live cross-family reviewer.*Spawn a reviewer from a different model family.*swarm review no-reviewer/s
+        /No live qualified cross-family reviewer.*Requalify a different-family reviewer.*swarm review no-reviewer/s
       );
       assert.strictEqual(
         (value.db.prepare("SELECT state FROM tasks WHERE id = 'no-reviewer'").get() as any).state,

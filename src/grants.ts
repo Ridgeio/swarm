@@ -3,7 +3,7 @@ import { getAgent } from './registry.js';
 import { requireActiveAgent, requireSwarmAuthority } from './authority.js';
 import { observeMonotonicClock } from './clock.js';
 
-export const GRANT_OPS = ['merge', 'prod', 'spend', 'override'] as const;
+export const GRANT_OPS = ['merge', 'prod', 'release', 'spend', 'migration', 'override'] as const;
 export type BuiltinGrantOp = typeof GRANT_OPS[number];
 export type GrantOp = BuiltinGrantOp | `custom:${string}`;
 
@@ -48,7 +48,9 @@ export const GRANT_TTL_PATTERN = /^(\d+)(m|h|d)$/;
 export function validateGrantOp(value: string): GrantOp {
   if ((GRANT_OPS as readonly string[]).includes(value)) return value as BuiltinGrantOp;
   if (/^custom:[A-Za-z0-9][A-Za-z0-9._-]*$/.test(value)) return value as unknown as GrantOp;
-  throw new Error(`Invalid grant op "${value}". Use merge, prod, spend, override, or custom:<name>.`);
+  throw new Error(
+    `Invalid grant op "${value}". Use merge, prod, release, spend, migration, override, or custom:<name>.`
+  );
 }
 
 export function parseGrantTtl(value: string): number {

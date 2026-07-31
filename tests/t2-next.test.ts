@@ -175,14 +175,37 @@ describe('T2.1 typed grants', () => {
 });
 
 describe('T2.2 close chokepoints', () => {
-  test('merged code claim routes authorization through escalation and an operator remedy, then records grant use', async () => {
+  test('merged code claim routes through a merge grant, which still cannot bypass the typed verdict gate', async () => {
     const fixture = tempDb('swarm-t2-merge-');
     try {
       joinHeadlessAgent(fixture.db, 'default', 'Lead');
-      joinHeadlessAgent(fixture.db, 'default', 'Alice');
-      await startTask(fixture.db, 'default', 'Alice', 'merge-gated', {
-        title: 'Merge gated', noWorktree: true, claimKind: 'code-merged',
-      });
+      const alice = joinHeadlessAgent(fixture.db, 'default', 'Alice');
+      const repo = path.join(fixture.root, 'repo');
+      fs.mkdirSync(repo);
+      execFileSync('git', ['init', '-b', 'main', repo], { stdio: 'ignore' });
+      execFileSync('git', ['-C', repo, 'config', 'user.name', 'Swarm Test']);
+      execFileSync('git', ['-C', repo, 'config', 'user.email', 'swarm@example.test']);
+      fs.writeFileSync(path.join(repo, 'tracked.txt'), 'base\n');
+      execFileSync('git', ['-C', repo, 'add', 'tracked.txt']);
+      execFileSync('git', ['-C', repo, 'commit', '-m', 'base'], { stdio: 'ignore' });
+      const head = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD'], { encoding: 'utf-8' }).trim();
+      const tree = execFileSync('git', ['-C', repo, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf-8' }).trim();
+      const at = new Date().toISOString();
+      fixture.db.prepare(`
+        INSERT INTO tasks (
+          id, swarm_id, title, state, owner_agent, owner_agent_id, lease_epoch,
+          lease_expires_at, repo_path, branch, worktree_path, transcript_hint,
+          disposition, claim_kind, head_sha, tree_sha, author_family, created_at, updated_at
+        ) VALUES (
+          'merge-gated', 'default', 'Merge gated', 'active', 'Alice', ?, 1,
+          ?, ?, 'main', ?, 'fixture', NULL, 'code-merged', ?, ?, 'openai', ?, ?
+        )
+      `).run(alice.id, new Date(Date.now() + 60_000).toISOString(), repo, repo, head, tree, at, at);
+      fixture.db.prepare(`
+        INSERT INTO task_events (
+          swarm_id, task_id, epoch, kind, actor, actor_agent_id, data, created_at
+        ) VALUES ('default', 'merge-gated', 1, 'started', 'Alice', ?, '{}', ?)
+      `).run(alice.id, at);
       await assert.rejects(
         closeTask(fixture.db, 'default', 'Alice', 'merge-gated', {
           disposition: 'merged', notEstablished: 'none',
@@ -196,41 +219,18 @@ describe('T2.2 close chokepoints', () => {
       const grant = createGrant(fixture.db, 'default', 'Lead', {
         op: 'merge', resource: 'merge-gated', ttl: '2h', grantedTo: 'Alice',
       });
-      const closed = await closeTask(fixture.db, 'default', 'Alice', 'merge-gated', {
-        disposition: 'merged', notEstablished: 'none',
-      });
-      assert.strictEqual(closed.state, 'done');
-      const used = fixture.db.prepare(`
-        SELECT data FROM task_events WHERE task_id = 'merge-gated' AND kind = 'grant_used'
-      `).get() as { data: string };
-      assert.deepStrictEqual(
-        {
-          grant_id: JSON.parse(used.data).grant_id,
-          op: JSON.parse(used.data).op,
-          resource: JSON.parse(used.data).resource,
-          actor: JSON.parse(used.data).actor,
-        },
-        { grant_id: grant.id, op: 'merge', resource: 'merge-gated', actor: 'Alice' }
+      assert.ok(grant.id > 0);
+      await assert.rejects(
+        closeTask(fixture.db, 'default', 'Alice', 'merge-gated', {
+          disposition: 'pr', notEstablished: 'none',
+        }),
+        /expects evidence kind\(s\): verdict/
       );
-      assert.ok(JSON.parse(used.data).actor_agent_id);
-      assert.strictEqual(JSON.parse(used.data).granted_by_agent_id, grant.granted_by_agent_id);
-      assert.strictEqual(JSON.parse(used.data).granted_to_agent_id, grant.granted_to_agent_id);
-
-      await startTask(fixture.db, 'default', 'Alice', 'branch-gated', {
-        title: 'Branch gated', noWorktree: true, claimKind: 'code-merged',
-      });
-      fixture.db.prepare("UPDATE tasks SET branch = 'swarm/Alice/branch-gated' WHERE id = 'branch-gated'").run();
-      const branchGrant = createGrant(fixture.db, 'default', 'Lead', {
-        op: 'merge', resource: 'swarm/Alice/branch-gated', ttl: '2h', grantedTo: 'Alice',
-      });
-      const branchClosed = await closeTask(fixture.db, 'default', 'Alice', 'branch-gated', {
-        disposition: 'merged', notEstablished: 'none',
-      });
-      assert.strictEqual(branchClosed.state, 'done');
-      const branchUse = fixture.db.prepare(`
-        SELECT data FROM task_events WHERE task_id = 'branch-gated' AND kind = 'grant_used'
-      `).get() as { data: string };
-      assert.strictEqual(JSON.parse(branchUse.data).grant_id, branchGrant.id);
+      assert.strictEqual(
+        (fixture.db.prepare("SELECT COUNT(*) AS n FROM task_events WHERE kind = 'grant_used'").get() as { n: number }).n,
+        0,
+        'grant use is recorded only when every protected close gate commits'
+      );
     } finally {
       fixture.db.close();
       fs.rmSync(fixture.root, { recursive: true, force: true });

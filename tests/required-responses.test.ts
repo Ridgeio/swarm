@@ -13,6 +13,7 @@ import {
   type SwarmDb,
 } from '../src/db.js';
 import {
+  acknowledgeMessages,
   enqueueDirectMessage,
   flushMessageOutbox,
   getInbox,
@@ -77,12 +78,22 @@ describe('durable required replies', () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  test('reading only acknowledges transport; an exact directed reply resolves the request atomically', async () => {
+  test('display is non-acking; exact transport ack and exact directed reply are separate atomic acts', async () => {
     const now = Date.now();
     const requestId = enqueueRequired(db, 'Alice', 'Bob', now, now + 10 * 60_000);
 
     assert.deepStrictEqual(getInbox(db, SWARM_ID, 'Bob').map(message => message.id), [requestId]);
     assert.strictEqual(getRequiredResponse(db, SWARM_ID, requestId)?.status, 'pending');
+    assert.strictEqual(
+      (db.prepare('SELECT status FROM message_deliveries WHERE message_id = ?').get(requestId) as { status: string }).status,
+      'pending'
+    );
+    assert.strictEqual(
+      (db.prepare('SELECT COUNT(*) AS n FROM message_outbox WHERE message_id = ?').get(requestId) as { n: number }).n,
+      1,
+      'display must not cancel a queued push'
+    );
+    assert.deepStrictEqual(acknowledgeMessages(db, SWARM_ID, 'Bob', [requestId]), [requestId]);
     assert.strictEqual(
       (db.prepare('SELECT status FROM message_deliveries WHERE message_id = ?').get(requestId) as { status: string }).status,
       'acked'
@@ -433,6 +444,8 @@ test('CLI prints persistent reply instructions and rejects malformed coordinatio
       inbox.stdout,
       new RegExp(`REPLY REQUIRED by .*swarm send Alice "<answer>" --reply-to ${request.request_message_id}`)
     );
+    const transportAck = runCli(home, ['ack', String(request.request_message_id)], 'Bob');
+    assert.strictEqual(transportAck.status, 0, transportAck.stderr || transportAck.stdout);
     const hook = runCli(home, ['hook-context'], 'Bob');
     assert.strictEqual(hook.status, 0, hook.stderr || hook.stdout);
     assert.match(hook.stdout, new RegExp(`REPLY REQUIRED #${request.request_message_id} from Alice`));

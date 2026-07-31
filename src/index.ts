@@ -21,8 +21,6 @@ import {
   joinAgent,
   joinHeadlessAgent,
   leaveA2AAgent,
-  leaveAgent,
-  leaveHeadlessAgent,
   listAgents,
   listAgentsSync,
   listSwarms,
@@ -138,7 +136,7 @@ import {
 } from './board-server.js';
 import { createGrant, listGrants, parseGrantTtl, revokeGrant } from './grants.js';
 import { escalateTask } from './escalations.js';
-import { requestTaskReview } from './reviews.js';
+import { requestTaskReview, submitReviewVerdict } from './reviews.js';
 import { harnessReviewTask } from './harness-review.js';
 import { renderAgentHelp } from './agent-help.js';
 import {
@@ -146,6 +144,17 @@ import {
   listSwarmAuthorities,
   type SwarmAuthorityRole,
 } from './authority.js';
+import {
+  listReviewerQualifications,
+  recordReviewerQualification,
+  revokeReviewerQualification,
+} from './qualifications.js';
+import {
+  listMigrationResources,
+  releaseMigrationResource,
+  reserveMigrationResource,
+} from './migration-leases.js';
+import { standDownAgent } from './stand-down.js';
 
 const rawArgs = process.argv.slice(2);
 
@@ -197,7 +206,7 @@ function requireSendKind(usage: string): string | undefined {
   if (kind === 'ack') {
     console.error(
       'Refused conversational acknowledgement: delivery acknowledgement is transport metadata, not a swarm message. ' +
-      'Handle the message, then run "swarm ack <msg-id...>" for the exact IDs; send only a result or a true blocker.'
+      'Handle one message, then run "swarm ack <msg-id>" for that exact ID; send only a result or a true blocker.'
     );
     console.error(usage);
     process.exit(1);
@@ -455,7 +464,9 @@ Agent Management:
     [--headless] [--push] [--force] [--force-surface]
     [--root <path>]                                  Force headless / Warp push / reclaim name /
                                                      take surface / set root
-  swarm leave                                      Deregister from the current swarm
+  swarm leave                                      Refuse unverified process-only deregistration
+  swarm stand-down <agent>                         Owner/Lead: terminate and verify one exact
+                                                     captured local process tree, then unregister
   swarm register-a2a <name> --endpoint <url>       Register an A2A agent
     [--description <text>] [--force]
   swarm unregister-a2a <name>                      Remove an A2A agent
@@ -477,12 +488,11 @@ Communication:
     [--interject|--now] [--kind <kind>]              (kinds: status, digest, merge-req,
     [--supersedes <msg-id>]                           escalation, gate, handoff;
                                                      ack is read-only/system-reserved)
-  swarm inbox [--peek|--unread|--recent [N]]       Read pending messages
+  swarm inbox [--peek|--unread|--recent [N]]       Display pending messages without acknowledging
     [--wait <seconds>]
-    [--kind <kind>]                                  (--unread is an alias; --peek does not advance cursor;
-                                                      --recent N replays last N regardless of cursor;
-                                                      --kind filters and never advances the cursor)
-  swarm ack <msg-id...>                            Acknowledge exact messages explicitly
+    [--kind <kind>]                                  (--unread/--peek are display aliases;
+                                                      --recent N replays history; --kind filters)
+  swarm ack <msg-id>                               Acknowledge exactly one handled message
   swarm replies [--history]                        Inspect required-answer state for this exact ID
   swarm redeliver [--dry-run]                      Re-push queued messages recipients haven't seen
 
@@ -510,6 +520,22 @@ Task Ledger:
     [--to <agent>]
   swarm review <slug> [--to <agent>]               Route an inverted-family review request
     [--same-family-ok --reason <text>]
+  swarm review verdict <slug> --request <id>       Submit PASS/BLOCK for the exact request head/tree
+    --qualification <id> --verdict pass|block
+    --head <sha> --tree <sha> --report <path>
+    --model-id <id> --harness-sha <sha256>
+    --prompt-sha <sha256> --tools-sha <sha256>
+  swarm qualification record <agent>               Owner/Lead: bind reviewer epoch to immutable
+    --binary-sha <sha256> --model-id <id>             binary/model/harness/prompt/tool identities
+    --harness-sha <sha256> --prompt-sha <sha256>
+    --tools-sha <sha256> --ttl <duration>
+  swarm qualification list [--live]                List reviewer qualification epochs
+  swarm qualification revoke <id>                  Owner/Lead: revoke one qualification
+  swarm migration reserve <resource>               Owner/Lead: exclusively lease migration resource
+    --task <slug> --ttl <duration>
+  swarm migration release <resource>               Owner/Lead: release an exact resource lease
+    --reason <text>
+  swarm migration list [--live]                    List migration resource leases
   swarm task list                                  List the durable task ledger
   swarm task show <slug>                           Show one task with events and decisions
   swarm handoff offer <slug> --to <agent>          Offer a checkpoint-bound lease transfer
@@ -838,18 +864,28 @@ async function main() {
       }
 
       case 'leave': {
-        const { db, self, swarm } = requireSelf();
-        if (self.agent_type === 'headless') {
-          leaveHeadlessAgent(db, self.swarm_id, self.name, { trackSession: true });
-          removeSurface(self.swarm_id, self.name);
-          const host = detectHost();
-          if (host) {
-            removeHook(host, self.name, self.swarm_id);
-          }
-        } else {
-          leaveAgent(db, self.swarm_id, self.surface_id);
+        const { self } = requireSelf();
+        console.error(
+          `Refused unverified leave for "${self.name}": unregistering a live process is not stand-down. ` +
+          `From an unrelated Owner/Lead session, run "swarm stand-down ${self.name}" so the exact ` +
+          'captured process tree is terminated and verified before the registration is removed.'
+        );
+        process.exit(1);
+        break;
+      }
+
+      case 'stand-down': {
+        const target = args[1];
+        if (!target) {
+          console.error('Usage: swarm stand-down <agent>');
+          process.exit(1);
         }
-        console.log(`Left swarm "${swarm.name}" (was "${self.name}")`);
+        const { db, self } = requireSelf('privileged');
+        const result = await standDownAgent(db, self.swarm_id, self.name, target);
+        console.log(
+          `Verified stand-down for ${result.targetName}: root PID ${result.rootPid}; ` +
+          `tree ${result.treeSha256}; terminated ${result.terminatedPids.join(', ')}.`
+        );
         break;
       }
 
@@ -1186,14 +1222,17 @@ async function main() {
           );
           process.exit(1);
         }
-        if (rawIds.length === 0) {
-          console.error('Usage: swarm ack <msg-id...>');
+        if (rawIds.length !== 1) {
+          console.error(
+            'Refused bulk acknowledgement: acknowledge exactly one handled message ID at a time.\n' +
+            'Usage: swarm ack <msg-id>'
+          );
           process.exit(1);
         }
         const ids = rawIds.map(raw => Number(raw));
         if (ids.some((id, index) => !/^\d+$/.test(rawIds[index]) || id <= 0 || !Number.isSafeInteger(id))) {
           console.error('Message IDs must be positive integers.');
-          console.error('Usage: swarm ack <msg-id...>');
+          console.error('Usage: swarm ack <msg-id>');
           process.exit(1);
         }
         const acknowledged = acknowledgeMessages(db, self.swarm_id, self.name, ids);
@@ -1261,6 +1300,10 @@ async function main() {
           console.log(`lease expires: ${task.lease_expires_at ?? 'none'}; disposition: ${task.disposition ?? 'none'}`);
           console.log(`repo: ${task.repo_path ?? 'none'}`);
           console.log(`branch: ${task.branch ?? 'none'}; worktree: ${task.worktree_path ?? 'none'}`);
+          console.log(
+            `bound head: ${task.head_sha ?? 'none'}; bound tree: ${task.tree_sha ?? 'none'}; ` +
+            `immutable author family: ${task.author_family ?? 'none'}`
+          );
           console.log(`transcript: ${task.transcript_hint ?? 'not available'}`);
           const events = db.prepare(`
             SELECT id, epoch, kind, actor, actor_agent_id, data, created_at
@@ -1589,6 +1632,49 @@ async function main() {
       }
 
       case 'review': {
+        if (args[1] === 'verdict') {
+          const usage =
+            'Usage: swarm review verdict <slug> --request <id> --qualification <id> ' +
+            '--verdict pass|block --head <sha> --tree <sha> --report <path> --model-id <id> ' +
+            '--harness-sha <sha256> --prompt-sha <sha256> --tools-sha <sha256>';
+          const slug = args[2];
+          const requestId = requirePositiveIdFlag('--request', 'Review request ID', usage);
+          const qualificationId = requirePositiveIdFlag('--qualification', 'Qualification ID', usage);
+          const verdict = getFlag('--verdict');
+          const headSha = getFlag('--head');
+          const treeSha = getFlag('--tree');
+          const reportPath = getFlag('--report');
+          const modelId = getFlag('--model-id');
+          const harnessSha256 = getFlag('--harness-sha');
+          const promptSha256 = getFlag('--prompt-sha');
+          const toolsSha256 = getFlag('--tools-sha');
+          if (
+            !slug || requestId === undefined || qualificationId === undefined ||
+            !verdict || !headSha || !treeSha || !reportPath || !modelId ||
+            !harnessSha256 || !promptSha256 || !toolsSha256
+          ) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const result = submitReviewVerdict(db, self.swarm_id, self.name, slug, {
+            requestId,
+            qualificationId,
+            verdict: verdict as 'pass' | 'block',
+            headSha,
+            treeSha,
+            reportPath,
+            modelId,
+            harnessSha256,
+            promptSha256,
+            toolsSha256,
+          });
+          console.log(
+            `Typed ${result.verdict.toUpperCase()} verdict #${result.id} recorded for request ` +
+            `#${result.requestId} at ${result.headSha}/${result.treeSha}; report ${result.reportSha256}.`
+          );
+          break;
+        }
         const slug = args[1];
         if (!slug) {
           console.error('Usage: swarm review <slug> [--to <agent>] [--same-family-ok --reason <text>]');
@@ -1603,8 +1689,142 @@ async function main() {
         console.log(`Review brief: ${result.briefPath}`);
         console.log(
           `Pointer sent to ${result.reviewer} (${result.reviewerFamily}); ` +
-          `task "${slug}" is awaiting_review.`
+          `task "${slug}" is awaiting_review; request #${result.requestId}, ` +
+          `qualification #${result.qualificationId}.`
         );
+        break;
+      }
+
+      case 'qualification': {
+        const subcommand = args[1];
+        const usage =
+          'Usage: swarm qualification record <agent> --binary-sha <sha256> --model-id <id> ' +
+          '--harness-sha <sha256> --prompt-sha <sha256> --tools-sha <sha256> --ttl <duration> | ' +
+          'swarm qualification list [--live] | swarm qualification revoke <id>';
+        if (subcommand === 'record') {
+          const agent = args[2];
+          const binarySha256 = getFlag('--binary-sha');
+          const modelId = getFlag('--model-id');
+          const harnessSha256 = getFlag('--harness-sha');
+          const promptSha256 = getFlag('--prompt-sha');
+          const toolsSha256 = getFlag('--tools-sha');
+          const ttl = getFlag('--ttl');
+          if (!agent || !binarySha256 || !modelId || !harnessSha256 || !promptSha256 || !toolsSha256 || !ttl) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = recordReviewerQualification(db, self.swarm_id, self.name, {
+            agent,
+            binarySha256,
+            modelId,
+            harnessSha256,
+            promptSha256,
+            toolsSha256,
+            ttl,
+          });
+          console.log(
+            `Qualification #${row.id} recorded for ${row.agent_name} (${row.family}); ` +
+            `worker ${row.worker_version}, binary ${row.binary_sha256}, expires ${row.expires_at}.`
+          );
+          break;
+        }
+        if (subcommand === 'list') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listReviewerQualifications(db, swarm.id, hasFlag('--live'));
+          if (rows.length === 0) {
+            console.log(hasFlag('--live') ? 'No live reviewer qualifications.' : 'No reviewer qualifications recorded.');
+          } else {
+            for (const row of rows) {
+              const status = row.revoked_at ? `revoked ${row.revoked_at}` : `expires ${row.expires_at}`;
+              console.log(
+                `#${row.id} ${row.agent_name} ${row.family}; worker ${row.worker_version}; ` +
+                `binary ${row.binary_sha256}; model ${row.model_id}; ${status}`
+              );
+            }
+          }
+          break;
+        }
+        if (subcommand === 'revoke') {
+          const rawId = args[2];
+          const id = rawId && /^\d+$/.test(rawId) ? Number(rawId) : 0;
+          if (!Number.isSafeInteger(id) || id <= 0) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = revokeReviewerQualification(db, self.swarm_id, self.name, id);
+          if (!row) {
+            console.error(`Qualification #${id} not found in this swarm.`);
+            process.exit(1);
+          }
+          console.log(`Qualification #${row.id} revoked at ${row.revoked_at}.`);
+          break;
+        }
+        console.error(usage);
+        process.exit(1);
+        break;
+      }
+
+      case 'migration': {
+        const subcommand = args[1];
+        const usage =
+          'Usage: swarm migration reserve <resource> --task <slug> --ttl <duration> | ' +
+          'swarm migration release <resource> --reason <text> | swarm migration list [--live]';
+        if (subcommand === 'reserve') {
+          const resource = args[2];
+          const taskId = getFlag('--task');
+          const ttl = getFlag('--ttl');
+          if (!resource || !taskId || !ttl) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = reserveMigrationResource(db, self.swarm_id, self.name, { resource, taskId, ttl });
+          console.log(
+            `Migration lease #${row.id} reserved ${row.resource} for ${row.task_id} ` +
+            `epoch ${row.task_epoch}; expires ${row.expires_at}.`
+          );
+          break;
+        }
+        if (subcommand === 'release') {
+          const resource = args[2];
+          const reason = getFlag('--reason');
+          if (!resource || !reason) {
+            console.error(usage);
+            process.exit(1);
+          }
+          const { db, self } = requireSelf('privileged');
+          const row = releaseMigrationResource(db, self.swarm_id, self.name, resource, reason);
+          if (!row) {
+            console.error(`No live migration lease found for ${resource}.`);
+            process.exit(1);
+          }
+          console.log(`Migration lease #${row.id} released at ${row.released_at}: ${row.release_reason}.`);
+          break;
+        }
+        if (subcommand === 'list') {
+          const db = getDb();
+          const swarm = resolveSelectedSwarm(db);
+          const rows = listMigrationResources(db, swarm.id, hasFlag('--live'));
+          if (rows.length === 0) {
+            console.log(hasFlag('--live') ? 'No live migration leases.' : 'No migration leases recorded.');
+          } else {
+            for (const row of rows) {
+              const status = row.released_at
+                ? `released ${row.released_at} (${row.release_reason})`
+                : `expires ${row.expires_at}`;
+              console.log(
+                `#${row.id} ${row.resource} -> ${row.task_id}@${row.task_epoch} ` +
+                `(${row.holder_name}); ${status}`
+              );
+            }
+          }
+          break;
+        }
+        console.error(usage);
+        process.exit(1);
         break;
       }
 
@@ -2094,8 +2314,8 @@ async function main() {
       case 'inbox': {
         const { db, self } = requireSelf();
         const usage = 'Usage: swarm inbox [--peek|--unread|--recent [N]] [--kind <kind>] [--wait <seconds>]';
-        // --unread: common agent habit; same as default (show unread, advance cursor).
-        // --peek: show without advancing.
+        // All inbox displays are non-acknowledging. --unread and --peek are
+        // retained as display aliases for compatibility.
         // --recent [N]: replay last N messages (default 10) IGNORING the read
         // cursor and delivery state, never advancing or acknowledging them.
         // --kind <k>: show only messages of that kind. Filtered reads NEVER advance
@@ -2166,8 +2386,8 @@ async function main() {
             );
           }
           const suffix = kind
-            ? ` (kind filter — cursor not advanced)`
-            : peek ? ' (peek mode, not marked as read)' : '';
+            ? ` (kind filter — pending until exact ack)`
+            : ' (display only — pending until exact ack)';
           console.log(`\n${messages.length} message(s)${suffix}`);
         }
         const shownIds = new Set(messages.map(message => message.id));

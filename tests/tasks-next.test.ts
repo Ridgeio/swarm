@@ -86,6 +86,13 @@ function dropSessionMarkers(home: string): void {
 function joinAgent(home: string, name: string): void {
   const joined = runCli(home, ['join', name, '--headless'], name);
   assert.strictEqual(joined.status, 0, joined.stderr || joined.stdout);
+  const db = new DatabaseSync(path.join(home, '.swarm', 'swarm.db'));
+  db.prepare(`
+    UPDATE agents
+    SET host_agent = 'codex', worker_version = 'fixture-codex', worker_binary_sha256 = ?
+    WHERE name = ? COLLATE NOCASE
+  `).run('a'.repeat(64), name);
+  db.close();
   dropSessionMarkers(home);
 }
 
@@ -118,6 +125,73 @@ function openDb(home: string): SwarmDb {
 
 function taskRow(db: SwarmDb, slug: string): any {
   return db.prepare('SELECT * FROM tasks WHERE swarm_id = ? AND id = ?').get('default', slug);
+}
+
+function seedPassVerdict(db: SwarmDb, slug: string): number {
+  const task = taskRow(db, slug);
+  const reviewer = db.prepare("SELECT * FROM agents WHERE name = 'Alice' COLLATE NOCASE").get() as any;
+  const head = git(task.worktree_path, ['rev-parse', 'HEAD']);
+  const tree = git(task.worktree_path, ['rev-parse', 'HEAD^{tree}']);
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + 24 * 60 * 60_000).toISOString();
+  db.prepare('UPDATE tasks SET head_sha = ?, tree_sha = ? WHERE swarm_id = ? AND id = ?')
+    .run(head, tree, 'default', slug);
+  const qualification = db.prepare(`
+    INSERT INTO reviewer_qualifications (
+      swarm_id, agent_id, agent_name, family, worker_version, binary_sha256,
+      model_id, harness_sha256, prompt_sha256, tools_sha256,
+      qualified_by_agent_id, qualified_at, expires_at, revoked_at
+    ) VALUES ('default', ?, ?, 'openai', ?, ?, 'fixture-model', ?, ?, ?, ?, ?, ?, NULL)
+  `).run(
+    reviewer.id,
+    reviewer.name,
+    reviewer.worker_version,
+    reviewer.worker_binary_sha256,
+    'b'.repeat(64),
+    'c'.repeat(64),
+    'd'.repeat(64),
+    reviewer.id,
+    now,
+    expires
+  );
+  const qualificationId = Number(qualification.lastInsertRowid);
+  const request = db.prepare(`
+    INSERT INTO review_requests (
+      swarm_id, task_id, task_epoch, requester_agent_id, reviewer_agent_id,
+      reviewer_name, author_family, reviewer_family, head_sha, tree_sha,
+      qualification_id, brief_path, status, created_at, resolved_at
+    ) VALUES ('default', ?, ?, ?, ?, ?, ?, 'openai', ?, ?, ?, 'fixture.md', 'passed', ?, ?)
+  `).run(
+    slug,
+    task.lease_epoch,
+    reviewer.id,
+    reviewer.id,
+    reviewer.name,
+    task.author_family,
+    head,
+    tree,
+    qualificationId,
+    now,
+    now
+  );
+  const verdict = db.prepare(`
+    INSERT INTO review_verdicts (
+      swarm_id, task_id, request_id, task_epoch, reviewer_agent_id,
+      qualification_id, verdict, head_sha, tree_sha, report_path,
+      report_sha256, submitted_at
+    ) VALUES ('default', ?, ?, ?, ?, ?, 'pass', ?, ?, 'fixture.md', ?, ?)
+  `).run(
+    slug,
+    Number(request.lastInsertRowid),
+    task.lease_epoch,
+    reviewer.id,
+    qualificationId,
+    head,
+    tree,
+    'e'.repeat(64),
+    now
+  );
+  return Number(verdict.lastInsertRowid);
 }
 
 describe('WI-3 task ledger CLI', () => {
@@ -209,7 +283,13 @@ describe('WI-3 task ledger CLI', () => {
       assert.strictEqual(secondCheckpoint.status, 0, secondCheckpoint.stderr || secondCheckpoint.stdout);
       assert.match(secondCheckpoint.stdout, /Checkpoint #002 recorded: .*\/002\.md/);
 
-      const closed = runCli(home, ['task', 'close', 'happy-path', '--disposition', 'pr', '--not-established', 'none'], 'Alice');
+      const evidenceDb = openDb(home);
+      const verdictId = seedPassVerdict(evidenceDb, 'happy-path');
+      evidenceDb.close();
+      const closed = runCli(home, [
+        'task', 'close', 'happy-path', '--disposition', 'pr',
+        '--evidence', `verdict:${verdictId}`, '--not-established', 'none',
+      ], 'Alice');
       assert.strictEqual(closed.status, 0, closed.stderr || closed.stdout);
       const verified = openDb(home);
       const done = taskRow(verified, 'happy-path');
@@ -243,6 +323,9 @@ describe('WI-3 task ledger CLI', () => {
       git(active.worktree_path, ['push', '-u', 'origin', active.branch]);
       const sourceSha = git(active.worktree_path, ['rev-parse', 'HEAD']);
       const originalTargetSha = git(repo, ['rev-parse', 'origin/main']);
+      db = openDb(home);
+      const verdictId = seedPassVerdict(db, 'default-merged');
+      db.close();
 
       const grant = runCli(home, [
         'grant', 'create', '--op', 'merge', '--resource', 'default-merged', '--ttl', '2h', '--to', 'Alice',
@@ -251,6 +334,7 @@ describe('WI-3 task ledger CLI', () => {
 
       const refused = runCli(home, [
         'task', 'close', 'default-merged', '--disposition', 'merged', '--not-established', 'none',
+        '--evidence', `verdict:${verdictId}`,
       ], 'Alice');
       assert.notStrictEqual(refused.status, 0);
       assert.match(refused.stderr, new RegExp(`source SHA ${sourceSha}`));
@@ -269,6 +353,7 @@ describe('WI-3 task ledger CLI', () => {
 
       const closed = runCli(home, [
         'task', 'close', 'default-merged', '--disposition', 'merged', '--not-established', 'none',
+        '--evidence', `verdict:${verdictId}`,
       ], 'Alice');
       assert.strictEqual(closed.status, 0, closed.stderr || closed.stdout);
       assert.match(
@@ -657,10 +742,16 @@ describe('WI-3 task ledger CLI', () => {
       git(task.worktree_path, ['config', 'user.name', 'Swarm Test']);
       git(task.worktree_path, ['config', 'user.email', 'swarm@example.test']);
       git(task.worktree_path, ['commit', '-m', 'local only']);
+      const verdictDb = openDb(home);
+      const verdictId = seedPassVerdict(verdictDb, 'count-state');
+      verdictDb.close();
       fs.appendFileSync(path.join(task.worktree_path, 'tracked.txt'), 'dirty\n');
       fs.writeFileSync(path.join(task.worktree_path, 'untracked.txt'), 'untracked\n');
 
-      const refused = runCli(home, ['task', 'close', 'count-state', '--disposition', 'pr', '--not-established', 'none'], 'Alice');
+      const refused = runCli(home, [
+        'task', 'close', 'count-state', '--disposition', 'pr',
+        '--evidence', `verdict:${verdictId}`, '--not-established', 'none',
+      ], 'Alice');
       assert.notStrictEqual(refused.status, 0);
       assert.match(refused.stderr, /unpushed commits: 1, dirty tracked files: 1, untracked files: 1/);
 
@@ -805,8 +896,18 @@ describe('WI-3 task ledger CLI', () => {
         assert.strictEqual(manifest.counts.untracked, 0);
       }
 
-      assert.strictEqual(runCli(home, ['task', 'close', 'agent-one', '--disposition', 'pr', '--not-established', 'none'], 'Alice').status, 0);
-      assert.strictEqual(runCli(home, ['task', 'close', 'agent-two', '--disposition', 'pr', '--not-established', 'none'], 'Alice').status, 0);
+      const evidenceDb = openDb(home);
+      const firstVerdict = seedPassVerdict(evidenceDb, 'agent-one');
+      const secondVerdict = seedPassVerdict(evidenceDb, 'agent-two');
+      evidenceDb.close();
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'agent-one', '--disposition', 'pr',
+        '--evidence', `verdict:${firstVerdict}`, '--not-established', 'none',
+      ], 'Alice').status, 0);
+      assert.strictEqual(runCli(home, [
+        'task', 'close', 'agent-two', '--disposition', 'pr',
+        '--evidence', `verdict:${secondVerdict}`, '--not-established', 'none',
+      ], 'Alice').status, 0);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
     }
@@ -1054,12 +1155,11 @@ describe('WI-3 task ledger CLI', () => {
       assert.notStrictEqual(invalidClaim.status, 0);
       assert.match(invalidClaim.stderr, /Invalid --claim.*code-merged.*journey-works.*deploy-healthy.*analysis.*decision.*probe/s);
 
-      assert.strictEqual(runCli(home, [
+      const codeWithoutIdentity = runCli(home, [
         'task', 'start', 'code-claim', '--title', 'Code', '--no-worktree', '--claim', 'code-merged',
-      ], 'Alice').status, 0);
-      assert.strictEqual(runCli(home, [
-        'task', 'close', 'code-claim', '--disposition', 'archive', '--not-established', 'runtime behavior',
-      ], 'Alice').status, 0);
+      ], 'Alice');
+      assert.notStrictEqual(codeWithoutIdentity.status, 0);
+      assert.match(codeWithoutIdentity.stderr, /requires --repo and an isolated named worktree/);
 
       assert.strictEqual(runCli(home, [
         'task', 'start', 'journey-claim', '--title', 'Journey', '--no-worktree', '--claim', 'journey-works',

@@ -363,7 +363,7 @@ describe('Owner/Lead ACLs, grants, and decisions', () => {
     }
   });
 
-  test('decision supersession requires an active predecessor, exact author ID, and one successor', () => {
+  test('decision supersession requires an active predecessor, live operator authority, and one successor', () => {
     const value = fixture('swarm-decision-successor-');
     try {
       joinHeadlessAgent(value.db, 'default', 'Owner');
@@ -428,18 +428,16 @@ describe('Owner/Lead ACLs, grants, and decisions', () => {
       leaveHeadlessAgent(value.db, 'default', 'Owner');
       joinHeadlessAgent(value.db, 'default', 'Owner');
       assignSwarmAuthority(value.db, 'default', 'Lead', 'owner', 'Owner');
-      assert.throws(
-        () => recordDecision(
-          value.db,
-          'default',
-          'Owner',
-          'same display name, different author registration',
-          undefined,
-          second.id,
-          1_800_000_000_004
-        ),
-        /only that exact active author registration may supersede it/
+      const replacement = recordDecision(
+        value.db,
+        'default',
+        'Owner',
+        'newly assigned operator registration may supersede program authority',
+        undefined,
+        second.id,
+        1_800_000_000_004
       );
+      assert.ok(replacement.id > second.id);
     } finally {
       value.db.close();
     }

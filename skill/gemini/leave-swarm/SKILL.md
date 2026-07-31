@@ -3,10 +3,13 @@ name: leave-swarm
 description: Leave the agent coordination swarm and disconnect from other agents
 ---
 
-Leave the agent coordination swarm. This disconnects you from other agents and removes any auto-installed hooks.
+Direct deregistration is intentionally refused because it does not prove that the
+agent's process tree stopped. First emit the final evidence packet or blocker.
+Then an unrelated Owner/Lead session must run:
 
 ```bash
-swarm leave
+swarm stand-down <agent-name>
 ```
 
-You are no longer part of the swarm. Other agents will no longer see you in `swarm members` and cannot send you messages. Any awareness hooks installed during join are automatically cleaned up.
+The operator verifies the exact captured process tree is gone before the
+registration is removed. `swarm leave` only prints this refusal and guidance.

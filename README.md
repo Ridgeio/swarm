@@ -215,7 +215,7 @@ Messaging:
   swarm inbox [--peek|--unread|--recent [N]]  Read pending or historical messages
         [--wait <seconds>]
         [--kind <kind>]
-  swarm ack <msg-id...>                       Acknowledge exact pending deliveries
+  swarm ack <msg-id>                          Acknowledge exactly one handled delivery
   swarm replies [--history]                   Inspect required-answer state for this exact ID
   swarm redeliver [--dry-run]                 Retry eligible push notifications
 
@@ -244,6 +244,20 @@ Task ledger:
         [--to <agent>]
   swarm review <slug> [--to <agent>]            Route a cross-family gate review
         [--same-family-ok --reason <text>]
+  swarm review verdict <slug> --request <id>     Submit PASS/BLOCK for the exact request head/tree
+        --qualification <id> --verdict pass|block --head <sha> --tree <sha>
+        --report <path> --model-id <id> --harness-sha <sha256>
+        --prompt-sha <sha256> --tools-sha <sha256>
+  swarm qualification record <agent>             Owner/Lead: bind a reviewer epoch to immutable
+        --binary-sha <sha256> --model-id <id> --harness-sha <sha256>
+        --prompt-sha <sha256> --tools-sha <sha256> --ttl <duration>
+  swarm qualification list [--live]              List reviewer qualification epochs
+  swarm qualification revoke <id>                Owner/Lead: revoke one qualification
+  swarm migration reserve <resource>              Owner/Lead: lease one migration resource
+        --task <slug> --ttl <duration>
+  swarm migration release <resource> --reason <text>
+                                                  Owner/Lead: release one resource lease
+  swarm migration list [--live]                  List migration resource leases
   swarm task list                              List the durable task ledger
   swarm task show <slug>                       Show task facts, events, and decisions
   swarm handoff offer <slug> --to <agent>      Offer a digest-bound transfer
@@ -252,7 +266,7 @@ Task ledger:
   swarm handoff decline <slug> [--offer <id>]  Decline without transferring
   swarm handoff cancel <slug> [--offer <id>]   Cancel your pending offer
   swarm handoff status [slug]                  Show pickup/dead-letter state
-  swarm decision <text> [--task <slug>]        Record a durable decision
+  swarm decision <text> [--task <slug>]        Owner/Lead: record a durable decision
         [--supersedes <decision-id>]
 
 Recovery and hygiene:
@@ -278,7 +292,9 @@ Operator visibility:
 Cmux Agents (local terminal sessions):
   swarm join <name> [--description <text>]   Register this terminal as an agent
         [--headless] [--push] [--force] [--force-surface] [--swarm <name>]
-  swarm leave                                 Deregister from the current swarm
+  swarm leave                                 Refuse unverified process-only deregistration
+  swarm stand-down <agent>                    Owner/Lead: terminate and verify the exact captured
+                                                local process tree, then unregister it
   swarm whoami                                Show own registration
   swarm read <agent> [--lines <n>]            Read an agent's terminal screen
 
@@ -485,7 +501,7 @@ swarm. Do not send a ceremonial wrap-up/receipt broadcast. Use
 
 ## How agents coordinate
 
-**Cmux/headless agents**: SQLite is the source of truth. The awareness hook peeks without consuming, records injection attempts, and keeps a delivery pending until `swarm ack <id>` (or a plain `swarm inbox` read) acknowledges it. Acknowledgement also cancels any queued push for that exact delivery, but it does not resolve a required reply. Cmux/AppleScript push remains a best-effort nudge, not proof that work was seen or completed.
+**Cmux/headless agents**: SQLite is the source of truth. The awareness hook and every `swarm inbox` mode display without consuming, record injection attempts, and keep a delivery pending until `swarm ack <exact-id>` acknowledges exactly that row. Bulk acknowledgement is refused. Acknowledgement cancels any queued push for that exact delivery, but it does not resolve a required reply. Cmux/AppleScript push remains a best-effort nudge, not proof that work was seen or completed.
 
 **A2A agents**: Messages are delivered via HTTP POST to the agent's registered endpoint using the [A2A protocol](https://google.github.io/A2A/). The agent processes the message and can respond through the same channel.
 
@@ -501,7 +517,12 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`src/db.ts`** — SQLite with WAL mode for concurrent access
 - **`src/registry.ts`** — Swarm + agent CRUD, A2A registration, async stale cleanup
 - **`src/mailbox.ts`** — Exact-recipient delivery/outbox, required-reply deadlines, inbox, and cursor tracking
-- **`src/tasks.ts`** — Fenced task leases, checkpoints, evidence-gated close, handoff, and decisions
+- **`src/model-family.ts`** — Canonical host/model-family identity derivation
+- **`src/qualifications.ts`** — Bounded reviewer qualifications tied to binary/model/invocation identity
+- **`src/reviews.ts`** — Exact-head requests, typed verdicts, and live qualification/source validation
+- **`src/tasks.ts`** — Fenced task leases, immutable code identity, typed-verdict close, handoff, and decisions
+- **`src/migration-leases.ts`** — Exclusive, task-epoch-bound migration resource reservations
+- **`src/stand-down.ts`** — Verified exact-process-tree termination and audit events
 - **`src/rescue.ts`** — Verified preservation artifacts plus digest-bound exact-successor delivery
 - **`src/janitor.ts`** — Observe-only debris census, coordination-deadline sweeps, heartbeat, hook trigger, and launchd schedule
 - **`src/board.ts`** — Read-only fleet/task/debris/quota rendering, watch loops, and Mermaid graph/HTML output
@@ -509,7 +530,7 @@ The skill doc (`skill/SKILL.md`) teaches agents when to check messages, how to d
 - **`hooks/swarm-awareness.sh`** — Claude Code UserPromptSubmit hook that injects swarm context and refreshes heartbeats
 - **`hooks/swarm-awareness-headless.sh`** — Headless awareness hook used where a host can poll inbox messages
 
-State is stored in `~/.swarm/swarm.db`. Swarm-scoped tables include agents, messages, per-recipient deliveries/outbox, required-response/audience rows, inbox cursors, tasks, task events, and decisions; janitor status, findings, and snapshots provide machine-level debris history. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
+State is stored in `~/.swarm/swarm.db`. Swarm-scoped tables include agents, messages, per-recipient deliveries/outbox, required-response rows, inbox cursors, tasks/events, handoff offers, decisions/grants, reviewer qualifications and exact-head requests/verdicts, migration resource leases, and stand-down events; janitor status, findings, and snapshots provide machine-level debris history. Legacy installs are migrated into the `default` swarm. Stale Cmux agents are cleaned up when their surface is unreachable AND their heartbeat is older than 30 minutes. A2A agents are cleaned up when their endpoint fails to respond to an agent card ping AND their heartbeat is stale. The awareness hook refreshes heartbeats on every prompt, so active agents are never pruned.
 
 ## Security
 

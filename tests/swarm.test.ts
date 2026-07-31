@@ -21,6 +21,7 @@ import {
 } from '../src/registry.js';
 import {
   broadcastMessage as broadcastMessageRaw,
+  acknowledgeMessages as acknowledgeMessagesRaw,
   countRecentMessages as countRecentMessagesRaw,
   getInbox as getInboxRaw,
   getRecentMessages as getRecentMessagesRaw,
@@ -447,7 +448,7 @@ describe('mailbox', () => {
     assert.strictEqual(messages.length, 0);
   });
 
-  test('cursor advances after reading', () => {
+  test('reading never advances the cursor; only exact acknowledgement clears a message', () => {
     joinAgent(db, 'Alice', 'surface-1', 'workspace-1', process.ppid);
 
     db.prepare(
@@ -457,9 +458,11 @@ describe('mailbox', () => {
     const first = getInbox(db, 'Alice');
     assert.strictEqual(first.length, 1);
 
-    // Second read should return nothing
+    // Second read returns the same pending message.
     const second = getInbox(db, 'Alice');
-    assert.strictEqual(second.length, 0);
+    assert.strictEqual(second.length, 1);
+    acknowledgeMessagesRaw(db, SWARM_ID, 'Alice', [first[0].id]);
+    assert.strictEqual(getInbox(db, 'Alice').length, 0);
 
     // New message should appear
     db.prepare(
@@ -534,8 +537,8 @@ describe('mailbox', () => {
     const all = getInbox(db, 'Alice');
     assert.strictEqual(all.length, 3, 'filtered read must not have advanced the cursor');
 
-    // The unfiltered read above DID advance the cursor as usual.
-    assert.strictEqual(getInbox(db, 'Alice').length, 0);
+    // The unfiltered read above is also display-only.
+    assert.strictEqual(getInbox(db, 'Alice').length, 3);
   });
 
   test('getRecentMessages honors the kind filter', () => {

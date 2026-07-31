@@ -722,22 +722,6 @@ function ensureDeliveryRows(
   });
 }
 
-function advanceCursor(
-  db: SwarmDb,
-  swarmId: string,
-  agentName: string,
-  messageIds: number[]
-): void {
-  if (messageIds.length === 0) return;
-  const maxId = Math.max(...messageIds);
-  db.prepare(`
-    INSERT INTO inbox_cursors (swarm_id, agent_name, last_read_id)
-    VALUES (?, ?, ?)
-    ON CONFLICT(swarm_id, agent_name) DO UPDATE SET
-      last_read_id = MAX(inbox_cursors.last_read_id, excluded.last_read_id)
-  `).run(swarmId, agentName, maxId);
-}
-
 export function acknowledgeMessages(
   db: SwarmDb,
   swarmId: string,
@@ -789,7 +773,10 @@ export function acknowledgeMessages(
         `).run(id, agentId);
       }
     }
-    advanceCursor(db, swarmId, agentName, ids);
+    // Do not advance the legacy high-water cursor. Acknowledging message #N
+    // must never conceal earlier unacknowledged messages that lack delivery
+    // rows (for example when the recipient acks an exact ID before inbox).
+    // Exact per-message delivery state is authoritative for new builds.
   });
   return ids;
 }
@@ -852,12 +839,10 @@ export function getInbox(
 
   ensureDeliveryRows(db, swarmId, agentName, agentId, messages.map(message => message.id));
 
-  // Kind-filtered reads are peek-only by construction. A plain explicit inbox read
-  // acknowledges exactly the rows it returned and advances the compatibility cursor.
-  if (!peek && !kind && messages.length > 0) {
-    acknowledgeMessages(db, swarmId, agentName, messages.map(message => message.id));
-  }
-
+  // Display is never acknowledgement. Messages remain pending until the
+  // recipient explicitly acknowledges one exact ID with `swarm ack <id>`.
+  // The `peek` parameter remains for source compatibility but cannot weaken
+  // this invariant.
   return messages;
 }
 

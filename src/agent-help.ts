@@ -33,7 +33,8 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'swarms', group: 'identity', line: 'swarms — list known swarms' },
   { command: 'delete', group: 'identity', line: 'delete — delete a non-default swarm' },
   { command: 'join', group: 'identity', line: 'join — register this terminal' },
-  { command: 'leave', group: 'identity', line: 'leave — deregister this terminal' },
+  { command: 'leave', group: 'identity', line: 'leave — refuse unverified process-only deregistration' },
+  { command: 'stand-down', group: 'identity', line: 'stand-down — verify and terminate an exact process tree' },
   { command: 'register-a2a', group: 'identity', line: 'register-a2a — register a remote agent' },
   { command: 'unregister-a2a', group: 'identity', line: 'unregister-a2a — remove a remote agent' },
   { command: 'discover', group: 'identity', line: 'discover — inspect an A2A agent card' },
@@ -63,11 +64,13 @@ export const AGENT_HELP_ENTRIES: readonly AgentHelpEntry[] = [
   { command: 'handoff', group: 'tasks+evidence', line: 'handoff — offer/accept a charter-bound task lease transfer' },
   { command: 'decision', group: 'tasks+evidence', line: 'decision — record a durable decision' },
   { command: 'harness-review', group: 'tasks+evidence', line: 'harness-review — review a task handoff loop' },
+  { command: 'migration', group: 'tasks+evidence', line: 'migration — manage exclusive resource leases' },
 
   { command: 'grant', group: 'grants+escalation', line: 'grant — create, list, or revoke authority' },
   { command: 'authority', group: 'grants+escalation', line: 'authority — show or assign Owner/Lead IDs' },
   { command: 'escalate', group: 'grants+escalation', line: 'escalate — create a decision packet' },
   { command: 'review', group: 'grants+escalation', line: 'review — route a cross-family gate review' },
+  { command: 'qualification', group: 'grants+escalation', line: 'qualification — bind or revoke reviewer epochs' },
 
   { command: 'board', group: 'board', line: 'board — render fleet state or graph (splits beside you; --own-workspace for program setup)' },
   { command: 'stats', group: 'board', line: 'stats — show fleet metrics' },
@@ -89,7 +92,7 @@ export function renderAgentHelp(): string {
     if (group === 'tasks+evidence') {
       lines.push(...CLAIM_KINDS.map(claimKind => {
         const required = claimKind === 'code-merged'
-          ? 'git gates only'
+          ? 'typed PASS verdict + exact git gates'
           : CLAIM_EVIDENCE_KINDS[claimKind].join(', ');
         return `claim ${claimKind} → ${required}`;
       }));
